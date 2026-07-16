@@ -1,10 +1,11 @@
 {
   "name": "HA Whole-House State Scanner",
   "content_in_root": false,
-  "filename": "ha-whole-house-state-scanner.zip",
   "country": [
     "CN"
   ],
-  "iot_class": "Local Polling",
-  "render_readme": true
+  "render_readme": true,
+  "categories": [
+    "integration"
+  ]
 }
