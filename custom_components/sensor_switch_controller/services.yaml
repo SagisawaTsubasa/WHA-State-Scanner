@@ -1,0 +1,11 @@
+force_evaluate:
+  name: 强制评估
+  description: 立即触发指定控制器的条件评估。
+  fields:
+    entity_id:
+      name: 实体ID
+      description: 控制器生成的任意开关实体ID。
+      required: true
+      selector:
+        entity:
+          integration: sensor_switch_controller
