@@ -1,0 +1,12 @@
+{
+  "domain": "sensor_switch_controller",
+  "name": "HA Whole-House State Scanner",
+  "version": "v0.0.1",
+  "documentation": "https://github.com/YOUR_GITHUB/sensor-switch-controller",
+  "issue_tracker": "https://github.com/YOUR_GITHUB/sensor-switch-controller/issues",
+  "dependencies": [],
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_polling",
+  "requirements": []
+}

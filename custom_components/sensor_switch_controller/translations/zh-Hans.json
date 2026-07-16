@@ -1,0 +1,141 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA全屋状态扫描 - 基础设置",
+        "description": "配置控制器的基本参数。"
+      },
+      "sensors": {
+        "title": "HA全屋状态扫描",
+        "description": "选择所有需要参与逻辑判断的传感器。"
+      },
+      "conditions_menu": {
+        "title": "HA全屋状态扫描",
+        "description": "当前条件:\\n{conditions_list}"
+      },
+      "add_condition": {
+        "title": "HA全屋状态扫描",
+        "description": "选择要添加的条件类型。"
+      },
+      "cond_numeric": {
+        "title": "HA全屋状态扫描",
+        "description": "当传感器数值满足范围时条件为真。"
+      },
+      "cond_state": {
+        "title": "HA全屋状态扫描",
+        "description": "当传感器状态匹配时条件为真。多个状态用逗号分隔。"
+      },
+      "cond_time": {
+        "title": "HA全屋状态扫描",
+        "description": "仅在指定时间范围内条件为真。"
+      },
+      "cond_sun": {
+        "title": "HA全屋状态扫描",
+        "description": "根据日出日落时间判断。偏移量单位为秒，负数表示提前。"
+      },
+      "cond_template": {
+        "title": "HA全屋状态扫描",
+        "description": "使用 Jinja2 模板编写自定义判断逻辑。"
+      },
+      "cond_group": {
+        "title": "HA全屋状态扫描",
+        "description": "将多个已有条件组合为 AND 或 OR 逻辑。"
+      },
+      "outputs": {
+        "title": "HA全屋状态扫描",
+        "description": "当前输出:\\n{outputs_list}"
+      },
+      "confirm": {
+        "title": "HA全屋状态扫描",
+        "description": "{summary}"
+      }
+    },
+    "error": {
+      "invalid_yaml": "YAML 格式无效"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "修改HA全屋状态扫描配置",
+        "description": "选择要修改的项目。"
+      },
+      "opt_conditions_menu": {
+        "title": "HA全屋状态扫描",
+        "description": "当前条件:\\n{conditions_list}"
+      },
+      "opt_add_cond_type": {
+        "title": "HA全屋状态扫描",
+        "description": "选择要添加的条件类型。"
+      },
+      "opt_edit_select": {
+        "title": "HA全屋状态扫描",
+        "description": "选择要编辑的条件。"
+      },
+      "opt_delete_select": {
+        "title": "HA全屋状态扫描",
+        "description": "选择要删除的条件。"
+      },
+      "opt_cond_numeric": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_cond_state": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_cond_time": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_cond_sun": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_cond_template": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_cond_group": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_edit_numeric": {
+        "title": "HA全屋状态扫描",
+        "description": "修改条件参数。"
+      },
+      "opt_edit_state": {
+        "title": "HA全屋状态扫描",
+        "description": "修改条件参数。"
+      },
+      "opt_edit_time": {
+        "title": "HA全屋状态扫描",
+        "description": "修改条件参数。"
+      },
+      "opt_edit_sun": {
+        "title": "HA全屋状态扫描",
+        "description": "修改条件参数。"
+      },
+      "opt_edit_template": {
+        "title": "HA全屋状态扫描",
+        "description": "修改条件参数。"
+      },
+      "opt_edit_group": {
+        "title": "HA全屋状态扫描",
+        "description": "修改条件参数。"
+      },
+      "opt_outputs_menu": {
+        "title": "HA全屋状态扫描",
+        "description": "当前输出:\\n{outputs_list}"
+      },
+      "opt_add_output": {
+        "title": "HA全屋状态扫描",
+        "description": ""
+      },
+      "opt_delete_output": {
+        "title": "HA全屋状态扫描",
+        "description": "选择要删除的输出实体。"
+      }
+    }
+  }
+}
