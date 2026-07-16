@@ -1,11 +1,4 @@
 {
   "name": "HA Whole-House State Scanner",
-  "content_in_root": false,
-  "country": [
-    "CN"
-  ],
-  "render_readme": true,
-  "categories": [
-    "integration"
-  ]
+  "render_readme": true
 }
