@@ -2,7 +2,7 @@
 
 A fully visual, zero-YAML whole-house state scanner and logic controller for Home Assistant. Define any number of sensors, compose any number of condition rules, and generate any number of output entities (switches or binary sensors) — all through the UI. No YAML editing required.
 
-> **Programmer:** [Kimi](https://kimi.moonshot.cn) (Moonshot AI) · Author: [@SagizawaTsubasa](https://github.com/SagizawaTsubasa)
+> **Programmer:** [Kimi](https://kimi.moonshot.cn) (Moonshot AI) · Author: [@SagizawaTsubasa](https://github.com/SagisawaTsubasa)
 
 ---
 
@@ -167,4 +167,4 @@ MIT
 
 ---
 
-*Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagizawaTsubasa](https://github.com/SagizawaTsubasa)*
+*Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagizawaTsubasa](https://github.com/SagisawaTsubasa)*
