@@ -1,0 +1,141 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Whole-House State Scanner - Basic Setup",
+        "description": "Configure the basic controller parameters."
+      },
+      "sensors": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Select all sensors that participate in logic evaluation."
+      },
+      "conditions_menu": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Current conditions:\n{conditions_list}"
+      },
+      "add_condition": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Select the type of condition to add."
+      },
+      "cond_numeric": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Condition is true when the sensor value is within the range."
+      },
+      "cond_state": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Condition is true when the sensor state matches. Separate multiple states with commas."
+      },
+      "cond_time": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Condition is true only within the specified time window."
+      },
+      "cond_sun": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Evaluate based on sunrise/sunset. Offsets are in seconds; negative means earlier."
+      },
+      "cond_template": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Write custom logic with a Jinja2 template."
+      },
+      "cond_group": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Combine existing conditions with AND/OR logic."
+      },
+      "outputs": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Current outputs:\n{outputs_list}"
+      },
+      "confirm": {
+        "title": "HA Whole-House State Scanner",
+        "description": "{summary}"
+      }
+    },
+    "error": {
+      "invalid_yaml": "Invalid YAML format"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Edit HA Whole-House State Scanner",
+        "description": "Select what to modify."
+      },
+      "opt_conditions_menu": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Current conditions:\n{conditions_list}"
+      },
+      "opt_add_cond_type": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Select the type of condition to add."
+      },
+      "opt_edit_select": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Select the condition to edit."
+      },
+      "opt_delete_select": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Select the condition to delete."
+      },
+      "opt_cond_numeric": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_cond_state": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_cond_time": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_cond_sun": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_cond_template": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_cond_group": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_edit_numeric": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Modify condition parameters."
+      },
+      "opt_edit_state": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Modify condition parameters."
+      },
+      "opt_edit_time": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Modify condition parameters."
+      },
+      "opt_edit_sun": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Modify condition parameters."
+      },
+      "opt_edit_template": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Modify condition parameters."
+      },
+      "opt_edit_group": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Modify condition parameters."
+      },
+      "opt_outputs_menu": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Current outputs:\n{outputs_list}"
+      },
+      "opt_add_output": {
+        "title": "HA Whole-House State Scanner",
+        "description": ""
+      },
+      "opt_delete_output": {
+        "title": "HA Whole-House State Scanner",
+        "description": "Select the output entity to delete."
+      }
+    }
+  }
+}
