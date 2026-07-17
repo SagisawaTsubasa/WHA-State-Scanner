@@ -451,7 +451,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return SensorSwitchControllerOptionsFlow(config_entry)
+        return SensorSwitchControllerOptionsFlow()
 
 
 # ------------------------------------------------------------------
@@ -461,9 +461,16 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
 class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     """Options flow with full incremental condition editing."""
 
-    def __init__(self, config_entry) -> None:
-        self.config_entry = config_entry
-        self._opts = dict(config_entry.options)
+    @property
+    def _opts(self) -> dict:
+        """Working copy of options, lazily initialised from the config entry.
+
+        config_entry is not available during __init__ on modern HA,
+        so it must be read lazily inside step methods.
+        """
+        if "_opts_cache" not in self.__dict__:
+            self.__dict__["_opts_cache"] = dict(self.config_entry.options)
+        return self.__dict__["_opts_cache"]
 
     # ---------- Main menu ----------
     async def async_step_init(self, user_input=None):

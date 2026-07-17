@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -36,25 +35,22 @@ class DecisionLogger:
             "sensor_switch_controller_logs",
             entry_id,
         )
-        os.makedirs(self.log_dir, exist_ok=True)
+        self._dir_ready = False
 
-        self._current_file = None
-        self._current_date = None
-        self._fh = None
-
-    def _get_log_file(self) -> str:
-        """Return today's log file path."""
-        today = dt_util.now().strftime("%Y-%m-%d")
-        if today != self._current_date:
-            # Rotate
-            if self._fh:
-                self._fh.close()
-                self._fh = None
-            self._current_date = today
-            self._current_file = os.path.join(
+    def _write_line(self, record: dict) -> None:
+        """Blocking write — runs in the executor, never in the event loop."""
+        try:
+            if not self._dir_ready:
+                os.makedirs(self.log_dir, exist_ok=True)
+                self._dir_ready = True
+            today = dt_util.now().strftime("%Y-%m-%d")
+            filepath = os.path.join(
                 self.log_dir, f"{self.controller_name}_{today}.jsonl"
             )
-        return self._current_file
+            with open(filepath, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as err:
+            _LOGGER.error("Failed to write decision log: %s", err)
 
     async def log(
         self,
@@ -78,18 +74,11 @@ class DecisionLogger:
             "readings": readings,
         }
 
-        filepath = self._get_log_file()
-        try:
-            with open(filepath, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError as err:
-            _LOGGER.error("Failed to write decision log: %s", err)
+        await self.hass.async_add_executor_job(self._write_line, record)
 
     async def close(self) -> None:
-        """Close file handle."""
-        if self._fh:
-            self._fh.close()
-            self._fh = None
+        """No persistent handles to close (writes are per-record)."""
+        return
 
     def list_log_files(self) -> list[str]:
         """Return list of log files."""

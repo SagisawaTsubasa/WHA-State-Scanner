@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval
 
 from .condition_engine import ConditionEngine
@@ -99,7 +99,11 @@ class ControllerManager:
         """Allow switch/binary_sensor to register themselves."""
         self._entities[entity_id] = entity
 
-    @callback
+    @property
+    def entities(self) -> dict[str, Any]:
+        """Expose registered output entities (read-only view)."""
+        return self._entities
+
     async def _async_evaluate(self, _now) -> None:
         """Evaluate all outputs."""
         readings = {}
