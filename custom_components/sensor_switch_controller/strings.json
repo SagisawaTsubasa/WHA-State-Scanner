@@ -51,7 +51,7 @@
       }
     },
     "error": {
-      "invalid_yaml": "Invalid YAML format"
+      "empty_group": "A group condition requires at least one member."
     }
   },
   "options": {
@@ -59,6 +59,27 @@
       "init": {
         "title": "Edit HA Whole-House State Scanner",
         "description": "Select what to modify."
+      },
+      "edit_interval": {
+        "title": "Edit Polling Interval",
+        "description": "How often the controller evaluates conditions.",
+        "data": {
+          "scan_interval": "Interval (seconds, 10-3600)"
+        }
+      },
+      "edit_logging": {
+        "title": "Edit Logging Settings",
+        "description": "Decision logs are written as JSONL under sensor_switch_controller_logs/.",
+        "data": {
+          "logging_enabled": "Write decision logs to file"
+        }
+      },
+      "edit_sensors": {
+        "title": "Edit Sensor Pool",
+        "description": "Select all sensors that participate in logic evaluation.",
+        "data": {
+          "entities": "Sensors"
+        }
       },
       "opt_conditions_menu": {
         "title": "HA Whole-House State Scanner",
@@ -136,6 +157,9 @@
         "title": "HA Whole-House State Scanner",
         "description": "Select the output entity to delete."
       }
+    },
+    "error": {
+      "empty_group": "A group condition requires at least one member."
     }
   }
 }

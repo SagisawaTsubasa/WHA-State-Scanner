@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import uuid
 from typing import Any
 
@@ -58,25 +59,16 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
 
     def __init__(self) -> None:
         super().__init__()
+        # Wizard state lives on the flow instance (M13) — never in
+        # hass.data[DOMAIN], which is reserved for runtime managers.
         self._data: dict[str, Any] = {}
-
-    def _get_store(self) -> dict:
-        self.hass.data.setdefault(DOMAIN, {})
-        if self.flow_id not in self.hass.data[DOMAIN]:
-            self.hass.data[DOMAIN][self.flow_id] = {}
-        return self.hass.data[DOMAIN][self.flow_id]
-
-    def _clear_store(self) -> None:
-        self.hass.data[DOMAIN].pop(self.flow_id, None)
 
     # ---------- Step 1: Basic ----------
     async def async_step_user(self, user_input=None):
-        errors = {}
-        store = self._get_store()
         if user_input is not None:
-            store["name"] = user_input[CONF_NAME]
-            store["scan_interval"] = user_input[CONF_SCAN_INTERVAL]
-            store["logging"] = user_input[CONF_LOGGING]
+            self._data["name"] = user_input[CONF_NAME]
+            self._data["scan_interval"] = user_input[CONF_SCAN_INTERVAL]
+            self._data["logging"] = user_input[CONF_LOGGING]
             return await self.async_step_sensors()
         schema = vol.Schema({
             vol.Required(CONF_NAME): str,
@@ -85,17 +77,15 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             ),
             vol.Optional(CONF_LOGGING, default=False): bool,
         })
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+        return self.async_show_form(step_id="user", data_schema=schema)
 
     # ---------- Step 2: Sensors ----------
     async def async_step_sensors(self, user_input=None):
-        errors = {}
-        store = self._get_store()
-        current = store.get("sensors", [])
+        current = self._data.get("sensors", [])
         if user_input is not None:
             selected = user_input.get("entities", [])
             existing = {s["entity_id"]: s.get("alias", "") for s in current}
-            store["sensors"] = [
+            self._data["sensors"] = [
                 {"entity_id": eid, "alias": existing.get(eid, "")}
                 for eid in selected
             ]
@@ -105,12 +95,11 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 selector.EntitySelectorConfig(multiple=True)
             ),
         })
-        return self.async_show_form(step_id="sensors", data_schema=schema, errors=errors)
+        return self.async_show_form(step_id="sensors", data_schema=schema)
 
     # ---------- Step 3: Conditions Menu ----------
     async def async_step_conditions_menu(self, user_input=None):
-        store = self._get_store()
-        conditions = store.get("conditions", [])
+        conditions = self._data.get("conditions", [])
         if user_input is not None:
             action = user_input.get("action")
             if action == "add":
@@ -141,8 +130,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
     async def async_step_add_condition(self, user_input=None):
         if user_input is not None:
             ctype = user_input["condition_type"]
-            store = self._get_store()
-            store["_pending_cond_type"] = ctype
+            self._data["_pending_cond_type"] = ctype
             if ctype == COND_NUMERIC_STATE:
                 return await self.async_step_cond_numeric()
             if ctype == COND_STATE:
@@ -175,12 +163,11 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
 
     # ---------- Step 3b-f: Condition forms ----------
     async def async_step_cond_numeric(self, user_input=None):
-        store = self._get_store()
-        sensors = store.get("sensors", [])
+        sensors = self._data.get("sensors", [])
         sensor_options = _sensor_options(sensors)
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_NUMERIC_STATE,
                 "label": user_input.get("label", "数值条件"),
                 "entity_id": user_input["entity_id"],
@@ -193,7 +180,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                     "minutes": user_input.get("for_minutes", 0),
                     "seconds": user_input.get("for_seconds", 0),
                 }
-            store.setdefault("conditions", []).append(cond)
+            self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
             vol.Optional("label", default="数值条件"): str,
@@ -210,14 +197,13 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         return self.async_show_form(step_id="cond_numeric", data_schema=schema)
 
     async def async_step_cond_state(self, user_input=None):
-        store = self._get_store()
-        sensors = store.get("sensors", [])
+        sensors = self._data.get("sensors", [])
         sensor_options = _sensor_options(sensors)
         if user_input is not None:
-            state_val = user_input["state"]
+            state_val = user_input["state"].strip()
             states = [s.strip() for s in state_val.split(",")] if "," in state_val else state_val
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_STATE,
                 "label": user_input.get("label", "状态条件"),
                 "entity_id": user_input["entity_id"],
@@ -229,7 +215,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                     "minutes": user_input.get("for_minutes", 0),
                     "seconds": user_input.get("for_seconds", 0),
                 }
-            store.setdefault("conditions", []).append(cond)
+            self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
             vol.Optional("label", default="状态条件"): str,
@@ -245,10 +231,9 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         return self.async_show_form(step_id="cond_state", data_schema=schema)
 
     async def async_step_cond_time(self, user_input=None):
-        store = self._get_store()
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TIME,
                 "label": user_input.get("label", "时间条件"),
             }
@@ -256,7 +241,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 cond["after"] = user_input["after"]
             if user_input.get("before"):
                 cond["before"] = user_input["before"]
-            store.setdefault("conditions", []).append(cond)
+            self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
             vol.Optional("label", default="时间条件"): str,
@@ -266,10 +251,9 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         return self.async_show_form(step_id="cond_time", data_schema=schema)
 
     async def async_step_cond_sun(self, user_input=None):
-        store = self._get_store()
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_SUN,
                 "label": user_input.get("label", "日出日落条件"),
             }
@@ -283,7 +267,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 off = user_input.get("before_offset", 0)
                 if off != 0:
                     cond["before_offset"] = off
-            store.setdefault("conditions", []).append(cond)
+            self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
             vol.Optional("label", default="日出日落条件"): str,
@@ -313,15 +297,14 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         return self.async_show_form(step_id="cond_sun", data_schema=schema)
 
     async def async_step_cond_template(self, user_input=None):
-        store = self._get_store()
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TEMPLATE,
                 "label": user_input.get("label", "模板条件"),
                 "value_template": user_input["template"],
             }
-            store.setdefault("conditions", []).append(cond)
+            self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
             vol.Optional("label", default="模板条件"): str,
@@ -332,32 +315,37 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         return self.async_show_form(step_id="cond_template", data_schema=schema)
 
     async def async_step_cond_group(self, user_input=None):
-        store = self._get_store()
-        conditions = store.get("conditions", [])
+        conditions = self._data.get("conditions", [])
         cond_options = _condition_options(conditions)
-        ctype = store.get("_pending_cond_type", COND_AND)
-        if user_input is not None:
-            cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
-                "type": ctype,
-                "label": user_input.get("label", f"{ctype.upper()} 组合"),
-                "conditions": user_input.get("members", []),
-            }
-            store.setdefault("conditions", []).append(cond)
-            return await self.async_step_conditions_menu()
+        ctype = self._data.get("_pending_cond_type", COND_AND)
         schema = vol.Schema({
             vol.Optional("label", default=f"{ctype.upper()} 组合"): str,
             vol.Required("members", default=[]): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=cond_options, multiple=True, mode="list")
             ),
         })
+        if user_input is not None:
+            members = user_input.get("members", [])
+            if not members:
+                # M3: an empty AND/OR group would force outputs every cycle.
+                return self.async_show_form(
+                    step_id="cond_group", data_schema=schema,
+                    errors={"base": "empty_group"},
+                )
+            cond = {
+                "id": f"cond_{uuid.uuid4().hex}",
+                "type": ctype,
+                "label": user_input.get("label", f"{ctype.upper()} 组合"),
+                "conditions": members,
+            }
+            self._data.setdefault("conditions", []).append(cond)
+            return await self.async_step_conditions_menu()
         return self.async_show_form(step_id="cond_group", data_schema=schema)
 
     # ---------- Step 4: Outputs ----------
     async def async_step_outputs(self, user_input=None):
-        store = self._get_store()
-        outputs = store.get("outputs", [])
-        conditions = store.get("conditions", [])
+        outputs = self._data.get("outputs", [])
+        conditions = self._data.get("conditions", [])
         cond_options = _condition_options(conditions)
         if user_input is not None:
             action = user_input.get("action")
@@ -365,13 +353,13 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 out = {
                     "name": user_input["name"],
                     "type": user_input["output_type"],
-                    "entity_id": f"ssc_{uuid.uuid4().hex[:6]}",
+                    "entity_id": f"ssc_{uuid.uuid4().hex}",
                     "on_conditions": user_input.get("on_conditions", []),
                     "off_conditions": user_input.get("off_conditions", []),
                     "manual_override": user_input.get("manual_override", False),
                 }
                 outputs.append(out)
-                store["outputs"] = outputs
+                self._data["outputs"] = outputs
                 return await self.async_step_outputs()
             if action == "done":
                 if not outputs:
@@ -418,8 +406,10 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
 
     # ---------- Step 5: Confirm ----------
     async def async_step_confirm(self, user_input=None):
-        store = self._get_store()
+        store = self._data
         if user_input is not None:
+            # Only known model keys are persisted — internal bookkeeping keys
+            # (leading underscore) never leak into entry options (M6).
             data = {
                 CONF_SCAN_INTERVAL: store["scan_interval"],
                 CONF_LOGGING: store["logging"],
@@ -427,7 +417,6 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 CONF_CONDITIONS: store.get("conditions", []),
                 CONF_OUTPUTS: store.get("outputs", []),
             }
-            self._clear_store()
             return self.async_create_entry(title=store["name"], data={}, options=data)
         sensors = store.get("sensors", [])
         conditions = store.get("conditions", [])
@@ -461,16 +450,68 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
 class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     """Options flow with full incremental condition editing."""
 
+    def __init__(self) -> None:
+        """Init with per-flow state (never persisted into options)."""
+        super().__init__()
+        self._opts_cache: dict[str, Any] | None = None
+        self._pending_cond_type: str = COND_AND
+        self._editing_cond_id: str | None = None
+
     @property
     def _opts(self) -> dict:
-        """Working copy of options, lazily initialised from the config entry.
+        """Deep copy of the entry options, lazily initialised.
 
         config_entry is not available during __init__ on modern HA,
-        so it must be read lazily inside step methods.
+        so it must be read lazily inside step methods. The deep copy keeps
+        the running entry untouched until the flow is saved.
         """
-        if "_opts_cache" not in self.__dict__:
-            self.__dict__["_opts_cache"] = dict(self.config_entry.options)
-        return self.__dict__["_opts_cache"]
+        if self._opts_cache is None:
+            self._opts_cache = copy.deepcopy(dict(self.config_entry.options))
+        return self._opts_cache
+
+    def _clean_options(self) -> dict[str, Any]:
+        """Return options without internal bookkeeping keys (M6/M13)."""
+        return {
+            key: value
+            for key, value in self._opts.items()
+            if not str(key).startswith("_")
+        }
+
+    def _cascade_remove_condition(self, cid: str) -> None:
+        """Drop dangling references to a deleted condition (M4)."""
+        for group in self._opts.get(CONF_CONDITIONS, []):
+            if isinstance(group, dict) and group.get("type") in (COND_AND, COND_OR):
+                members = group.get("conditions")
+                if isinstance(members, list):
+                    group["conditions"] = [m for m in members if m != cid]
+        for out in self._opts.get(CONF_OUTPUTS, []):
+            if not isinstance(out, dict):
+                continue
+            for key in ("on_conditions", "off_conditions"):
+                refs = out.get(key)
+                if isinstance(refs, list):
+                    out[key] = [m for m in refs if m != cid]
+
+    @staticmethod
+    def _ancestor_ids(conditions: list[dict], group_id: str) -> set[str]:
+        """IDs of groups that (transitively) contain group_id, plus itself (M5)."""
+        excluded = {group_id}
+        parents: dict[str, set[str]] = {}
+        for cond in conditions:
+            if isinstance(cond, dict) and cond.get("type") in (COND_AND, COND_OR):
+                gid = cond.get("id")
+                if not gid:
+                    continue
+                for member in cond.get("conditions", []) or []:
+                    parents.setdefault(member, set()).add(gid)
+        stack = [group_id]
+        while stack:
+            current = stack.pop()
+            for parent in parents.get(current, ()):
+                if parent not in excluded:
+                    excluded.add(parent)
+                    stack.append(parent)
+        return excluded
 
     # ---------- Main menu ----------
     async def async_step_init(self, user_input=None):
@@ -506,7 +547,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_edit_interval(self, user_input=None):
         if user_input is not None:
             self._opts[CONF_SCAN_INTERVAL] = user_input[CONF_SCAN_INTERVAL]
-            return self.async_create_entry(title="", data=self._opts)
+            return self.async_create_entry(title="", data=self._clean_options())
         schema = vol.Schema({
             vol.Optional(
                 CONF_SCAN_INTERVAL,
@@ -519,7 +560,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_edit_logging(self, user_input=None):
         if user_input is not None:
             self._opts[CONF_LOGGING] = user_input[CONF_LOGGING]
-            return self.async_create_entry(title="", data=self._opts)
+            return self.async_create_entry(title="", data=self._clean_options())
         schema = vol.Schema({
             vol.Optional(
                 CONF_LOGGING,
@@ -539,7 +580,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
                 for eid in selected
             ]
             self._opts[CONF_SENSORS] = sensors
-            return self.async_create_entry(title="", data=self._opts)
+            return self.async_create_entry(title="", data=self._clean_options())
         schema = vol.Schema({
             vol.Optional("entities", default=[s["entity_id"] for s in current]): selector.EntitySelector(
                 selector.EntitySelectorConfig(multiple=True)
@@ -563,7 +604,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             if action == "delete":
                 return await self.async_step_opt_delete_select()
             if action == "done":
-                return self.async_create_entry(title="", data=self._opts)
+                return self.async_create_entry(title="", data=self._clean_options())
         menu_items = [f"{i+1}. [{c['type']}] {c.get('label', c['id'])}" for i, c in enumerate(conditions)]
         schema = vol.Schema({
             vol.Optional("action", default="done"): selector.SelectSelector(
@@ -590,7 +631,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_opt_add_cond_type(self, user_input=None):
         if user_input is not None:
             ctype = user_input["condition_type"]
-            self._opts["_pending_cond_type"] = ctype
+            self._pending_cond_type = ctype
             if ctype == COND_NUMERIC_STATE:
                 return await self.async_step_opt_cond_numeric()
             if ctype == COND_STATE:
@@ -627,7 +668,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         cond_options = _condition_options(conditions)
         if user_input is not None:
             cid = user_input["cond_id"]
-            self._opts["_editing_cond_id"] = cid
+            self._editing_cond_id = cid
             cond = next((c for c in conditions if c["id"] == cid), None)
             if not cond:
                 return await self.async_step_opt_conditions_menu()
@@ -658,6 +699,8 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             cid = user_input["cond_id"]
             self._opts[CONF_CONDITIONS] = [c for c in conditions if c["id"] != cid]
+            # Cascade: also purge the deleted id from groups and outputs (M4).
+            self._cascade_remove_condition(cid)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
             vol.Required("cond_id"): selector.SelectSelector(
@@ -675,7 +718,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         sensor_options = _sensor_options(sensors)
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_NUMERIC_STATE,
                 "label": user_input.get("label", "数值条件"),
                 "entity_id": user_input["entity_id"],
@@ -708,10 +751,10 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         sensors = self._opts.get(CONF_SENSORS, [])
         sensor_options = _sensor_options(sensors)
         if user_input is not None:
-            state_val = user_input["state"]
+            state_val = user_input["state"].strip()
             states = [s.strip() for s in state_val.split(",")] if "," in state_val else state_val
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_STATE,
                 "label": user_input.get("label", "状态条件"),
                 "entity_id": user_input["entity_id"],
@@ -741,7 +784,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_opt_cond_time(self, user_input=None):
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TIME,
                 "label": user_input.get("label", "时间条件"),
             }
@@ -761,7 +804,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_opt_cond_sun(self, user_input=None):
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_SUN,
                 "label": user_input.get("label", "日出日落条件"),
             }
@@ -807,7 +850,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_opt_cond_template(self, user_input=None):
         if user_input is not None:
             cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
+                "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TEMPLATE,
                 "label": user_input.get("label", "模板条件"),
                 "value_template": user_input["template"],
@@ -825,22 +868,29 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_opt_cond_group(self, user_input=None):
         conditions = self._opts.get(CONF_CONDITIONS, [])
         cond_options = _condition_options(conditions)
-        ctype = self._opts.get("_pending_cond_type", COND_AND)
-        if user_input is not None:
-            cond = {
-                "id": f"cond_{uuid.uuid4().hex[:6]}",
-                "type": ctype,
-                "label": user_input.get("label", f"{ctype.upper()} 组合"),
-                "conditions": user_input.get("members", []),
-            }
-            self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
-            return await self.async_step_opt_conditions_menu()
+        ctype = self._pending_cond_type
         schema = vol.Schema({
             vol.Optional("label", default=f"{ctype.upper()} 组合"): str,
             vol.Required("members", default=[]): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=cond_options, multiple=True, mode="list")
             ),
         })
+        if user_input is not None:
+            members = user_input.get("members", [])
+            if not members:
+                # M3: an empty AND/OR group would force outputs every cycle.
+                return self.async_show_form(
+                    step_id="opt_cond_group", data_schema=schema,
+                    errors={"base": "empty_group"},
+                )
+            cond = {
+                "id": f"cond_{uuid.uuid4().hex}",
+                "type": ctype,
+                "label": user_input.get("label", f"{ctype.upper()} 组合"),
+                "conditions": members,
+            }
+            self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
+            return await self.async_step_opt_conditions_menu()
         return self.async_show_form(step_id="opt_cond_group", data_schema=schema)
 
     # ================================================================
@@ -848,7 +898,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
     # ================================================================
 
     def _get_editing_cond(self) -> dict | None:
-        cid = self._opts.get("_editing_cond_id")
+        cid = self._editing_cond_id
         conditions = self._opts.get(CONF_CONDITIONS, [])
         return next((c for c in conditions if c["id"] == cid), None)
 
@@ -908,7 +958,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             new_cond = dict(cond)
             new_cond["label"] = user_input.get("label", cond.get("label", ""))
             new_cond["entity_id"] = user_input["entity_id"]
-            sval = user_input["state"]
+            sval = user_input["state"].strip()
             states = [s.strip() for s in sval.split(",")] if "," in sval else sval
             new_cond["state"] = states if isinstance(states, list) and len(states) > 1 else sval
             if user_input.get("for_enabled"):
@@ -1037,19 +1087,33 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         if not cond:
             return await self.async_step_opt_conditions_menu()
         conditions = self._opts.get(CONF_CONDITIONS, [])
-        cond_options = _condition_options(conditions)
-        if user_input is not None:
-            new_cond = dict(cond)
-            new_cond["label"] = user_input.get("label", cond.get("label", ""))
-            new_cond["conditions"] = user_input.get("members", [])
-            self._replace_cond(new_cond)
-            return await self.async_step_opt_conditions_menu()
+        # M5: exclude the group itself and all of its (transitive) ancestors
+        # from the member options so self-reference/cycles cannot be built.
+        excluded = self._ancestor_ids(conditions, cond["id"])
+        cond_options = [
+            option
+            for option in _condition_options(conditions)
+            if option["value"] not in excluded
+        ]
         schema = vol.Schema({
             vol.Optional("label", default=cond.get("label", "组合条件")): str,
             vol.Required("members", default=cond.get("conditions", [])): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=cond_options, multiple=True, mode="list")
             ),
         })
+        if user_input is not None:
+            members = user_input.get("members", [])
+            if not members:
+                # M3: an empty AND/OR group would force outputs every cycle.
+                return self.async_show_form(
+                    step_id="opt_edit_group", data_schema=schema,
+                    errors={"base": "empty_group"},
+                )
+            new_cond = dict(cond)
+            new_cond["label"] = user_input.get("label", cond.get("label", ""))
+            new_cond["conditions"] = members
+            self._replace_cond(new_cond)
+            return await self.async_step_opt_conditions_menu()
         return self.async_show_form(step_id="opt_edit_group", data_schema=schema)
 
     # ================================================================
@@ -1065,7 +1129,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             if action == "delete":
                 return await self.async_step_opt_delete_output()
             if action == "done":
-                return self.async_create_entry(title="", data=self._opts)
+                return self.async_create_entry(title="", data=self._clean_options())
         out_lines = [f"{i+1}. {o['name']} ({o['type']})" for i, o in enumerate(outputs)]
         schema = vol.Schema({
             vol.Optional("action", default="done"): selector.SelectSelector(
@@ -1094,7 +1158,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             out = {
                 "name": user_input["name"],
                 "type": user_input["output_type"],
-                "entity_id": f"ssc_{uuid.uuid4().hex[:6]}",
+                "entity_id": f"ssc_{uuid.uuid4().hex}",
                 "on_conditions": user_input.get("on_conditions", []),
                 "off_conditions": user_input.get("off_conditions", []),
                 "manual_override": user_input.get("manual_override", False),

@@ -24,6 +24,3 @@ OUTPUT_SWITCH = "switch"
 OUTPUT_BINARY_SENSOR = "binary_sensor"
 
 DEFAULT_SCAN_INTERVAL = 180
-
-# Flow storage
-FLOW_DATA = "flow_data"
