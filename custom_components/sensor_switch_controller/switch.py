@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -10,6 +12,8 @@ from homeassistant.helpers.entity import DeviceInfo
 from .const import CONF_OUTPUTS, DOMAIN, OUTPUT_SWITCH
 from .controller import ControllerManager
 
+_LOGGER = logging.getLogger(__name__)
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
@@ -17,10 +21,13 @@ async def async_setup_entry(
     """Set up switches."""
     manager: ControllerManager = hass.data[DOMAIN][entry.entry_id]
     outputs = entry.options.get(CONF_OUTPUTS, [])
-    entities = []
-    for out in outputs:
-        if out.get("type") == OUTPUT_SWITCH:
-            entities.append(SensorSwitch(hass, manager, entry, out))
+    entities = [
+        SensorSwitch(hass, manager, entry, out)
+        for out in outputs
+        if isinstance(out, dict)
+        and out.get("type") == OUTPUT_SWITCH
+        and out.get("entity_id")
+    ]
     async_add_entities(entities)
 
 
@@ -34,13 +41,12 @@ class SensorSwitch(SwitchEntity):
         """Init."""
         self.hass = hass
         self._manager = manager
-        self._config = out_cfg
+        self._out_id = out_cfg["entity_id"]
         self._attr_name = out_cfg.get("name")
         self._attr_unique_id = f"{entry.entry_id}_{out_cfg.get('entity_id')}"
         self._attr_is_on = False
         self._manual_override = out_cfg.get("manual_override", False)
-        self._controller_lock = False
-        manager.register_entity(self._attr_unique_id, self)
+        manager.register_entity(self._out_id, self)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -50,6 +56,16 @@ class SensorSwitch(SwitchEntity):
             manufacturer="Sensor Switch Controller",
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Notify the manager so the first evaluation can be triggered."""
+        await super().async_added_to_hass()
+        self._manager.async_entity_added(self._out_id)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Drop the stale entity reference from the manager."""
+        await super().async_will_remove_from_hass()
+        self._manager.unregister_entity(self._out_id)
+
     @property
     def extra_state_attributes(self) -> dict:
         return {
@@ -58,25 +74,33 @@ class SensorSwitch(SwitchEntity):
         }
 
     async def async_controller_turn_on(self) -> None:
-        if self._manual_override and self._attr_is_on:
+        """Called by the controller; ignored while manual override is on."""
+        if self._manual_override:
+            _LOGGER.debug(
+                "Output %s is in manual override; controller turn_on ignored",
+                self._out_id,
+            )
             return
-        self._controller_lock = True
         self._attr_is_on = True
         self.async_write_ha_state()
-        self._controller_lock = False
 
     async def async_controller_turn_off(self) -> None:
-        if self._manual_override and not self._attr_is_on:
+        """Called by the controller; ignored while manual override is on."""
+        if self._manual_override:
+            _LOGGER.debug(
+                "Output %s is in manual override; controller turn_off ignored",
+                self._out_id,
+            )
             return
-        self._controller_lock = True
         self._attr_is_on = False
         self.async_write_ha_state()
-        self._controller_lock = False
 
     async def async_turn_on(self, **kwargs) -> None:
+        """Manual user control — always available, even in override."""
         self._attr_is_on = True
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        """Manual user control — always available, even in override."""
         self._attr_is_on = False
         self.async_write_ha_state()

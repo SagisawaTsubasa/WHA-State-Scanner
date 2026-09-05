@@ -17,10 +17,13 @@ async def async_setup_entry(
     """Set up binary sensors."""
     manager: ControllerManager = hass.data[DOMAIN][entry.entry_id]
     outputs = entry.options.get(CONF_OUTPUTS, [])
-    entities = []
-    for out in outputs:
-        if out.get("type") == OUTPUT_BINARY_SENSOR:
-            entities.append(SensorBinarySensor(hass, manager, entry, out))
+    entities = [
+        SensorBinarySensor(hass, manager, entry, out)
+        for out in outputs
+        if isinstance(out, dict)
+        and out.get("type") == OUTPUT_BINARY_SENSOR
+        and out.get("entity_id")
+    ]
     async_add_entities(entities)
 
 
@@ -33,11 +36,11 @@ class SensorBinarySensor(BinarySensorEntity):
         """Init."""
         self.hass = hass
         self._manager = manager
-        self._config = out_cfg
+        self._out_id = out_cfg["entity_id"]
         self._attr_name = out_cfg.get("name")
         self._attr_unique_id = f"{entry.entry_id}_{out_cfg.get('entity_id')}"
         self._attr_is_on = False
-        manager.register_entity(self._attr_unique_id, self)
+        manager.register_entity(self._out_id, self)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -46,6 +49,16 @@ class SensorBinarySensor(BinarySensorEntity):
             name=self._manager.name,
             manufacturer="Sensor Switch Controller",
         )
+
+    async def async_added_to_hass(self) -> None:
+        """Notify the manager so the first evaluation can be triggered."""
+        await super().async_added_to_hass()
+        self._manager.async_entity_added(self._out_id)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Drop the stale entity reference from the manager."""
+        await super().async_will_remove_from_hass()
+        self._manager.unregister_entity(self._out_id)
 
     async def async_controller_turn_on(self) -> None:
         self._attr_is_on = True

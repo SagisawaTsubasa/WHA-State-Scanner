@@ -12,9 +12,18 @@ from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
+LOG_DIR_NAME = "sensor_switch_controller_logs"
+LOG_FILE_PREFIX = "log_"
+LOG_RETENTION_DAYS = 30
+
 
 class DecisionLogger:
-    """Logs every evaluation cycle to a dedicated file, not HA system log."""
+    """Logs evaluation decisions to one JSONL file per day.
+
+    File name is fixed to ``log_YYYY-MM-DD.jsonl`` inside a per-entry
+    directory, so user-provided controller names can never produce invalid
+    file names. All blocking file IO runs in the executor.
+    """
 
     def __init__(
         self,
@@ -31,80 +40,67 @@ class DecisionLogger:
 
         # Log directory: <config>/sensor_switch_controller_logs/<entry_id>/
         self.log_dir = os.path.join(
-            hass.config.config_dir,
-            "sensor_switch_controller_logs",
-            entry_id,
+            hass.config.config_dir, LOG_DIR_NAME, entry_id
         )
         self._dir_ready = False
 
-    def _write_line(self, record: dict) -> None:
-        """Blocking write — runs in the executor, never in the event loop."""
+    # ------------------------------------------------------------------
+    # Writing
+    # ------------------------------------------------------------------
+
+    def _write_lines(self, records: list[dict]) -> None:
+        """Blocking write of one evaluation cycle — runs in the executor."""
         try:
             if not self._dir_ready:
                 os.makedirs(self.log_dir, exist_ok=True)
                 self._dir_ready = True
             today = dt_util.now().strftime("%Y-%m-%d")
             filepath = os.path.join(
-                self.log_dir, f"{self.controller_name}_{today}.jsonl"
+                self.log_dir, f"{LOG_FILE_PREFIX}{today}.jsonl"
             )
             with open(filepath, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                for record in records:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as err:
             _LOGGER.error("Failed to write decision log: %s", err)
 
-    async def log(
-        self,
-        output: str,
-        readings: dict,
-        on_met: bool,
-        off_met: bool,
-        decision: str,
-    ) -> None:
-        """Append a decision record to the log file."""
+    async def log_cycle(self, records: list[dict]) -> None:
+        """Append all decision records of one evaluation cycle in one write."""
+        if not self.enabled or not records:
+            return
+        timestamp = dt_util.now().isoformat()
+        enriched = [
+            {"timestamp": timestamp, "controller": self.controller_name, **record}
+            for record in records
+        ]
+        await self.hass.async_add_executor_job(self._write_lines, enriched)
+
+    # ------------------------------------------------------------------
+    # Retention
+    # ------------------------------------------------------------------
+
+    def _cleanup_old_logs(self) -> None:
+        """Delete log files older than the retention period — executor only."""
+        try:
+            if not os.path.isdir(self.log_dir):
+                return
+            cutoff = dt_util.now().timestamp() - LOG_RETENTION_DAYS * 86400
+            for filename in os.listdir(self.log_dir):
+                if not filename.startswith(LOG_FILE_PREFIX) or not filename.endswith(
+                    ".jsonl"
+                ):
+                    continue
+                path = os.path.join(self.log_dir, filename)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                except OSError as err:
+                    _LOGGER.warning("Could not remove old log %s: %s", path, err)
+        except OSError as err:
+            _LOGGER.warning("Could not clean up decision logs: %s", err)
+
+    async def async_cleanup(self) -> None:
+        """Clean up old log files according to the retention period."""
         if not self.enabled:
             return
-
-        record = {
-            "timestamp": dt_util.now().isoformat(),
-            "controller": self.controller_name,
-            "output": output,
-            "decision": decision,
-            "on_met": on_met,
-            "off_met": off_met,
-            "readings": readings,
-        }
-
-        await self.hass.async_add_executor_job(self._write_line, record)
-
-    async def close(self) -> None:
-        """No persistent handles to close (writes are per-record)."""
-        return
-
-    def list_log_files(self) -> list[str]:
-        """Return list of log files."""
-        try:
-            return sorted(
-                f for f in os.listdir(self.log_dir) if f.endswith(".jsonl")
-            )
-        except OSError:
-            return []
-
-    def read_log(self, filename: str, tail: int = 100) -> list[dict]:
-        """Read last N lines from a log file."""
-        filepath = os.path.join(self.log_dir, filename)
-        if not os.path.exists(filepath):
-            return []
-        try:
-            with open(filepath, "r", encoding="utf-8") as fh:
-                lines = fh.readlines()
-            records = []
-            for line in lines[-tail:]:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-            return records
-        except OSError:
-            return []
+        await self.hass.async_add_executor_job(self._cleanup_old_logs)

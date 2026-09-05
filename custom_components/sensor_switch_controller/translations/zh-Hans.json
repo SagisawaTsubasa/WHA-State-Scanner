@@ -11,7 +11,7 @@
       },
       "conditions_menu": {
         "title": "HA全屋状态扫描",
-        "description": "当前条件:\\n{conditions_list}"
+        "description": "当前条件:\n{conditions_list}"
       },
       "add_condition": {
         "title": "HA全屋状态扫描",
@@ -43,7 +43,7 @@
       },
       "outputs": {
         "title": "HA全屋状态扫描",
-        "description": "当前输出:\\n{outputs_list}"
+        "description": "当前输出:\n{outputs_list}"
       },
       "confirm": {
         "title": "HA全屋状态扫描",
@@ -51,7 +51,7 @@
       }
     },
     "error": {
-      "invalid_yaml": "YAML 格式无效"
+      "empty_group": "组合条件至少需要选择一个成员条件。"
     }
   },
   "options": {
@@ -60,9 +60,30 @@
         "title": "修改HA全屋状态扫描配置",
         "description": "选择要修改的项目。"
       },
+      "edit_interval": {
+        "title": "修改轮询间隔",
+        "description": "控制器评估条件的频率。",
+        "data": {
+          "scan_interval": "间隔（秒，10-3600）"
+        }
+      },
+      "edit_logging": {
+        "title": "修改日志设置",
+        "description": "决策日志以 JSONL 格式写入 sensor_switch_controller_logs/ 目录。",
+        "data": {
+          "logging_enabled": "将决策日志写入文件"
+        }
+      },
+      "edit_sensors": {
+        "title": "修改传感器池",
+        "description": "选择所有需要参与逻辑判断的传感器。",
+        "data": {
+          "entities": "传感器"
+        }
+      },
       "opt_conditions_menu": {
         "title": "HA全屋状态扫描",
-        "description": "当前条件:\\n{conditions_list}"
+        "description": "当前条件:\n{conditions_list}"
       },
       "opt_add_cond_type": {
         "title": "HA全屋状态扫描",
@@ -126,7 +147,7 @@
       },
       "opt_outputs_menu": {
         "title": "HA全屋状态扫描",
-        "description": "当前输出:\\n{outputs_list}"
+        "description": "当前输出:\n{outputs_list}"
       },
       "opt_add_output": {
         "title": "HA全屋状态扫描",
@@ -136,6 +157,9 @@
         "title": "HA全屋状态扫描",
         "description": "选择要删除的输出实体。"
       }
+    },
+    "error": {
+      "empty_group": "组合条件至少需要选择一个成员条件。"
     }
   }
 }
