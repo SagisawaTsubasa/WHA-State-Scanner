@@ -408,7 +408,9 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
                 CONF_CONDITIONS: store.get("conditions", []),
                 CONF_OUTPUTS: store.get("outputs", []),
             }
-            return self.async_create_entry(title=store["name"], data={}, options=data)
+            # HA 2026 起 config flow 创建条目不再落地 options——配置放 data，
+# async_setup_entry 首次启动时镜像到 options（运行时统一读 options）。
+            return self.async_create_entry(title=store["name"], data=data)
         sensors = store.get("sensors", [])
         conditions = store.get("conditions", [])
         outputs = store.get("outputs", [])

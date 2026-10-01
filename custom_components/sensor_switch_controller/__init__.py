@@ -22,6 +22,10 @@ FORCE_EVALUATE_SCHEMA = vol.Schema(
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    # 向后兼容：flow 把向导结果存进 data（2026 起 options 不落地），
+    # options 为空时镜像一次；此后 options flow 的修改只写 options。
+    if not entry.options and entry.data:
+        hass.config_entries.async_update_entry(entry, options=dict(entry.data))
     """Set up from a config entry."""
     manager = ControllerManager(hass, entry)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = manager
