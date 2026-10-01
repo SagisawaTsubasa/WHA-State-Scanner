@@ -19,7 +19,7 @@ from .const import (
     CONF_SENSORS,
     DEFAULT_SCAN_INTERVAL,
 )
-from .logbook import DecisionLogger
+from .decision_log import DecisionLogger
 
 _LOGGER = logging.getLogger(__name__)
 
