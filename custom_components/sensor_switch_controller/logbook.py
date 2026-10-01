@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -59,8 +58,7 @@ class DecisionLogger:
                 self.log_dir, f"{LOG_FILE_PREFIX}{today}.jsonl"
             )
             with open(filepath, "a", encoding="utf-8") as fh:
-                for record in records:
-                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.writelines(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
         except OSError as err:
             _LOGGER.error("Failed to write decision log: %s", err)
 

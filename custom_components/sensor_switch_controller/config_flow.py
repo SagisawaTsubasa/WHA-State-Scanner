@@ -111,9 +111,9 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             vol.Optional("action", default="done"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "add", "label": "➕ 添加条件"},
-                        {"value": "done", "label": "✅ 完成条件配置"},
+                        "add", "done",
                     ],
+                    translation_key="cond_menu_action",
                     mode="list",
                 )
             ),
@@ -122,7 +122,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             step_id="conditions_menu",
             data_schema=schema,
             description_placeholders={
-                "conditions_list": "\n".join(menu_items) if menu_items else "（暂无条件）",
+                "conditions_list": "\n".join(menu_items) if menu_items else "-",
             },
         )
 
@@ -146,15 +146,8 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         schema = vol.Schema({
             vol.Required("condition_type"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=[
-                        {"value": COND_NUMERIC_STATE, "label": "数值比较 (numeric_state)"},
-                        {"value": COND_STATE, "label": "状态匹配 (state)"},
-                        {"value": COND_TIME, "label": "时间范围 (time)"},
-                        {"value": COND_SUN, "label": "日出日落 (sun)"},
-                        {"value": COND_TEMPLATE, "label": "模板表达式 (template)"},
-                        {"value": COND_AND, "label": "AND 组合"},
-                        {"value": COND_OR, "label": "OR 组合"},
-                    ],
+                    options=[COND_NUMERIC_STATE, COND_STATE, COND_TIME, COND_SUN, COND_TEMPLATE, COND_AND, COND_OR],
+                    translation_key="condition_type",
                     mode="list",
                 )
             ),
@@ -169,7 +162,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_NUMERIC_STATE,
-                "label": user_input.get("label", "数值条件"),
+                "label": user_input.get("label", COND_NUMERIC_STATE),
                 "entity_id": user_input["entity_id"],
                 "above": user_input.get("above"),
                 "below": user_input.get("below"),
@@ -183,7 +176,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="数值条件"): str,
+            vol.Optional("label", default=COND_NUMERIC_STATE): str,
             vol.Required("entity_id"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=sensor_options, mode="dropdown")
             ),
@@ -205,7 +198,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_STATE,
-                "label": user_input.get("label", "状态条件"),
+                "label": user_input.get("label", COND_STATE),
                 "entity_id": user_input["entity_id"],
                 "state": states if isinstance(states, list) and len(states) > 1 else state_val,
             }
@@ -218,7 +211,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="状态条件"): str,
+            vol.Optional("label", default=COND_STATE): str,
             vol.Required("entity_id"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=sensor_options, mode="dropdown")
             ),
@@ -235,7 +228,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TIME,
-                "label": user_input.get("label", "时间条件"),
+                "label": user_input.get("label", COND_TIME),
             }
             if user_input.get("after"):
                 cond["after"] = user_input["after"]
@@ -244,7 +237,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="时间条件"): str,
+            vol.Optional("label", default=COND_TIME): str,
             vol.Optional("after"): selector.TimeSelector(),
             vol.Optional("before"): selector.TimeSelector(),
         })
@@ -255,14 +248,14 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_SUN,
-                "label": user_input.get("label", "日出日落条件"),
+                "label": user_input.get("label", COND_SUN),
             }
-            if user_input.get("after"):
+            if user_input.get("after") not in ("none", None):
                 cond["after"] = user_input["after"]
                 off = user_input.get("after_offset", 0)
                 if off != 0:
                     cond["after_offset"] = off
-            if user_input.get("before"):
+            if user_input.get("before") not in ("none", None):
                 cond["before"] = user_input["before"]
                 off = user_input.get("before_offset", 0)
                 if off != 0:
@@ -270,14 +263,13 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="日出日落条件"): str,
+            vol.Optional("label", default=COND_SUN): str,
             vol.Optional("after"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "", "label": "（不限制）"},
-                        {"value": "sunrise", "label": "日出后"},
-                        {"value": "sunset", "label": "日落后"},
+                        "none", "sunrise", "sunset",
                     ],
+                    translation_key="sun_after",
                     mode="dropdown",
                 )
             ),
@@ -285,10 +277,9 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             vol.Optional("before"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "", "label": "（不限制）"},
-                        {"value": "sunrise", "label": "日出前"},
-                        {"value": "sunset", "label": "日落前"},
+                        "none", "sunrise", "sunset",
                     ],
+                    translation_key="sun_before",
                     mode="dropdown",
                 )
             ),
@@ -301,13 +292,13 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TEMPLATE,
-                "label": user_input.get("label", "模板条件"),
+                "label": user_input.get("label", COND_TEMPLATE),
                 "value_template": user_input["template"],
             }
             self._data.setdefault("conditions", []).append(cond)
             return await self.async_step_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="模板条件"): str,
+            vol.Optional("label", default=COND_TEMPLATE): str,
             vol.Required("template"): selector.TextSelector(
                 selector.TextSelectorConfig(multiline=True)
             ),
@@ -319,7 +310,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         cond_options = _condition_options(conditions)
         ctype = self._data.get("_pending_cond_type", COND_AND)
         schema = vol.Schema({
-            vol.Optional("label", default=f"{ctype.upper()} 组合"): str,
+            vol.Optional("label", default=ctype): str,
             vol.Required("members", default=[]): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=cond_options, multiple=True, mode="list")
             ),
@@ -335,7 +326,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": ctype,
-                "label": user_input.get("label", f"{ctype.upper()} 组合"),
+                "label": user_input.get("label", ctype),
                 "conditions": members,
             }
             self._data.setdefault("conditions", []).append(cond)
@@ -372,19 +363,19 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             vol.Optional("action", default="add"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "add", "label": "➕ 添加输出实体"},
-                        {"value": "done", "label": "✅ 完成输出配置"},
+                        "add", "done",
                     ],
+                    translation_key="out_menu_action",
                     mode="list",
                 )
             ),
-            vol.Optional("name", default="逻辑开关"): str,
+            vol.Optional("name", default="logic_switch"): str,
             vol.Optional("output_type", default=OUTPUT_SWITCH): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": OUTPUT_SWITCH, "label": "开关 (Switch)"},
-                        {"value": OUTPUT_BINARY_SENSOR, "label": "二进制传感器 (Binary Sensor)"},
+                        OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR,
                     ],
+                    translation_key="output_type",
                     mode="dropdown",
                 )
             ),
@@ -400,7 +391,7 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
             step_id="outputs",
             data_schema=schema,
             description_placeholders={
-                "outputs_list": "\n".join(out_lines) if out_lines else "（暂无输出实体）",
+                "outputs_list": "\n".join(out_lines) if out_lines else "-",
             },
         )
 
@@ -421,20 +412,28 @@ class SensorSwitchControllerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
         sensors = store.get("sensors", [])
         conditions = store.get("conditions", [])
         outputs = store.get("outputs", [])
-        summary = f"**传感器 ({len(sensors)} 个):**\n"
-        for s in sensors:
-            summary += f"- {s.get('alias', s['entity_id'])} ({s['entity_id']})\n"
-        summary += f"\n**条件规则 ({len(conditions)} 条):**\n"
-        for c in conditions:
-            summary += f"- [{c['type']}] {c.get('label', c['id'])}\n"
-        summary += f"\n**输出实体 ({len(outputs)} 个):**\n"
-        for o in outputs:
-            summary += f"- {o['name']} ({o['type']})\n"
-        summary += f"\n**轮询间隔:** {store['scan_interval']} 秒"
-        summary += f"\n**日志:** {'开启' if store['logging'] else '关闭'}"
+        # 值列表保持语言中性，段落标题交给翻译模板
+        sensors_details = "\n".join(
+            f"- {s.get('alias', s['entity_id'])} ({s['entity_id']})" for s in sensors
+        )
+        conditions_details = "\n".join(
+            f"- [{c['type']}] {c.get('label', c['id'])}" for c in conditions
+        )
+        outputs_details = "\n".join(
+            f"- {o['name']} ({o['type']})" for o in outputs
+        )
         return self.async_show_form(
             step_id="confirm",
-            description_placeholders={"summary": summary},
+            description_placeholders={
+                "sensor_count": len(sensors),
+                "condition_count": len(conditions),
+                "output_count": len(outputs),
+                "interval": store["scan_interval"],
+                "logging": "✓" if store["logging"] else "✗",
+                "sensors_details": sensors_details or "-",
+                "conditions_details": conditions_details or "-",
+                "outputs_details": outputs_details or "-",
+            },
         )
 
     @staticmethod
@@ -530,13 +529,8 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         schema = vol.Schema({
             vol.Required("action"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=[
-                        {"value": "interval", "label": "修改轮询间隔"},
-                        {"value": "logging", "label": "修改日志设置"},
-                        {"value": "sensors", "label": "修改传感器池"},
-                        {"value": "conditions", "label": "修改条件规则"},
-                        {"value": "outputs", "label": "修改输出实体"},
-                    ],
+                    options=["interval", "logging", "sensors", "conditions", "outputs"],
+                    translation_key="opt_menu_action",
                     mode="list",
                 )
             ),
@@ -610,11 +604,9 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             vol.Optional("action", default="done"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "add", "label": "➕ 添加条件"},
-                        {"value": "edit", "label": "✏️ 编辑条件"},
-                        {"value": "delete", "label": "🗑️ 删除条件"},
-                        {"value": "done", "label": "✅ 保存并返回"},
+                        "add", "edit", "delete", "done",
                     ],
+                    translation_key="cond_edit_action",
                     mode="list",
                 )
             ),
@@ -623,7 +615,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             step_id="opt_conditions_menu",
             data_schema=schema,
             description_placeholders={
-                "conditions_list": "\n".join(menu_items) if menu_items else "（暂无条件）",
+                "conditions_list": "\n".join(menu_items) if menu_items else "-",
             },
         )
 
@@ -647,15 +639,8 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         schema = vol.Schema({
             vol.Required("condition_type"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=[
-                        {"value": COND_NUMERIC_STATE, "label": "数值比较 (numeric_state)"},
-                        {"value": COND_STATE, "label": "状态匹配 (state)"},
-                        {"value": COND_TIME, "label": "时间范围 (time)"},
-                        {"value": COND_SUN, "label": "日出日落 (sun)"},
-                        {"value": COND_TEMPLATE, "label": "模板表达式 (template)"},
-                        {"value": COND_AND, "label": "AND 组合"},
-                        {"value": COND_OR, "label": "OR 组合"},
-                    ],
+                    options=[COND_NUMERIC_STATE, COND_STATE, COND_TIME, COND_SUN, COND_TEMPLATE, COND_AND, COND_OR],
+                    translation_key="condition_type",
                     mode="list",
                 )
             ),
@@ -720,7 +705,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_NUMERIC_STATE,
-                "label": user_input.get("label", "数值条件"),
+                "label": user_input.get("label", COND_NUMERIC_STATE),
                 "entity_id": user_input["entity_id"],
                 "above": user_input.get("above"),
                 "below": user_input.get("below"),
@@ -734,7 +719,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="数值条件"): str,
+            vol.Optional("label", default=COND_NUMERIC_STATE): str,
             vol.Required("entity_id"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=sensor_options, mode="dropdown")
             ),
@@ -756,7 +741,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_STATE,
-                "label": user_input.get("label", "状态条件"),
+                "label": user_input.get("label", COND_STATE),
                 "entity_id": user_input["entity_id"],
                 "state": states if isinstance(states, list) and len(states) > 1 else state_val,
             }
@@ -769,7 +754,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="状态条件"): str,
+            vol.Optional("label", default=COND_STATE): str,
             vol.Required("entity_id"): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=sensor_options, mode="dropdown")
             ),
@@ -786,7 +771,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TIME,
-                "label": user_input.get("label", "时间条件"),
+                "label": user_input.get("label", COND_TIME),
             }
             if user_input.get("after"):
                 cond["after"] = user_input["after"]
@@ -795,7 +780,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="时间条件"): str,
+            vol.Optional("label", default=COND_TIME): str,
             vol.Optional("after"): selector.TimeSelector(),
             vol.Optional("before"): selector.TimeSelector(),
         })
@@ -806,14 +791,14 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_SUN,
-                "label": user_input.get("label", "日出日落条件"),
+                "label": user_input.get("label", COND_SUN),
             }
-            if user_input.get("after"):
+            if user_input.get("after") not in ("none", None):
                 cond["after"] = user_input["after"]
                 off = user_input.get("after_offset", 0)
                 if off != 0:
                     cond["after_offset"] = off
-            if user_input.get("before"):
+            if user_input.get("before") not in ("none", None):
                 cond["before"] = user_input["before"]
                 off = user_input.get("before_offset", 0)
                 if off != 0:
@@ -821,14 +806,13 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="日出日落条件"): str,
+            vol.Optional("label", default=COND_SUN): str,
             vol.Optional("after"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "", "label": "（不限制）"},
-                        {"value": "sunrise", "label": "日出后"},
-                        {"value": "sunset", "label": "日落后"},
+                        "none", "sunrise", "sunset",
                     ],
+                    translation_key="sun_after",
                     mode="dropdown",
                 )
             ),
@@ -836,10 +820,9 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             vol.Optional("before"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "", "label": "（不限制）"},
-                        {"value": "sunrise", "label": "日出前"},
-                        {"value": "sunset", "label": "日落前"},
+                        "none", "sunrise", "sunset",
                     ],
+                    translation_key="sun_before",
                     mode="dropdown",
                 )
             ),
@@ -852,13 +835,13 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": COND_TEMPLATE,
-                "label": user_input.get("label", "模板条件"),
+                "label": user_input.get("label", COND_TEMPLATE),
                 "value_template": user_input["template"],
             }
             self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default="模板条件"): str,
+            vol.Optional("label", default=COND_TEMPLATE): str,
             vol.Required("template"): selector.TextSelector(
                 selector.TextSelectorConfig(multiline=True)
             ),
@@ -870,7 +853,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         cond_options = _condition_options(conditions)
         ctype = self._pending_cond_type
         schema = vol.Schema({
-            vol.Optional("label", default=f"{ctype.upper()} 组合"): str,
+            vol.Optional("label", default=ctype): str,
             vol.Required("members", default=[]): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=cond_options, multiple=True, mode="list")
             ),
@@ -886,7 +869,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             cond = {
                 "id": f"cond_{uuid.uuid4().hex}",
                 "type": ctype,
-                "label": user_input.get("label", f"{ctype.upper()} 组合"),
+                "label": user_input.get("label", ctype),
                 "conditions": members,
             }
             self._opts.setdefault(CONF_CONDITIONS, []).append(cond)
@@ -932,7 +915,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._replace_cond(new_cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default=cond.get("label", "数值条件")): str,
+            vol.Optional("label", default=cond.get("label", COND_NUMERIC_STATE)): str,
             vol.Required("entity_id", default=cond.get("entity_id")): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=sensor_options, mode="dropdown")
             ),
@@ -972,7 +955,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._replace_cond(new_cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default=cond.get("label", "状态条件")): str,
+            vol.Optional("label", default=cond.get("label", COND_STATE)): str,
             vol.Required("entity_id", default=cond.get("entity_id")): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=sensor_options, mode="dropdown")
             ),
@@ -1002,7 +985,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._replace_cond(new_cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default=cond.get("label", "时间条件")): str,
+            vol.Optional("label", default=cond.get("label", COND_TIME)): str,
             vol.Optional("after", default=cond.get("after")): selector.TimeSelector(),
             vol.Optional("before", default=cond.get("before")): selector.TimeSelector(),
         })
@@ -1015,7 +998,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             new_cond = dict(cond)
             new_cond["label"] = user_input.get("label", cond.get("label", ""))
-            if user_input.get("after"):
+            if user_input.get("after") not in ("none", None):
                 new_cond["after"] = user_input["after"]
                 off = user_input.get("after_offset", 0)
                 if off != 0:
@@ -1025,7 +1008,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             else:
                 new_cond.pop("after", None)
                 new_cond.pop("after_offset", None)
-            if user_input.get("before"):
+            if user_input.get("before") not in ("none", None):
                 new_cond["before"] = user_input["before"]
                 off = user_input.get("before_offset", 0)
                 if off != 0:
@@ -1038,25 +1021,23 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._replace_cond(new_cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default=cond.get("label", "日出日落条件")): str,
-            vol.Optional("after", default=cond.get("after", "")): selector.SelectSelector(
+            vol.Optional("label", default=cond.get("label", COND_SUN)): str,
+            vol.Optional("after", default=cond.get("after", "none")): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "", "label": "（不限制）"},
-                        {"value": "sunrise", "label": "日出后"},
-                        {"value": "sunset", "label": "日落后"},
+                        "none", "sunrise", "sunset",
                     ],
+                    translation_key="sun_after",
                     mode="dropdown",
                 )
             ),
             vol.Optional("after_offset", default=cond.get("after_offset", 0)): vol.All(vol.Coerce(int), vol.Range(min=-86400, max=86400)),
-            vol.Optional("before", default=cond.get("before", "")): selector.SelectSelector(
+            vol.Optional("before", default=cond.get("before", "none")): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "", "label": "（不限制）"},
-                        {"value": "sunrise", "label": "日出前"},
-                        {"value": "sunset", "label": "日落前"},
+                        "none", "sunrise", "sunset",
                     ],
+                    translation_key="sun_before",
                     mode="dropdown",
                 )
             ),
@@ -1075,7 +1056,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._replace_cond(new_cond)
             return await self.async_step_opt_conditions_menu()
         schema = vol.Schema({
-            vol.Optional("label", default=cond.get("label", "模板条件")): str,
+            vol.Optional("label", default=cond.get("label", COND_TEMPLATE)): str,
             vol.Required("template", default=cond.get("value_template", "")): selector.TextSelector(
                 selector.TextSelectorConfig(multiline=True)
             ),
@@ -1096,7 +1077,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             if option["value"] not in excluded
         ]
         schema = vol.Schema({
-            vol.Optional("label", default=cond.get("label", "组合条件")): str,
+            vol.Optional("label", default=cond.get("label") or cond.get("type", COND_AND)): str,
             vol.Required("members", default=cond.get("conditions", [])): selector.SelectSelector(
                 selector.SelectSelectorConfig(options=cond_options, multiple=True, mode="list")
             ),
@@ -1135,10 +1116,9 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             vol.Optional("action", default="done"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": "add", "label": "➕ 添加输出实体"},
-                        {"value": "delete", "label": "🗑️ 删除输出实体"},
-                        {"value": "done", "label": "✅ 保存并返回"},
+                        "add", "delete", "done",
                     ],
+                    translation_key="out_edit_action",
                     mode="list",
                 )
             ),
@@ -1147,7 +1127,7 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             step_id="opt_outputs_menu",
             data_schema=schema,
             description_placeholders={
-                "outputs_list": "\n".join(out_lines) if out_lines else "（暂无输出实体）",
+                "outputs_list": "\n".join(out_lines) if out_lines else "-",
             },
         )
 
@@ -1166,13 +1146,13 @@ class SensorSwitchControllerOptionsFlow(config_entries.OptionsFlow):
             self._opts.setdefault(CONF_OUTPUTS, []).append(out)
             return await self.async_step_opt_outputs_menu()
         schema = vol.Schema({
-            vol.Optional("name", default="逻辑开关"): str,
+            vol.Optional("name", default="logic_switch"): str,
             vol.Optional("output_type", default=OUTPUT_SWITCH): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": OUTPUT_SWITCH, "label": "开关 (Switch)"},
-                        {"value": OUTPUT_BINARY_SENSOR, "label": "二进制传感器 (Binary Sensor)"},
+                        OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR,
                     ],
+                    translation_key="output_type",
                     mode="dropdown",
                 )
             ),
