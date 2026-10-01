@@ -167,9 +167,7 @@ class ConditionEngine:
                 return False
             if above_f is not None and val <= above_f:
                 return False
-            if below_f is not None and val >= below_f:
-                return False
-            return True
+            return below_f is None or val < below_f
 
         if ctype == "state":
             eid = cond.get(CONF_ENTITY_ID)
@@ -193,7 +191,7 @@ class ConditionEngine:
                 self._template_cache[tpl_str] = template
             try:
                 return bool(template.async_render())
-            except Exception as err:
+            except Exception as err:  # noqa: BLE001 — 模板渲染可抛任意异常，失败即条件不成立
                 _LOGGER.debug(
                     "Template condition at %s failed to render (%s): %s",
                     path,
@@ -211,9 +209,7 @@ class ConditionEngine:
                 return now >= after or now <= before
             if after is not None and now < after:
                 return False
-            if before is not None and now > before:
-                return False
-            return True
+            return before is None or now <= before
 
         if ctype == "sun":
             now = dt_util.now()

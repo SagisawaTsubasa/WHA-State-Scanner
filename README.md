@@ -218,3 +218,23 @@ MIT
 ---
 
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
+
+## 更新日志 / Changelog
+
+### 0.3.0
+- 国际化：Config/Options Flow 全量接入 HA 翻译体系——全部菜单/条件类型/输出类型/字段标签改为 translation_key + selector 翻译段，中英双语界面完整（此前 93 处硬编码中文）  
+  i18n: the full config/options flow now uses the HA translation system — menus, condition/output types and field labels moved to translation keys with selector sections (93 hardcoded Chinese strings removed)
+- 确认页摘要重构：段落文案进翻译模板，值列表保持语言中性  
+  Reworked the confirmation summary: section text moved into translation templates, value lists stay language-neutral
+- 默认标签改为语言中性的条件类型 ID；日出日落「不限制」哨兵值由空串改为 `none`（存储兼容：空串从未被持久化）  
+  Default labels now use neutral condition-type IDs; the sun boundary "no limit" sentinel changed from empty string to `none` (storage-compatible)
+- 新增 `translations/en.json`（HA 运行时只读 translations 目录）；修正 manifest `loggers` 为规范的字符串数组  
+  Added `translations/en.json` (HA runtime only reads the translations dir); fixed manifest `loggers` to the spec string array
+- 清理：ruff 告警清零（import、否定条件直返、模板渲染异常豁免注释）  
+  Chores: ruff warnings cleared
+- 评估记录：审计遗留 L1（errors 死变量）、L10（FLOW_DATA/_config 死代码）、L13（register/unregister 配对）均已在 9 月 V0.1.0 重构中解决，本批复核确认  
+  Note: audit leftovers L1/L10/L13 were already resolved in the September V0.1.0 rewrite — re-verified this batch
+
+### 0.2.0 / 0.1.0（2026-09-05 审计修复批次）
+- 实体注册/查找键、组条件求值、options 重载等 11 项高级别问题与全部中低项修复  
+  September audit fixes: entity registration, group condition evaluation, options reload, and all medium/low items
