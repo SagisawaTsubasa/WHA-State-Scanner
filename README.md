@@ -242,3 +242,7 @@ MIT
 ### 0.3.1
 - 修复：自研决策日志模块 `logbook.py` 与 HA logbook 平台的自动发现机制撞名——HA 每次启动调用 `async_describe_events` 报 AttributeError，且连累输出实体创建。模块更名为 `decision_log.py`（纯内部改名，无存储/配置影响）  
   Fixed: the in-house decision-logger module `logbook.py` collided with HA's logbook platform auto-discovery — every boot raised AttributeError for `async_describe_events` and broke output entity creation. Renamed to `decision_log.py` (internal rename only)
+
+### 0.3.2
+- 修复：config flow 创建条目时配置丢失——HA 2026 起创建期 options 不再落地，条目表面 loaded 实则为空壳（输出实体永不创建，这也是本集成历史上"配置总是失败"的深层原因之一）。现配置写入 data，首次启动镜像到 options，运行时零改动  
+  Fixed: config entries were created empty — HA 2026 no longer persists creation-time options. The wizard result now goes into data and is mirrored to options on first setup
