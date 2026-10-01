@@ -238,3 +238,7 @@ MIT
 ### 0.2.0 / 0.1.0（2026-09-05 审计修复批次）
 - 实体注册/查找键、组条件求值、options 重载等 11 项高级别问题与全部中低项修复  
   September audit fixes: entity registration, group condition evaluation, options reload, and all medium/low items
+
+### 0.3.1
+- 修复：自研决策日志模块 `logbook.py` 与 HA logbook 平台的自动发现机制撞名——HA 每次启动调用 `async_describe_events` 报 AttributeError，且连累输出实体创建。模块更名为 `decision_log.py`（纯内部改名，无存储/配置影响）  
+  Fixed: the in-house decision-logger module `logbook.py` collided with HA's logbook platform auto-discovery — every boot raised AttributeError for `async_describe_events` and broke output entity creation. Renamed to `decision_log.py` (internal rename only)
