@@ -108,7 +108,7 @@
       },
       "confirm": {
         "title": "HA Whole-House State Scanner",
-        "description": "Sensors: {sensor_count} · Conditions: {condition_count} · Outputs: {output_count}\nPolling interval: {interval}s · Logging: {logging}\n\n{details}"
+        "description": "Sensors: {sensor_count} · Conditions: {condition_count} · Outputs: {output_count}\nPolling interval: {interval}s · Logging: {logging}\n\nSensors:\n{sensors_details}\n\nConditions:\n{conditions_details}\n\nOutputs:\n{outputs_details}"
       }
     },
     "error": {

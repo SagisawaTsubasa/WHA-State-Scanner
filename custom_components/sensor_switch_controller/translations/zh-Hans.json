@@ -108,7 +108,7 @@
       },
       "confirm": {
         "title": "HA全屋状态扫描",
-        "description": "传感器 {sensor_count} 个 · 条件 {condition_count} 条 · 输出 {output_count} 个\n轮询间隔 {interval} 秒 · 日志 {logging}\n\n{details}"
+        "description": "传感器 {sensor_count} 个 · 条件 {condition_count} 条 · 输出 {output_count} 个\n轮询间隔 {interval} 秒 · 日志 {logging}\n\n传感器：\n{sensors_details}\n\n条件：\n{conditions_details}\n\n输出：\n{outputs_details}"
       }
     },
     "error": {
