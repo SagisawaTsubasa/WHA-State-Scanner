@@ -305,3 +305,65 @@ details.wha-json pre {
 
 /* drawflow default theme tweaks */
 .parent-drawflow { width: 100%; height: 100%; }
+
+/* ---------- mobile / narrow screens: read-only, everything wraps ---------- */
+
+/* zoom floating buttons + mobile note: hidden on desktop */
+.wha-zoom-fab {
+  display: none;
+  position: absolute;
+  right: 10px;
+  bottom: 12px;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 5;
+}
+.wha-zoom-fab button {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--wha-line, #ccc);
+  background: var(--wha-card, #fff);
+  color: var(--wha-text, #222);
+  font-size: 18px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+.wha-editor-note {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--wha-line, #ccc);
+  border-radius: 10px;
+  background: var(--wha-card, #fff);
+  color: var(--wha-sub, #666);
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  /* top bar: wrap, taller touch targets */
+  .wha-topbar { padding: 6px 10px; gap: 6px; }
+  .wha-topbar h1 { font-size: 15px; margin-right: 4px; }
+  .wha-btn { padding: 10px 12px; font-size: 13px; }
+  .wha-main { padding: 8px; }
+
+  /* overview cards: single column */
+  .wha-grid { grid-template-columns: 1fr; }
+
+  /* tables: wrap long ids/values instead of overflowing */
+  .wha-table th, .wha-table td { word-break: break-all; white-space: normal; }
+
+  /* editor: read-only view — hide every editing control */
+  .wha-palette, .wha-inspector, .wha-editor-head, .wha-reload-note { display: none !important; }
+  .wha-editor-note { display: flex !important; }
+  .wha-editor-body { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  .wha-canvas-wrap { min-height: 380px; }
+  .wha-zoom-fab { display: flex !important; }
+}
+
+@media (max-width: 600px) {
+  .wha-topbar h1 { display: none; }
+  .wha-btn { padding: 10px 8px; font-size: 12px; }
+}

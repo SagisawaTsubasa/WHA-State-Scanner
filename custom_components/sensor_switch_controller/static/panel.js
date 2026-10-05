@@ -97,6 +97,7 @@ const LANG = {
     deleteOk: "已删除",
     evalDone: "评估完成",
     loading: "加载中…",
+    mobileNote: "查看模式：编辑请用电脑",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -175,6 +176,7 @@ const LANG = {
     deleteOk: "Deleted",
     evalDone: "Evaluation done",
     loading: "Loading…",
+    mobileNote: "Read-only view — edit on a desktop",
   },
 };
 
@@ -624,6 +626,7 @@ class ScannerPanel extends HTMLElement {
 
     main.innerHTML = `
       <div class="wha-editor">
+        <div class="wha-editor-note">📱 ${esc(this.tr("mobileNote"))}</div>
         <div class="wha-editor-head">
           <label>${esc(this.tr("controllerName"))}<input class="wha-input" data-field="name" value="${esc(config.name)}" style="min-width:180px"></label>
           <label class="field-inline" style="justify-content:center"><input type="checkbox" data-field="enabled" ${config.enabled ? "checked" : ""}> ${esc(this.tr("enabled"))}</label>
@@ -654,12 +657,17 @@ class ScannerPanel extends HTMLElement {
           <div class="wha-canvas-wrap">
             <div id="wha-drawflow"></div>
             <div class="wha-canvas-hint">${esc(this.tr("canvasHint"))}</div>
+            <div class="wha-zoom-fab" data-zoom>
+              <button type="button" data-z="in">＋</button>
+              <button type="button" data-z="out">－</button>
+              <button type="button" data-z="reset">⌂</button>
+            </div>
           </div>
           <div class="wha-inspector" data-inspector>
             <p class="wha-sub">${esc(this.tr("inspectorEmpty"))}</p>
           </div>
         </div>
-        <div class="wha-sub" style="padding:4px 2px">${esc(this.tr("dirtyReload"))}</div>
+        <div class="wha-sub wha-reload-note" style="padding:4px 2px">${esc(this.tr("dirtyReload"))}</div>
       </div>`;
 
     this._renderSensorPool(main.querySelector("[data-sensors]"));
@@ -686,6 +694,15 @@ class ScannerPanel extends HTMLElement {
     main.querySelector('[data-act="trial"]')?.addEventListener("click", () => this._trialRun());
     main.querySelector('[data-act="back"]')?.addEventListener("click", () => this._nav(""));
     main.querySelector('[data-act="delete-node"]')?.addEventListener("click", () => this._deleteSelected());
+    main.querySelectorAll("[data-zoom] [data-z]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const df = this._editor && this._editor.df;
+        if (!df) return;
+        if (b.dataset.z === "in") df.zoom_in();
+        else if (b.dataset.z === "out") df.zoom_out();
+        else df.zoom_reset();
+      })
+    );
 
     try {
       await loadScript(DF_JS_URL);

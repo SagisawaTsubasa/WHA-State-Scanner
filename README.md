@@ -170,6 +170,10 @@ MIT
 
 ## 更新日志 / Changelog
 
+### 0.4.2
+- **手机/窄屏支持（只读）**：总览单列、表格长 ID 自动换行（无横向溢出）；编辑器在窄屏切"查看模式"——隐藏全部编辑控件，画布占满并带 ＋/－/⌂ 缩放浮钮（Drawflow 原生触摸平移/拖线），提示"编辑请用电脑"；桌面布局不变
+  Mobile/narrow-screen support (read-only): single-column overview, wrapping tables (no horizontal overflow); the editor switches to a read-only canvas view with zoom buttons — editing stays on desktop
+
 ### 0.4.1
 - 修复：带路径参数的 REST 接口（PUT/DELETE 控制器、试运行）必 500——aiohttp 把 URL 变量以关键字参数传入 handler，而方法签名未接收（mock 环境抓不到，实机冒烟暴露）
   Fixed: path-param REST endpoints (controller PUT/DELETE, trial-run) always 500 — aiohttp passes URL vars as kwargs which the handler signatures did not accept
