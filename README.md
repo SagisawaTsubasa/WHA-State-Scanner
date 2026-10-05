@@ -170,6 +170,10 @@ MIT
 
 ## 更新日志 / Changelog
 
+### 0.4.1
+- 修复：带路径参数的 REST 接口（PUT/DELETE 控制器、试运行）必 500——aiohttp 把 URL 变量以关键字参数传入 handler，而方法签名未接收（mock 环境抓不到，实机冒烟暴露）
+  Fixed: path-param REST endpoints (controller PUT/DELETE, trial-run) always 500 — aiohttp passes URL vars as kwargs which the handler signatures did not accept
+
 ### 0.4.0
 - **侧边栏 Web 管理页**：总览 / 可视化流程图编辑器 / 决策日志三视图；条件→组→输出拖线连线（vendored Drawflow，零 CDN 零构建），节点点击编辑参数，试运行实时染色（绿=满足/红=不满足/输出决策徽章）
 - **存储重构**：由"每控制器一个 config entry"改为单一条目 + `storage.Store`；config flow 瘦身为单步确认，旧 5 步向导与 Options Flow 退役，Web 页成为唯一编辑器

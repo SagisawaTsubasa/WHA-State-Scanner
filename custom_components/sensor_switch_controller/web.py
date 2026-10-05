@@ -116,12 +116,13 @@ class ControllerDetailView(HomeAssistantView):
     requires_auth = True
 
     @require_admin
-    async def put(self, request: web.Request) -> web.Response:
+    async def put(self, request: web.Request, controller_id: str) -> web.Response:
+        """Update one controller (aiohttp passes the URL var as kwarg)."""
         hass = request.app["hass"]
         hub = get_hub(hass)
         if hub is None:
             return self.json({"ok": False, "error": "集成未加载"}, status_code=503)
-        cid = request.match_info["controller_id"]
+        cid = controller_id
         if cid not in hub.controllers:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
         try:
@@ -140,12 +141,13 @@ class ControllerDetailView(HomeAssistantView):
         return self.json({"ok": True, "id": cid})
 
     @require_admin
-    async def delete(self, request: web.Request) -> web.Response:
+    async def delete(self, request: web.Request, controller_id: str) -> web.Response:
+        """Delete one controller."""
         hass = request.app["hass"]
         hub = get_hub(hass)
         if hub is None:
             return self.json({"ok": False, "error": "集成未加载"}, status_code=503)
-        cid = request.match_info["controller_id"]
+        cid = controller_id
         if cid not in hub.controllers:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
         hub.remove_controller(cid)
@@ -163,12 +165,13 @@ class EvaluateView(HomeAssistantView):
     requires_auth = True
 
     @require_admin
-    async def post(self, request: web.Request) -> web.Response:
+    async def post(self, request: web.Request, controller_id: str) -> web.Response:
+        """Evaluate one controller now, with per-condition detail."""
         hass = request.app["hass"]
         hub = get_hub(hass)
         if hub is None:
             return self.json({"ok": False, "error": "集成未加载"}, status_code=503)
-        cid = request.match_info["controller_id"]
+        cid = controller_id
         manager = hub.managers.get(cid)
         if manager is None:
             if cid in hub.controllers:
