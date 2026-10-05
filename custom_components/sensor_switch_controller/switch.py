@@ -1,4 +1,4 @@
-"""Switch platform."""
+"""Switch platform — one logic switch per controller output."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 
-from .const import CONF_OUTPUTS, DOMAIN, OUTPUT_SWITCH
+from .const import DOMAIN, OUTPUT_SWITCH
 from .controller import ControllerManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -18,16 +18,17 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    """Set up switches."""
-    manager: ControllerManager = hass.data[DOMAIN][entry.entry_id]
-    outputs = entry.options.get(CONF_OUTPUTS, [])
-    entities = [
-        SensorSwitch(hass, manager, entry, out)
-        for out in outputs
-        if isinstance(out, dict)
-        and out.get("type") == OUTPUT_SWITCH
-        and out.get("entity_id")
-    ]
+    """Set up switches for every output of every enabled controller."""
+    hub = hass.data[DOMAIN]
+    entities = []
+    for controller_id, manager in hub.managers.items():
+        for out in manager.outputs:
+            if (
+                isinstance(out, dict)
+                and out.get("type") == OUTPUT_SWITCH
+                and out.get("entity_id")
+            ):
+                entities.append(SensorSwitch(hass, manager, controller_id, out))
     async_add_entities(entities)
 
 
@@ -37,13 +38,20 @@ class SensorSwitch(SwitchEntity):
     _attr_should_poll = False
     _attr_icon = "mdi:toggle-switch"
 
-    def __init__(self, hass, manager: ControllerManager, entry: ConfigEntry, out_cfg: dict) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        manager: ControllerManager,
+        controller_id: str,
+        out_cfg: dict,
+    ) -> None:
         """Init."""
         self.hass = hass
         self._manager = manager
+        self._controller_id = controller_id
         self._out_id = out_cfg["entity_id"]
         self._attr_name = out_cfg.get("name")
-        self._attr_unique_id = f"{entry.entry_id}_{out_cfg.get('entity_id')}"
+        self._attr_unique_id = f"{controller_id}_{out_cfg['entity_id']}"
         self._attr_is_on = False
         self._manual_override = out_cfg.get("manual_override", False)
         manager.register_entity(self._out_id, self)
@@ -51,7 +59,7 @@ class SensorSwitch(SwitchEntity):
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
-            identifiers={(DOMAIN, self._manager.entry.entry_id)},
+            identifiers={(DOMAIN, self._controller_id)},
             name=self._manager.name,
             manufacturer="Sensor Switch Controller",
         )
@@ -69,31 +77,37 @@ class SensorSwitch(SwitchEntity):
     @property
     def extra_state_attributes(self) -> dict:
         return {
+            "controller_id": self._controller_id,
+            "controller_name": self._manager.name,
             "manual_override": self._manual_override,
-            "scan_interval_seconds": int(self._manager.scan_interval.total_seconds()),
+            "scan_interval_seconds": int(
+                self._manager.scan_interval.total_seconds()
+            ),
         }
 
-    async def async_controller_turn_on(self) -> None:
-        """Called by the controller; ignored while manual override is on."""
+    async def async_controller_turn_on(self) -> bool:
+        """Called by the controller; no-op and False while override is on."""
         if self._manual_override:
             _LOGGER.debug(
                 "Output %s is in manual override; controller turn_on ignored",
                 self._out_id,
             )
-            return
+            return False
         self._attr_is_on = True
         self.async_write_ha_state()
+        return True
 
-    async def async_controller_turn_off(self) -> None:
-        """Called by the controller; ignored while manual override is on."""
+    async def async_controller_turn_off(self) -> bool:
+        """Called by the controller; no-op and False while override is on."""
         if self._manual_override:
             _LOGGER.debug(
                 "Output %s is in manual override; controller turn_off ignored",
                 self._out_id,
             )
-            return
+            return False
         self._attr_is_on = False
         self.async_write_ha_state()
+        return True
 
     async def async_turn_on(self, **kwargs) -> None:
         """Manual user control — always available, even in override."""

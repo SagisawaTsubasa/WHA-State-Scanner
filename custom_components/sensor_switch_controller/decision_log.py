@@ -14,32 +14,37 @@ _LOGGER = logging.getLogger(__name__)
 LOG_DIR_NAME = "sensor_switch_controller_logs"
 LOG_FILE_PREFIX = "log_"
 LOG_RETENTION_DAYS = 30
+READ_LIMIT_MAX = 5000
+# Records carry full sensor-pool snapshots; never read more than the tail
+# of a day file (records beyond this simply cannot match a sane limit).
+_TAIL_MAX_BYTES = 4 * 1024 * 1024
 
 
 class DecisionLogger:
     """Logs evaluation decisions to one JSONL file per day.
 
-    File name is fixed to ``log_YYYY-MM-DD.jsonl`` inside a per-entry
-    directory, so user-provided controller names can never produce invalid
-    file names. All blocking file IO runs in the executor.
+    File name is fixed to ``log_YYYY-MM-DD.jsonl`` inside a per-controller
+    directory (keyed by the stable ``ctrl_<hex>`` id), so user-provided
+    controller names can never produce invalid file names. All blocking
+    file IO runs in the executor.
     """
 
     def __init__(
         self,
         hass: HomeAssistant,
         controller_name: str,
-        entry_id: str,
+        controller_id: str,
         enabled: bool,
     ) -> None:
         """Init."""
         self.hass = hass
         self.controller_name = controller_name
-        self.entry_id = entry_id
+        self.controller_id = controller_id
         self.enabled = enabled
 
-        # Log directory: <config>/sensor_switch_controller_logs/<entry_id>/
+        # Log directory: <config>/sensor_switch_controller_logs/<controller_id>/
         self.log_dir = os.path.join(
-            hass.config.config_dir, LOG_DIR_NAME, entry_id
+            hass.config.config_dir, LOG_DIR_NAME, controller_id
         )
         self._dir_ready = False
 
@@ -102,3 +107,65 @@ class DecisionLogger:
         if not self.enabled:
             return
         await self.hass.async_add_executor_job(self._cleanup_old_logs)
+
+
+async def read_day_records(
+    hass: HomeAssistant,
+    controller_id: str,
+    date_str: str,
+    limit: int = 500,
+    decision: str | None = None,
+) -> tuple[list[dict], bool]:
+    """Read one day's JSONL records (newest last), optionally filtered.
+
+    Returns ``(records, truncated)``; when truncated, only the most recent
+    ``limit`` matching records are returned.
+    """
+    limit = max(1, min(int(limit), READ_LIMIT_MAX))
+    return await hass.async_add_executor_job(
+        _read_day_records_sync, hass, controller_id, date_str, limit, decision
+    )
+
+
+def _read_day_records_sync(
+    hass: HomeAssistant,
+    controller_id: str,
+    date_str: str,
+    limit: int,
+    decision: str | None,
+) -> tuple[list[dict], bool]:
+    path = os.path.join(
+        hass.config.config_dir,
+        LOG_DIR_NAME,
+        controller_id,
+        f"{LOG_FILE_PREFIX}{date_str}.jsonl",
+    )
+    if not os.path.isfile(path):
+        return [], False
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            dropped_head = False
+            if size > _TAIL_MAX_BYTES:
+                fh.seek(-_TAIL_MAX_BYTES, os.SEEK_END)
+                fh.readline()  # discard the partial line at the cut point
+                dropped_head = True
+            raw = fh.read()
+    except OSError as err:
+        _LOGGER.error("Failed to read decision log %s: %s", path, err)
+        return [], False
+
+    records: list[dict] = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if decision and record.get("decision") != decision:
+            continue
+        records.append(record)
+    truncated = dropped_head or len(records) > limit
+    return records[-limit:], truncated

@@ -1,29 +1,34 @@
-"""Binary sensor platform."""
+"""Binary sensor platform — read-only logic state per controller output."""
 
 from __future__ import annotations
+
+import logging
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 
-from .const import CONF_OUTPUTS, DOMAIN, OUTPUT_BINARY_SENSOR
+from .const import DOMAIN, OUTPUT_BINARY_SENSOR
 from .controller import ControllerManager
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    """Set up binary sensors."""
-    manager: ControllerManager = hass.data[DOMAIN][entry.entry_id]
-    outputs = entry.options.get(CONF_OUTPUTS, [])
-    entities = [
-        SensorBinarySensor(hass, manager, entry, out)
-        for out in outputs
-        if isinstance(out, dict)
-        and out.get("type") == OUTPUT_BINARY_SENSOR
-        and out.get("entity_id")
-    ]
+    """Set up binary sensors for every output of every enabled controller."""
+    hub = hass.data[DOMAIN]
+    entities = []
+    for controller_id, manager in hub.managers.items():
+        for out in manager.outputs:
+            if (
+                isinstance(out, dict)
+                and out.get("type") == OUTPUT_BINARY_SENSOR
+                and out.get("entity_id")
+            ):
+                entities.append(SensorBinarySensor(hass, manager, controller_id, out))
     async_add_entities(entities)
 
 
@@ -32,20 +37,27 @@ class SensorBinarySensor(BinarySensorEntity):
 
     _attr_should_poll = False
 
-    def __init__(self, hass, manager: ControllerManager, entry: ConfigEntry, out_cfg: dict) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        manager: ControllerManager,
+        controller_id: str,
+        out_cfg: dict,
+    ) -> None:
         """Init."""
         self.hass = hass
         self._manager = manager
+        self._controller_id = controller_id
         self._out_id = out_cfg["entity_id"]
         self._attr_name = out_cfg.get("name")
-        self._attr_unique_id = f"{entry.entry_id}_{out_cfg.get('entity_id')}"
+        self._attr_unique_id = f"{controller_id}_{out_cfg['entity_id']}"
         self._attr_is_on = False
         manager.register_entity(self._out_id, self)
 
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
-            identifiers={(DOMAIN, self._manager.entry.entry_id)},
+            identifiers={(DOMAIN, self._controller_id)},
             name=self._manager.name,
             manufacturer="Sensor Switch Controller",
         )
@@ -60,10 +72,24 @@ class SensorBinarySensor(BinarySensorEntity):
         await super().async_will_remove_from_hass()
         self._manager.unregister_entity(self._out_id)
 
-    async def async_controller_turn_on(self) -> None:
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "controller_id": self._controller_id,
+            "controller_name": self._manager.name,
+            "scan_interval_seconds": int(
+                self._manager.scan_interval.total_seconds()
+            ),
+        }
+
+    async def async_controller_turn_on(self) -> bool:
+        """Called by the controller; binary sensors always accept writes."""
         self._attr_is_on = True
         self.async_write_ha_state()
+        return True
 
-    async def async_controller_turn_off(self) -> None:
+    async def async_controller_turn_off(self) -> bool:
+        """Called by the controller; binary sensors always accept writes."""
         self._attr_is_on = False
         self.async_write_ha_state()
+        return True

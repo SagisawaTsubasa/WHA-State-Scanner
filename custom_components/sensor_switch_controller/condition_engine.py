@@ -76,11 +76,30 @@ class ConditionEngine:
                 _LOGGER.exception("Unexpected error evaluating condition '%s'", cid)
         return met
 
+    async def evaluate_detailed(self, cond_ids: list[str]) -> tuple[bool, dict[str, bool]]:
+        """Evaluate like evaluate_any but record per-id results for the UI.
+
+        Shares the same code path (and therefore FOR-timer semantics) as the
+        regular evaluation cycle, so a trial run behaves exactly like a tick.
+        """
+        results: dict[str, bool] = {}
+        met = False
+        for cid in cond_ids or []:
+            try:
+                if await self._evaluate_id(cid, set(), results):
+                    met = True
+            except Exception:
+                _LOGGER.exception("Unexpected error evaluating condition '%s'", cid)
+                results[cid] = False
+        return met, results
+
     # ------------------------------------------------------------------
     # Resolution / recursion
     # ------------------------------------------------------------------
 
-    async def _evaluate_id(self, cid: str, visited: set[str]) -> bool:
+    async def _evaluate_id(
+        self, cid: str, visited: set[str], trace: dict[str, bool] | None = None
+    ) -> bool:
         """Evaluate by condition id with cycle protection."""
         cond = self._conditions.get(cid)
         if cond is None:
@@ -94,14 +113,23 @@ class ConditionEngine:
             return False
         visited.add(cid)
         try:
-            return await self._evaluate_cond(cond, f"id:{cid}", visited)
+            result = await self._evaluate_cond(cond, f"id:{cid}", visited, trace)
+            if trace is not None:
+                trace[cid] = result
+            return result
         finally:
             visited.discard(cid)
 
-    async def _evaluate_cond(self, cond: Any, path: str, visited: set[str]) -> bool:
+    async def _evaluate_cond(
+        self,
+        cond: Any,
+        path: str,
+        visited: set[str],
+        trace: dict[str, bool] | None = None,
+    ) -> bool:
         """Recursive evaluation."""
         if isinstance(cond, str):
-            return await self._evaluate_id(cond, visited)
+            return await self._evaluate_id(cond, visited, trace)
         if not isinstance(cond, dict):
             _LOGGER.warning("Malformed condition at %s: %r", path, cond)
             return False
@@ -127,10 +155,12 @@ class ConditionEngine:
             for i, member in enumerate(members):
                 try:
                     if isinstance(member, str):
-                        results.append(await self._evaluate_id(member, visited))
+                        results.append(await self._evaluate_id(member, visited, trace))
                     else:
                         results.append(
-                            await self._evaluate_cond(member, f"{path}.{i}", visited)
+                            await self._evaluate_cond(
+                                member, f"{path}.{i}", visited, trace
+                            )
                         )
                 except Exception:
                     _LOGGER.exception(

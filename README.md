@@ -1,8 +1,8 @@
 # HA 全屋状态扫描 / HA Whole-House State Scanner
 
-> **零 YAML 可视化全屋状态扫描器，自由组合任意传感器条件，实时驱动多路输出。**
-> 
-> A zero-YAML visual whole-house state scanner — freely compose any sensor conditions and drive multiple outputs in real time.
+> **零 YAML 全屋状态扫描器：可视化流程图编辑中间层决策，传感器池 + 条件规则 + 多路输出 + 独立决策日志。**
+>
+> A zero-YAML whole-house state scanner: edit your sensor→decision middle layer as a visual flow graph — sensor pools, condition rules, multiple outputs, and an independent decision log.
 
 > **Programmer:** [Kimi](https://kimi.moonshot.cn) (Moonshot AI) · **Author:** [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)
 
@@ -10,27 +10,25 @@
 
 ## 功能 / Features
 
-- **纯 UI 配置** — 5 步向导，零 YAML
-- **传感器池** — 一个控制器可引用任意数量的实体
-- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`，支持 `AND`/`OR` 嵌套组合
-- **增量编辑** — 创建后仍可随时添加、编辑、删除条件规则和输出实体
-- **多路输出** — 一个控制器可生成多个开关或二进制传感器
-- **FOR 持续时间** — 内置状态持续计时器
-- **独立日志** — 决策日志写入专用 JSONL 文件（按日轮转），不混入 HA 系统日志
+- **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
+- **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，试运行实时染色（绿=满足/红=不满足/输出徽章显示决策）
+- **传感器池** — 一个控制器可引用任意数量的实体；总览页有全局传感器池视图，共享传感器高亮
+- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`，支持 `AND`/`OR` 嵌套组合与 `FOR` 持续计时
+- **多路输出** — 一个控制器可生成多个开关或二进制传感器；`off_conditions` 优先于 `on_conditions`（防抖动）
+- **决策日志** — 每周期逐输出写入独立 JSONL（含传感器读数快照、applied/override 标记），面板内可直接查询
 - **手动覆盖** — 开关类型支持可选的手动强制控制
-- **热重载** — 选项修改后立即生效，无需重启
+- **零构建前端** — 集成自带全部静态资源（vendored Drawflow），无 Node 工具链、无外网依赖
 
 ---
 
-- **Pure UI Configuration** — 5-step wizard, zero YAML
-- **Sensor Pool** — Reference any number of entities in a single controller
-- **Condition Library** — `numeric_state`, `state`, `time`, `sun`, `template`, plus `AND`/`OR` nesting
-- **Incremental Editing** — Add, edit, or delete conditions and outputs after creation
-- **Multiple Outputs** — One controller can drive multiple switches or binary sensors
-- **FOR Duration** — Built-in state-persistence timer support
-- **Independent Logging** — Decision logs written to dedicated JSONL files (daily rotation), never mixed into `home-assistant.log`
-- **Manual Override** — Optional per-switch manual control lock
-- **Hot Reload** — Options changes take effect immediately without restart
+- **Sidebar web panel** — overview / visual flow editor / decision-log viewer, fully built-in, zero CDN
+- **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; trial runs color nodes live (green=met / red=unmet, decision badges on outputs)
+- **Sensor pool** — any number of entities per controller; a global pool view highlights sensors shared across controllers
+- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, plus `AND`/`OR` nesting and `FOR` durations
+- **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
+- **Decision log** — per-cycle JSONL with sensor readings, applied/override flags; queryable in the panel
+- **Manual override** — optional per-switch manual control lock
+- **Zero-build frontend** — all static assets vendored (Drawflow); no Node toolchain, no external requests
 
 ---
 
@@ -41,12 +39,13 @@
 1. 在 HACS 中添加此仓库为自定义仓库。
 2. 安装 **HA 全屋状态扫描**。
 3. 重启 Home Assistant。
+4. **设置 → 设备与服务 → 添加集成**，搜索 **HA 全屋状态扫描**，一键创建全局条目。
+5. 侧边栏出现 **全屋状态扫描** 面板——所有控制器都在这里创建和编辑。
 
 ### 手动安装
 
 1. 将 `custom_components/sensor_switch_controller` 复制到 Home Assistant 的 `custom_components` 目录。
-2. 重启 Home Assistant。
-3. 进入 **设置 → 设备与服务 → 添加集成**，搜索 **HA 全屋状态扫描**。
+2. 重启 Home Assistant，按上述步骤添加集成并使用侧边栏面板。
 
 ---
 
@@ -55,120 +54,88 @@
 1. Add this repository as a custom repository in HACS.
 2. Install **HA Whole-House State Scanner**.
 3. Restart Home Assistant.
+4. **Settings → Devices & Services → Add Integration** → search **HA Whole-House State Scanner** and create the single entry.
+5. A **Whole-House State Scanner** panel appears in the sidebar — create and edit all controllers there.
 
 ### Manual
 
 1. Copy `custom_components/sensor_switch_controller` into your Home Assistant `custom_components` directory.
-2. Restart Home Assistant.
-3. Go to **Settings → Devices & Services → Add Integration** and search for **HA Whole-House State Scanner**.
+2. Restart Home Assistant and add the integration as above.
 
 ---
 
-## 配置向导 / Configuration Wizard
+## Web 管理页 / Web Panel
 
-### 第一步：基础设置 / Step 1: Basic Settings
+| 视图 / View | 内容 / Content |
+|-------------|----------------|
+| **总览 / Overview** | 控制器卡片（输出实时状态、立即评估、启停、删除）+ 全局传感器池视图 / Controller cards with live output states + global sensor pool view |
+| **编辑器 / Editor** | Drawflow 流程画布：条件/组/输出节点拖线连线，右侧 inspector 编辑参数，顶部保存与试运行 / Flow canvas with condition/group/output nodes, inspector forms, save & trial run |
+| **决策日志 / Logs** | 按控制器+日期查询 JSONL 决策记录，可按 decision 过滤，读数快照可展开 / Query JSONL records by controller+date, filter by decision, expandable readings |
 
-- **名称 / Name**：如 `浴室湿度控制` / `Bathroom Humidity Control`
-- **轮询间隔 / Scan Interval**：评估频率（秒），默认 180
-- **启用日志 / Enable Logging**：是否记录每次决策到独立文件
+**编辑器节点语义 / Node semantics:**
 
-### 第二步：传感器池 / Step 2: Sensor Pool
+- 条件节点（六类叶子）→ 用连线加入 **AND/OR 组**（成员可进多组）
+- 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
+- **试运行**与正式评估语义完全相同（会实际写输出实体、写决策日志），并把每个条件的满足结果染色到节点上
+- 保存后控制器整条重载，FOR 计时器清零
 
-- 多选所有参与逻辑判断的实体。
-- Multi-select any entities that will participate in logic evaluation.
+**REST API**（面板使用，亦可脚本调用，均需鉴权）：
 
-### 第三步：条件规则 / Step 3: Condition Rules
-
-点击"添加条件"，选择类型：
-
-| 类型 / Type | 说明 / Description |
-|-------------|--------------------|
-| **数值比较 / Numeric State** | 传感器数值与 `above` / `below` 阈值比较 |
-| **状态匹配 / State** | 匹配精确状态字符串（逗号分隔多状态），可选 `FOR` 持续时间 |
-| **时间范围 / Time** | 限制在 `after` / `before` 时间范围内 |
-| **日出日落 / Sun** | 基于日出日落判断，偏移量单位为秒（负数表示提前） |
-| **模板表达式 / Template** | 完整 Jinja2 模板表达式 |
-| **AND / OR 组合 / Group** | 将已有条件组合为嵌套逻辑 |
-
-顶层条件之间默认 **OR** 关系（任一满足即触发）。
-
-Top-level conditions are evaluated with **OR** logic (any one satisfied triggers).
-
-### 第四步：输出实体 / Step 4: Output Entities
-
-每个控制器可生成多个输出：
-- **开关 / Switch**：可切换实体，可选手动覆盖
-- **二进制传感器 / Binary Sensor**：只读状态指示器
-- 绑定 `on_conditions` 和 `off_conditions`（`off_conditions` 优先级高于 `on_conditions`，防止抖动）
-
-### 第五步：确认 / Step 5: Confirm
-
-预览所有配置后创建。
-
----
-
-## 修改配置（增量编辑）/ Editing After Creation
-
-进入 **设置 → 设备与服务 → HA 全屋状态扫描 → 配置 → 选项**。
-
-Go to **Settings → Devices & Services → HA Whole-House State Scanner → Configure → Options**.
-
-| 项目 / Item | 支持操作 / Operations |
-|-------------|------------------------|
-| 轮询间隔 / Scan Interval | 直接修改 / Direct edit |
-| 日志开关 / Logging | 直接修改 / Toggle on/off |
-| 传感器池 / Sensor Pool | 直接修改（注意：可能使现有条件失效）/ Direct edit |
-| **条件规则 / Condition Rules** | **添加 / 编辑 / 删除（预填充表单）/ Add / Edit / Delete** |
-| **输出实体 / Output Entities** | **添加 / 删除 / Add / Delete** |
-
-所有修改热重载，无需重启。
-
-All changes are hot-reloaded. No restart required.
+```
+GET    /api/sensor_switch_controller/config
+POST   /api/sensor_switch_controller/controllers          # 创建（body 为控制器 JSON）
+PUT    /api/sensor_switch_controller/controllers/{id}     # 更新
+DELETE /api/sensor_switch_controller/controllers/{id}
+POST   /api/sensor_switch_controller/controllers/{id}/evaluate   # 立即评估（带逐条件结果）
+GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decision=on|off|hold&limit=500
+```
 
 ---
 
 ## 独立日志系统 / Independent Logging
 
-开启日志后，每次评估在专用 JSONL 文件中追加记录：
-
-When enabled, every evaluation cycle is appended to a dedicated JSONL file:
+开启日志后，每次评估在专用 JSONL 文件中追加记录（按控制器分目录、按日轮转、保留 30 天）：
 
 ```
-<HA_CONFIG>/sensor_switch_controller_logs/<entry_id>/<控制器名>_<YYYY-MM-DD>.jsonl
+<HA_CONFIG>/sensor_switch_controller_logs/<controller_id>/log_YYYY-MM-DD.jsonl
 ```
 
 **示例记录 / Example record：**
 
 ```json
-{"timestamp":"2026-07-16T14:30:00+08:00","controller":"Bathroom Humidity Control","output":"Dehumidifier Enable","decision":"on","on_met":true,"off_met":false,"readings":{"sensor.humidity_diff":"25.3","switch.ventilation":"off"}}
+{"timestamp":"2026-10-05T14:30:00+08:00","controller":"浴室湿度控制","output":"湿度控制使能","decision":"off","on_met":false,"off_met":true,"applied":true,"override":false,"readings":{"sensor.shi_du_chai_zhi":"8.2"}}
 ```
 
-**日志特点 / Properties：**
-- 按日期自动轮转 / Daily file rotation
-- JSON Lines 格式，可用 `jq`、Python 或任何文本工具解析 / JSON Lines format — parseable with `jq`, Python, or any text tool
-- 完全不写入 HA 系统日志，不污染 `home-assistant.log` / Completely isolated from Home Assistant system logs
+- `decision` 为条件判定结果（on/off/hold，hold 也记录——"为什么没动作"同样有据可查）
+- `applied` 表示判定是否实际写入实体；`override` 表示该写入被手动覆盖拦截
+- `readings` 是本周期传感器池的完整读数快照
 
 ---
 
 ## 架构 / Architecture
 
 ```
-Config Entry（一个控制器 / One Controller）
-├── Sensor Pool          → 任意实体引用 / Any entity references
-├── Condition Engine     → 模块化评估 + FOR 计时器 / Modular evaluation + FOR timer
-├── Output Entities      → switch / binary_sensor（任意数量 / any quantity）
-└── Decision Logger      → 独立文件日志（按日轮转 / daily rotation）
+Config Entry（单一条目 / single entry）
+├── Store                → 全部控制器配置（hub.SannerHub, storage.Store）
+├── ControllerManager    → 每控制器一个：轮询调度 + 评估 + 实体注册（controller.py）
+├── Condition Engine     → 六类叶子 + AND/OR 嵌套 + FOR 计时 + 逐条件追踪（condition_engine.py）
+├── Output Platforms     → switch / binary_sensor（每控制器一个设备）
+├── Web Layer            → 侧边栏面板 + REST API + 静态资源（web.py + static/）
+└── Decision Logger      → 独立 JSONL（decision_log.py）
 ```
 
 **核心组件 / Key Components：**
 
 | 文件 / File | 职责 / Purpose |
 |-------------|----------------|
-| `controller.py` | 调度轮询、评估、实体注册、热重载 / Orchestrates polling, evaluation, registration, hot reload |
-| `condition_engine.py` | 递归条件评估器（6 种叶子类型 + AND/OR 嵌套 + FOR 计时器）/ Recursive evaluator (6 leaf types + nesting + FOR timers) |
-| `logbook.py` | 基于文件的 JSONL 日志（按日轮转）/ File-based JSONL logger with daily rotation |
-| `config_flow.py` | 5 步向导 + 完整增量 Options Flow / 5-step wizard + incremental Options Flow |
-| `switch.py` / `binary_sensor.py` | 输出平台（控制器驱动状态更新）/ Output platforms with controller-driven updates |
+| `hub.py` | 域级单例：Store 读写、控制器 CRUD、运行时快照 / Domain singleton: store, controller CRUD, snapshots |
+| `controller.py` | 轮询、评估（含 applied/override 记录）、试运行 API / Polling, evaluation, trial-run API |
+| `condition_engine.py` | 递归条件评估（六类叶子 + 嵌套 + FOR 计时器 + detail 追踪）/ Recursive evaluator |
+| `schema.py` | 共享校验（Web API 与 config flow 同源）/ Shared validation |
+| `web.py` | REST views、面板注册、静态资源 / REST views, panel & static registration |
+| `static/panel.js` | 面板前端（零构建自定义元素 + Drawflow）/ Zero-build panel frontend |
+| `decision_log.py` | 按日轮转 JSONL 日志 / File-based JSONL logger |
+| `config_flow.py` | 单步创建全局条目 / Single-step entry creation |
 
 ---
 
@@ -176,37 +143,19 @@ Config Entry（一个控制器 / One Controller）
 
 ### `sensor_switch_controller.force_evaluate`
 
-立即触发指定控制器的条件评估（不影响轮询定时器）。
-
-Manually trigger an evaluation cycle for a specific controller.
+立即触发指定输出实体的条件评估（不影响轮询定时器）。
 
 ```yaml
 service: sensor_switch_controller.force_evaluate
 target:
-  entity_id: switch.bathroom_humidity_control_dehumidifier_enable
+  entity_id: switch.humidity_control_enable
 ```
-
----
-
-## 可扩展性 / Extensibility
-
-框架设计便于扩展：
-
-- **新条件类型**：在 `condition_engine.py::_evaluate_leaf()` 中添加分支
-- **新输出类型**：在 `const.py` 中注册，在对应平台文件中实现
-- **动作输出**（未来）：直接调用服务（如 `fan.set_percentage`），无需中间实体
-
-The framework is designed for easy extension:
-
-- **New Condition Types**: Add a branch in `condition_engine.py::_evaluate_leaf()`
-- **New Output Types**: Register in `const.py` and implement the corresponding platform file
-- **Action Outputs** (future): Direct service calls without intermediate entities
 
 ---
 
 ## 兼容性 / Compatibility
 
-- Home Assistant **2024.1+**
+- Home Assistant **2024.11+**（Web 面板在 2026.1 实测）
 - Python **3.12+**
 
 ---
@@ -221,28 +170,28 @@ MIT
 
 ## 更新日志 / Changelog
 
-### 0.3.0
-- 国际化：Config/Options Flow 全量接入 HA 翻译体系——全部菜单/条件类型/输出类型/字段标签改为 translation_key + selector 翻译段，中英双语界面完整（此前 93 处硬编码中文）  
-  i18n: the full config/options flow now uses the HA translation system — menus, condition/output types and field labels moved to translation keys with selector sections (93 hardcoded Chinese strings removed)
-- 确认页摘要重构：段落文案进翻译模板，值列表保持语言中性  
-  Reworked the confirmation summary: section text moved into translation templates, value lists stay language-neutral
-- 默认标签改为语言中性的条件类型 ID；日出日落「不限制」哨兵值由空串改为 `none`（存储兼容：空串从未被持久化）  
-  Default labels now use neutral condition-type IDs; the sun boundary "no limit" sentinel changed from empty string to `none` (storage-compatible)
-- 新增 `translations/en.json`（HA 运行时只读 translations 目录）；修正 manifest `loggers` 为规范的字符串数组  
-  Added `translations/en.json` (HA runtime only reads the translations dir); fixed manifest `loggers` to the spec string array
-- 清理：ruff 告警清零（import、否定条件直返、模板渲染异常豁免注释）  
-  Chores: ruff warnings cleared
-- 评估记录：审计遗留 L1（errors 死变量）、L10（FLOW_DATA/_config 死代码）、L13（register/unregister 配对）均已在 9 月 V0.1.0 重构中解决，本批复核确认  
-  Note: audit leftovers L1/L10/L13 were already resolved in the September V0.1.0 rewrite — re-verified this batch
-
-### 0.2.0 / 0.1.0（2026-09-05 审计修复批次）
-- 实体注册/查找键、组条件求值、options 重载等 11 项高级别问题与全部中低项修复  
-  September audit fixes: entity registration, group condition evaluation, options reload, and all medium/low items
-
-### 0.3.1
-- 修复：自研决策日志模块 `logbook.py` 与 HA logbook 平台的自动发现机制撞名——HA 每次启动调用 `async_describe_events` 报 AttributeError，且连累输出实体创建。模块更名为 `decision_log.py`（纯内部改名，无存储/配置影响）  
-  Fixed: the in-house decision-logger module `logbook.py` collided with HA's logbook platform auto-discovery — every boot raised AttributeError for `async_describe_events` and broke output entity creation. Renamed to `decision_log.py` (internal rename only)
+### 0.4.0
+- **侧边栏 Web 管理页**：总览 / 可视化流程图编辑器 / 决策日志三视图；条件→组→输出拖线连线（vendored Drawflow，零 CDN 零构建），节点点击编辑参数，试运行实时染色（绿=满足/红=不满足/输出决策徽章）
+- **存储重构**：由"每控制器一个 config entry"改为单一条目 + `storage.Store`；config flow 瘦身为单步确认，旧 5 步向导与 Options Flow 退役，Web 页成为唯一编辑器
+- **REST API**：`/api/sensor_switch_controller/*` 全套（config/controllers CRUD/evaluate/logs），共享 voluptuous 校验（组引用、防环、输出引用完整性）
+- **决策日志增强**：record 新增 `applied`（判定是否实际写入）与 `override`（被手动覆盖拦截）字段；日志目录由 entry_id 改为 controller_id 键控；新增面板内日志查询
+- **全局传感器池总览**：跨控制器共享传感器高亮
+- 传感器 `alias` 字段启用（此前无 UI 可写入）；控制器新增 `enabled` 停用开关
+- services.yaml 去硬编码文案，接入翻译体系（name/description 进 translations）
+- ⚠ 存储版本升级（1→2）：旧版按 entry 创建的控制器配置不会自动迁移（0.4.0 前该集成无已配置条目，无实际迁移需求）
 
 ### 0.3.2
-- 修复：config flow 创建条目时配置丢失——HA 2026 起创建期 options 不再落地，条目表面 loaded 实则为空壳（输出实体永不创建，这也是本集成历史上"配置总是失败"的深层原因之一）。现配置写入 data，首次启动镜像到 options，运行时零改动  
-  Fixed: config entries were created empty — HA 2026 no longer persists creation-time options. The wizard result now goes into data and is mirrored to options on first setup
+- 修复：config flow 创建条目时配置丢失——HA 2026 起创建期 options 不再落地。向导结果现在写入 data，首次启动镜像到 options
+  Fixed: config entries were created empty — the wizard result now goes into data and is mirrored to options on first setup
+
+### 0.3.1
+- 修复：自研决策日志模块与 HA logbook 平台自动发现撞名（AttributeError 连累输出实体创建），模块更名 `decision_log.py`
+  Fixed: the in-house decision-logger collided with HA's logbook platform discovery; renamed to `decision_log.py`
+
+### 0.3.0
+- Config/Options Flow 全量接入 HA 翻译体系（93 处硬编码中文清除）；确认页摘要重构；`translations/en.json` 补齐；manifest `loggers` 规范化；ruff 告警清零
+  Full i18n of the flows via translation keys; reworked confirmation summary; loggers array; ruff clean
+
+### 0.2.0 / 0.1.0（2026-09-05 审计修复批次）
+- 实体注册/查找键、组条件求值、options 重载等 11 项高级别问题与全部中低项修复
+  September audit fixes: entity registration, group condition evaluation, options reload, and all medium/low items

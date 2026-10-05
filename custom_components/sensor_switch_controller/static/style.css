@@ -1,0 +1,307 @@
+/* Whole-House State Scanner panel styles.
+   Uses HA theme CSS vars (inherit through the shadow boundary) with
+   hardcoded fallbacks so the page stays usable in odd themes. */
+
+:host {
+  display: block;
+  height: 100%;
+  --wha-ok: var(--success-color, #43a047);
+  --wha-bad: var(--error-color, #db4437);
+  --wha-warn: var(--warning-color, #ffa600);
+  --wha-card: var(--card-background-color, #ffffff);
+  --wha-text: var(--primary-text-color, #212121);
+  --wha-sub: var(--secondary-text-color, #727272);
+  --wha-line: var(--divider-color, #e0e0e0);
+  --wha-accent: var(--primary-color, #03a9f4);
+}
+
+.wha-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  color: var(--wha-text);
+  font-family: var(--paper-font-body1_-_font-family, inherit);
+}
+
+/* ---------- top bar ---------- */
+.wha-topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--wha-line);
+  background: var(--wha-card);
+  flex: none;
+  flex-wrap: wrap;
+}
+.wha-topbar h1 {
+  font-size: 18px;
+  font-weight: 500;
+  margin: 0 12px 0 0;
+}
+.wha-topbar .spacer { flex: 1; }
+
+.wha-btn {
+  border: 1px solid var(--wha-line);
+  background: var(--wha-card);
+  color: var(--wha-text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.wha-btn:hover { border-color: var(--wha-accent); }
+.wha-btn.primary {
+  background: var(--wha-accent);
+  color: var(--text-on-primary, #fff);
+  border-color: transparent;
+}
+.wha-btn.danger { color: var(--wha-bad); }
+.wha-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.wha-btn.active { border-color: var(--wha-accent); color: var(--wha-accent); font-weight: 600; }
+
+/* ---------- generic ---------- */
+.wha-main {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 16px;
+}
+.wha-card {
+  background: var(--wha-card);
+  border: 1px solid var(--wha-line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+.wha-card h2 { font-size: 15px; margin: 0 0 8px; font-weight: 600; }
+.wha-card h3 { font-size: 14px; margin: 10px 0 6px; font-weight: 600; }
+.wha-sub { color: var(--wha-sub); font-size: 12px; }
+.wha-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wha-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+
+.badge {
+  display: inline-block;
+  border-radius: 10px;
+  padding: 1px 9px;
+  font-size: 12px;
+  border: 1px solid var(--wha-line);
+  color: var(--wha-sub);
+}
+.badge.on { background: rgba(67, 160, 71, 0.15); color: var(--wha-ok); border-color: transparent; }
+.badge.off { background: rgba(219, 68, 55, 0.12); color: var(--wha-bad); border-color: transparent; }
+.badge.hold { color: var(--wha-warn); }
+.badge.meta { background: rgba(127,127,127,.12); }
+
+table.wha-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.wha-table th, .wha-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--wha-line);
+  vertical-align: top;
+}
+.wha-table th { color: var(--wha-sub); font-weight: 500; font-size: 12px; }
+.wha-table tr.overlap td { background: rgba(3, 169, 244, 0.08); }
+
+.wha-input, select.wha-input, textarea.wha-input {
+  border: 1px solid var(--wha-line);
+  border-radius: 6px;
+  background: var(--wha-card, transparent);
+  color: var(--wha-text);
+  padding: 6px 8px;
+  font-size: 13px;
+  min-width: 60px;
+}
+.wha-input:focus { outline: 1px solid var(--wha-accent); }
+
+details.wha-json { margin-top: 4px; }
+details.wha-json pre {
+  background: rgba(127,127,127,0.1);
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.wha-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--wha-card);
+  color: var(--wha-text);
+  border: 1px solid var(--wha-accent);
+  border-radius: 8px;
+  padding: 10px 18px;
+  font-size: 13px;
+  z-index: 999;
+  max-width: 70vw;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+}
+.wha-toast.error { border-color: var(--wha-bad); color: var(--wha-bad); }
+
+/* ---------- editor layout ---------- */
+.wha-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.wha-editor-head {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  background: var(--wha-card);
+  border: 1px solid var(--wha-line);
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+.wha-editor-head label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--wha-sub); }
+.wha-editor-head label.field-inline,
+.wha-editor-head label.field-inline .wha-sub {
+  flex-direction: row;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--wha-text);
+}
+
+.wha-editor-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 190px 1fr 320px;
+  gap: 8px;
+}
+.wha-palette {
+  background: var(--wha-card);
+  border: 1px solid var(--wha-line);
+  border-radius: 10px;
+  padding: 10px;
+  overflow: auto;
+  font-size: 13px;
+}
+.wha-palette h3 { margin: 8px 0 6px; font-size: 13px; }
+.wha-palette button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 6px;
+}
+
+.wha-inspector {
+  background: var(--wha-card);
+  border: 1px solid var(--wha-line);
+  border-radius: 10px;
+  padding: 10px;
+  overflow: auto;
+  font-size: 13px;
+}
+.wha-inspector .field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 9px; }
+.wha-inspector .field > span { font-size: 12px; color: var(--wha-sub); }
+.wha-inspector .field-inline { flex-direction: row; align-items: center; gap: 6px; }
+
+.wha-canvas-wrap {
+  position: relative;
+  border: 1px solid var(--wha-line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--wha-card, #fafafa);
+  min-height: 0;
+}
+#wha-drawflow {
+  width: 100%;
+  height: 100%;
+}
+.wha-canvas-hint {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px;
+  color: var(--wha-sub);
+  background: rgba(127,127,127,.12);
+  border-radius: 12px;
+  padding: 3px 12px;
+  pointer-events: none;
+}
+
+/* ---------- drawflow node visuals ---------- */
+/* override drawflow's default cyan theme */
+.parent-drawflow .drawflow .drawflow-node {
+  background: transparent;
+  border: none;
+  padding: 0;
+  width: auto;
+  min-height: 0;
+  box-shadow: none;
+  border-radius: 8px;
+}
+.parent-drawflow .drawflow .drawflow-node.selected { background: transparent; box-shadow: none; }
+.parent-drawflow .drawflow .drawflow-node .input, .parent-drawflow .drawflow .drawflow-node .output { width: 12px; height: 12px; }
+.parent-drawflow .drawflow .drawflow-node .input:hover, .parent-drawflow .drawflow .drawflow-node .output:hover { background: var(--wha-accent); }
+
+.parent-drawflow .drawflow .wha-node {
+  background: var(--wha-card, #fff);
+  border: 2px solid var(--wha-line, #ccc);
+  border-radius: 8px;
+  color: var(--wha-text, #222);
+  min-width: 170px;
+  max-width: 240px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.parent-drawflow .drawflow .wha-node.selected { border-color: var(--wha-accent); box-shadow: 0 0 0 2px rgba(3,169,244,.25); }
+.parent-drawflow .drawflow .wha-node .wha-node-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--wha-line, #eee);
+}
+.parent-drawflow .drawflow .wha-node .wha-node-body { padding: 6px 8px; word-break: break-all; }
+.parent-drawflow .drawflow .wha-node .wha-node-tag {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: rgba(127,127,127,.14);
+  color: var(--wha-sub);
+  margin-left: auto;
+}
+.parent-drawflow .drawflow .wha-node.cond-numeric_state .wha-node-head { color: #1565c0; }
+.parent-drawflow .drawflow .wha-node.cond-state .wha-node-head { color: #6a1b9a; }
+.parent-drawflow .drawflow .wha-node.cond-time .wha-node-head,
+.parent-drawflow .drawflow .wha-node.cond-sun .wha-node-head { color: #b26a00; }
+.parent-drawflow .drawflow .wha-node.cond-template .wha-node-head { color: #2e7d32; }
+.parent-drawflow .drawflow .wha-node.cond-and .wha-node-head,
+.parent-drawflow .drawflow .wha-node.cond-or .wha-node-head { color: #ad1457; }
+.parent-drawflow .drawflow .wha-node.wha-out .wha-node-head { color: var(--wha-accent); }
+
+.parent-drawflow .drawflow .wha-node.met { border-color: var(--wha-ok); box-shadow: 0 0 0 2px rgba(67,160,71,.3); }
+.parent-drawflow .drawflow .wha-node.unmet { border-color: var(--wha-bad); box-shadow: 0 0 0 2px rgba(219,68,55,.25); opacity: .85; }
+.parent-drawflow .drawflow .wha-node .decision-badge {
+  position: absolute;
+  top: -12px;
+  right: -8px;
+  border-radius: 10px;
+  font-size: 10px;
+  padding: 1px 7px;
+  border: 1px solid var(--wha-line);
+  background: var(--wha-card);
+}
+.parent-drawflow .drawflow .wha-node .decision-badge.on { background: var(--wha-ok); color: #fff; border-color: transparent; }
+.parent-drawflow .drawflow .wha-node .decision-badge.off { background: var(--wha-bad); color: #fff; border-color: transparent; }
+
+/* drawflow default theme tweaks */
+.parent-drawflow { width: 100%; height: 100%; }
