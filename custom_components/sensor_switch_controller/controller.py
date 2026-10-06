@@ -1,18 +1,23 @@
-"""Controller manager – orchestrates sensors, conditions, outputs.
+"""Controller manager – orchestrates triggers, sensors, conditions, outputs.
 
-Since 0.4.0 a manager is keyed by a stable ``ctrl_<hex>`` id and configured
-from a plain controller dict (stored in the domain-level Store by
-``hub.ScannerHub``), not from a per-controller config entry.
+Since 0.5.0 evaluation is trigger-driven: the controller's TriggerManager
+fires on configured events (state changes / time / sun / HA start), the
+controller debounces bursts, runs one full level-based evaluation and —
+whenever a FOR timer is running — schedules a precise wakeup at the exact
+moment that duration elapses.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_point_in_time,
+)
 from homeassistant.util import dt as dt_util
 
 from .condition_engine import ConditionEngine
@@ -20,11 +25,12 @@ from .const import (
     CONF_CONDITIONS,
     CONF_LOGGING,
     CONF_OUTPUTS,
-    CONF_SCAN_INTERVAL,
     CONF_SENSORS,
-    DEFAULT_SCAN_INTERVAL,
+    CONF_TRIGGERS,
+    EVAL_DEBOUNCE_SECONDS,
 )
 from .decision_log import DecisionLogger
+from .triggers import TriggerManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,17 +48,18 @@ class ControllerManager:
 
         self.name = config.get("name", controller_id)
         self.enabled = config.get("enabled", True)
-        self.scan_interval = timedelta(
-            seconds=config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        )
+        self.triggers = config.get(CONF_TRIGGERS, [])
         self.sensors = config.get(CONF_SENSORS, [])
         self.conditions = config.get(CONF_CONDITIONS, [])
         self.outputs = config.get(CONF_OUTPUTS, [])
         self.logging_enabled = config.get(CONF_LOGGING, False)
 
-        self.engine = ConditionEngine(hass, self.conditions)
+        self.engine = ConditionEngine(hass, self.conditions, manager=self)
         self.logger = DecisionLogger(
             hass, self.name, controller_id, enabled=self.logging_enabled
+        )
+        self.trigger_manager = TriggerManager(
+            hass, self.triggers, self._on_trigger_fire
         )
 
         # Registered output entities, keyed by the stable internal output id
@@ -66,32 +73,57 @@ class ControllerManager:
         }
         self._added_out_ids: set[str] = set()
         self._first_eval_pending = True
-        self._remove_interval = None
         self._warned_bad_sensors = False
+
+        # Debounced trigger firings.
+        self._debounce_unsub = None
+        self._pending_sources: set[str] = set()
+
+        # Serialized evaluation guard (see _async_evaluate).
+        self._evaluating = False
+        self._rerun_pending = False
+        self._rerun_sources: set[str] = set()
+        # Shared by every evaluation entry point (trigger ticks, web trial
+        # runs, force_evaluate) so engine state is never mutated concurrently.
+        self._eval_lock = asyncio.Lock()
+
+        # Precise FOR-expiry wakeup (cancelled/re-armed after every cycle).
+        self._for_wakeup_unsub = None
+
+        # Last applied flip (utc) per output id — feeds cooldown conditions.
+        self._last_flip: dict[str, Any] = {}
 
         # Latest evaluation result per output, served to the web panel.
         self.last_results: dict[str, dict] = {}
         self.last_cycle: str | None = None
 
     async def async_setup(self) -> None:
-        """Start polling and schedule a one-off old-log cleanup.
+        """Register triggers and schedule a one-off old-log cleanup.
 
         The first evaluation is deferred until the platform entities have
         been registered (see ``async_entity_added``) so it does not idle.
         """
-        self._remove_interval = async_track_time_interval(
-            self.hass, self._async_evaluate, self.scan_interval
-        )
+        pool_ids = [
+            s.get("entity_id") for s in self.sensors
+            if isinstance(s, dict) and s.get("entity_id")
+        ]
+        self.trigger_manager.async_setup(pool_ids)
         self.hass.async_create_task(self.logger.async_cleanup())
 
     def async_unload(self) -> None:
-        """Stop polling and drop all entity references."""
-        if self._remove_interval:
-            self._remove_interval()
-            self._remove_interval = None
+        """Stop all triggers, timers and entity references."""
+        self.trigger_manager.async_unload()
+        if self._debounce_unsub:
+            self._debounce_unsub()
+            self._debounce_unsub = None
+        self._cancel_for_wakeup()
         self._entities.clear()
         self._added_out_ids.clear()
         self._first_eval_pending = False
+
+    def last_flip_at(self, out_id: str):
+        """UTC datetime of the last controller-applied flip, or None."""
+        return self._last_flip.get(out_id)
 
     # ------------------------------------------------------------------
     # Entity registration
@@ -119,12 +151,65 @@ class ControllerManager:
             and self._expected_out_ids <= self._added_out_ids
         ):
             self._first_eval_pending = False
-            self.hass.async_create_task(self._async_evaluate(None))
+            self.hass.async_create_background_task(
+                self._async_evaluate(None, ["init"]), f"{self.controller_id}-init"
+            )
 
     @property
     def entities(self) -> dict[str, Any]:
         """Expose registered output entities (read-only view)."""
         return self._entities
+
+    # ------------------------------------------------------------------
+    # Trigger plumbing
+    # ------------------------------------------------------------------
+
+    @callback
+    def _on_trigger_fire(self, source: str) -> None:
+        """A trigger fired: open (or join) a debounced evaluation window.
+
+        The window is opened once and never reset — a chatty pool delays
+        evaluation by at most EVAL_DEBOUNCE_SECONDS, never indefinitely.
+        """
+        self._pending_sources.add(source)
+        if self._debounce_unsub is None:
+            self._debounce_unsub = async_call_later(
+                self.hass, EVAL_DEBOUNCE_SECONDS, self._async_debounced_evaluate
+            )
+
+    @callback
+    def _async_debounced_evaluate(self, _now) -> None:
+        self._debounce_unsub = None
+        sources = sorted(self._pending_sources) or ["unknown"]
+        self._pending_sources.clear()
+        self.hass.async_create_background_task(
+            self._async_evaluate(None, sources), f"{self.controller_id}-evaluate"
+        )
+
+    @callback
+    def _cancel_for_wakeup(self) -> None:
+        if self._for_wakeup_unsub:
+            self._for_wakeup_unsub()
+            self._for_wakeup_unsub = None
+
+    @callback
+    def _rearm_for_wakeup(self) -> None:
+        """Wake up at the earliest instant some condition may flip on its own
+        (FOR expiry, time.at window start, cooldown end)."""
+        self._cancel_for_wakeup()
+        out_ids = [oid for oid in self._entities if self._entities.get(oid)]
+        expiry = self.engine.next_wakeup(out_ids)
+        if expiry is None:
+            return
+
+        @callback
+        def _woken(_now) -> None:
+            self._for_wakeup_unsub = None
+            self.hass.async_create_task(self._async_evaluate(None, ["for_expiry"]))
+
+        self._for_wakeup_unsub = async_track_point_in_time(
+            self.hass, _woken, expiry
+        )
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -148,10 +233,38 @@ class ControllerManager:
             readings[eid] = state.state if state else None
         return readings
 
-    async def _async_evaluate(self, _now: Any) -> None:
-        """Evaluate all outputs; one output failing never blocks the rest."""
+    async def _async_evaluate(self, _now: Any, sources: list[str] | None = None) -> None:
+        """Evaluate all outputs; one output failing never blocks the rest.
+
+        Serialized: a trigger arriving mid-run sets ``_rerun_pending`` and a
+        fresh run happens afterwards, so overlapping runs never interleave
+        their engine state. Sources of swallowed runs are carried over so the
+        decision log keeps telling which triggers caused the cycle.
+        """
+        if sources:
+            self._rerun_sources.update(sources)
+        if self._evaluating:
+            self._rerun_pending = True
+            return
+        self._evaluating = True
+        try:
+            async with self._eval_lock:
+                sources = sorted(self._rerun_sources)
+                self._rerun_sources.clear()
+                await self._async_evaluate_locked(sources)
+        finally:
+            self._evaluating = False
+            self._rearm_for_wakeup()
+            if self._rerun_pending:
+                self._rerun_pending = False
+                self.hass.async_create_background_task(
+                    self._async_evaluate(None, None), f"{self.controller_id}-rerun"
+                )
+
+    async def _async_evaluate_locked(self, sources: list[str] | None = None) -> None:
         self._first_eval_pending = False
         readings = self._async_read_sensors()
+        source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
         for out_cfg in self.outputs:
@@ -167,6 +280,7 @@ class ControllerManager:
             if not record:
                 # Output entity not registered yet — nothing evaluated.
                 continue
+            record["triggered_by"] = source_desc
             records.append(record)
 
         if self.logging_enabled and records:
@@ -200,11 +314,11 @@ class ControllerManager:
         on_details: dict[str, bool] | None = None
         off_details: dict[str, bool] | None = None
         if detailed:
-            on_met, on_details = await self.engine.evaluate_detailed(on_ids)
-            off_met, off_details = await self.engine.evaluate_detailed(off_ids)
+            on_met, on_details = await self.engine.evaluate_detailed(on_ids, out_id)
+            off_met, off_details = await self.engine.evaluate_detailed(off_ids, out_id)
         else:
-            on_met = await self.engine.evaluate_any(on_ids)
-            off_met = await self.engine.evaluate_any(off_ids)
+            on_met = await self.engine.evaluate_any(on_ids, out_id)
+            off_met = await self.engine.evaluate_any(off_ids, out_id)
 
         decision = "hold"
         applied = False
@@ -223,6 +337,9 @@ class ControllerManager:
                     applied = True
                 else:
                     overridden = True
+
+        if applied:
+            self._last_flip[out_id] = dt_util.utcnow()
 
         record = {
             "output": out_cfg.get("name"),
@@ -261,15 +378,22 @@ class ControllerManager:
         return {
             "outputs": dict(self.last_results),
             "last_cycle": self.last_cycle,
-            "scan_interval_seconds": int(self.scan_interval.total_seconds()),
+            "triggers": len(self.triggers),
+            "trigger_errors": self.trigger_manager.register_errors,
         }
 
     async def async_evaluate_with_details(self) -> dict:
         """Run one evaluation cycle now and return per-condition results.
 
-        Semantically identical to a polling tick (writes are applied, the
-        cycle is logged); the extra detail powers the editor trial-run view.
+        Semantically identical to a trigger-driven tick (writes are applied,
+        the cycle is logged); the extra detail powers the editor trial-run.
+        Shares the evaluation lock with trigger ticks so engine state is
+        never mutated concurrently.
         """
+        async with self._eval_lock:
+            return await self._async_evaluate_with_details_locked()
+
+    async def _async_evaluate_with_details_locked(self) -> dict:
         readings = self._async_read_sensors()
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
@@ -296,6 +420,7 @@ class ControllerManager:
         if self.logging_enabled and records:
             await self.logger.log_cycle(records)
 
+        self._rearm_for_wakeup()
         return {"readings": readings, "outputs": outputs, "conditions": conditions}
 
     async def async_evaluate_output(self, out_id: str) -> None:
@@ -312,12 +437,14 @@ class ControllerManager:
             _LOGGER.warning("Unknown output id '%s'; nothing to evaluate", out_id)
             return
         readings = self._async_read_sensors()
-        try:
-            record, _details = await self._async_evaluate_output(out_cfg, readings)
-        except Exception:
-            _LOGGER.exception(
-                "Error evaluating output '%s'", out_cfg.get("name", out_id)
-            )
-            return
-        if record and self.logging_enabled:
-            await self.logger.log_cycle([record])
+        async with self._eval_lock:
+            try:
+                record, _details = await self._async_evaluate_output(out_cfg, readings)
+            except Exception:
+                _LOGGER.exception(
+                    "Error evaluating output '%s'", out_cfg.get("name", out_id)
+                )
+                return
+            if record and self.logging_enabled:
+                await self.logger.log_cycle([record])
+            self._rearm_for_wakeup()

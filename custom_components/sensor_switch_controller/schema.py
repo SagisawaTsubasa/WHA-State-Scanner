@@ -2,8 +2,9 @@
 
 The persisted JSON shape intentionally matches the pre-0.4.0 options-flow
 schema: sensors / conditions / outputs lists with ``cond_<hex>`` ids and
-``ssc_<hex>`` output ids. Only new additive fields (controller-level
-``name``/``enabled``, sensor ``alias``) were introduced with 0.4.0.
+``ssc_<hex>`` output ids. Since 0.5.0 evaluation is trigger-driven:
+``triggers`` replaces the global ``scan_interval`` (old configs map their
+interval to a time trigger on load).
 """
 
 from __future__ import annotations
@@ -16,25 +17,42 @@ import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
 
 from .const import (
+    CALENDAR_HOURS_MAX,
     COND_AND,
+    COND_CALENDAR,
+    COND_COOLDOWN,
+    COND_NOT,
     COND_NUMERIC_STATE,
     COND_OR,
     COND_STATE,
     COND_SUN,
     COND_TEMPLATE,
     COND_TIME,
+    CONF_AT,
+    CONF_EVERY_SECONDS,
+    CONF_HOURS,
+    CONF_OFFSET,
+    CONF_SCAN_INTERVAL,
+    CONF_SECONDS,
+    CONF_TRIGGERS,
+    CONF_WEEKDAYS,
+    COOLDOWN_MAX,
     DEFAULT_SCAN_INTERVAL,
     OUTPUT_BINARY_SENSOR,
     OUTPUT_SWITCH,
-    SCAN_INTERVAL_MAX,
-    SCAN_INTERVAL_MIN,
     SUN_OFFSET_LIMIT,
+    TRG_HOMEASSISTANT,
+    TRG_ID_PREFIX,
+    TRG_STATE,
+    TRG_SUN,
+    TRG_TIME,
+    WEEKDAYS,
 )
 
 _COND_ID_RE = re.compile(r"^cond_[0-9a-f]{32}$")
 _OUT_ID_RE = re.compile(r"^ssc_[0-9a-f]{32}$")
 CTRL_ID_RE = re.compile(r"^ctrl_[0-9a-f]{8}$")
-_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$")
+_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
 _MAX_LABEL_LEN = 100
 _MAX_TEMPLATE_LEN = 2000
 
@@ -44,9 +62,13 @@ LEAF_TYPES = (
     COND_TIME,
     COND_SUN,
     COND_TEMPLATE,
+    COND_COOLDOWN,
+    COND_CALENDAR,
 )
-GROUP_TYPES = (COND_AND, COND_OR)
+GROUP_TYPES = (COND_AND, COND_OR, COND_NOT)
 OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR)
+TRIGGER_TYPES = (TRG_STATE, TRG_TIME, TRG_SUN, TRG_HOMEASSISTANT)
+EVERY_SECONDS_MIN, EVERY_SECONDS_MAX = 10, 86400
 
 
 class ControllerValidationError(ValueError):
@@ -118,6 +140,150 @@ def _validate_for(value, field: str) -> dict | None:
     return {"hours": hours, "minutes": minutes, "seconds": seconds}
 
 
+def _validate_weekdays(value) -> list[str] | None:
+    """Validate a weekday list (mon..sun); None when absent/empty."""
+    if value in (None, "", []):
+        return None
+    if not isinstance(value, list) or not all(isinstance(d, str) for d in value):
+        _fail("星期几必须是 mon/tue/wed/thu/fri/sat/sun 列表")
+    days = [d.strip().lower() for d in value]
+    bad = [d for d in days if d not in WEEKDAYS]
+    if bad:
+        _fail(f"非法星期值：{bad}（允许 {list(WEEKDAYS)}）")
+    deduped = list(dict.fromkeys(days))
+    return deduped or None
+
+
+# ------------------------------------------------------------------
+# Triggers
+# ------------------------------------------------------------------
+
+
+def _validate_state_filter(value, field: str) -> str | list[str] | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        states = [s.strip() for s in value.split(",") if s.strip()]
+    elif isinstance(value, list) and all(isinstance(s, str) for s in value):
+        states = [s.strip() for s in value if s.strip()]
+    else:
+        _fail(f"{field} 必须是字符串或字符串列表")
+    return states[0] if len(states) == 1 else (states or None)
+
+
+def validate_trigger(trg) -> dict:
+    """Validate and normalize one trigger; raises on bad input."""
+    if not isinstance(trg, dict):
+        _fail("触发器必须是对象")
+    ttype = trg.get("type")
+    if ttype not in TRIGGER_TYPES:
+        _fail(f"未知触发器类型：{ttype!r}")
+
+    result: dict = {
+        "id": f"{TRG_ID_PREFIX}{uuid.uuid4().hex}",
+        "type": ttype,
+        "label": _optional_str(trg.get("label"), "触发器标签"),
+        "enabled": _to_bool(trg.get("enabled", True), "触发器 enabled"),
+    }
+
+    if ttype == TRG_STATE:
+        entity_id = trg.get("entity_id")
+        if entity_id in (None, ""):
+            # empty = whole sensor pool
+            result["entity_id"] = None
+        else:
+            result["entity_id"] = _validate_entity_id(entity_id, "触发实体")
+        attribute = _optional_str(trg.get("attribute"), "触发 attribute")
+        if attribute:
+            result["attribute"] = attribute
+        for key in ("from", "to"):
+            mapped = _validate_state_filter(trg.get(key), f"触发器 {key}")
+            if mapped is not None:
+                result[key] = mapped
+
+    elif ttype == TRG_TIME:
+        at = trg.get(CONF_AT)
+        every = trg.get(CONF_EVERY_SECONDS)
+        if at and every:
+            _fail("时间触发器的 at 与 every_seconds 只能二选一")
+        if at:
+            if not isinstance(at, str) or not _TIME_RE.match(at.strip()):
+                _fail("时间触发的 at 必须是 HH:MM 或 HH:MM:SS")
+            result[CONF_AT] = at.strip()
+        elif every is not None:
+            try:
+                every = int(every)
+            except (OverflowError, TypeError, ValueError):
+                _fail("时间触发的 every_seconds 必须是秒数整数")
+            if not EVERY_SECONDS_MIN <= every <= EVERY_SECONDS_MAX:
+                _fail(
+                    f"时间触发的 every_seconds 必须在 "
+                    f"{EVERY_SECONDS_MIN}-{EVERY_SECONDS_MAX} 秒之间"
+                )
+            result[CONF_EVERY_SECONDS] = every
+        else:
+            _fail("时间触发器必须提供 at 或 every_seconds")
+
+    elif ttype == TRG_SUN:
+        event = trg.get("event")
+        if event not in ("sunrise", "sunset"):
+            _fail("太阳触发的 event 必须是 sunrise 或 sunset")
+        result["event"] = event
+        offset = trg.get(CONF_OFFSET)
+        if offset not in (None, 0):
+            try:
+                offset = int(offset)
+            except (OverflowError, TypeError, ValueError):
+                _fail("太阳触发的 offset 必须是秒数整数")
+            if abs(offset) > SUN_OFFSET_LIMIT:
+                _fail(f"太阳触发 offset 不能超过 ±{SUN_OFFSET_LIMIT} 秒")
+            if offset:
+                result[CONF_OFFSET] = offset
+
+    else:  # homeassistant
+        result["event"] = "start"
+
+    return result
+
+
+def _map_legacy_scan_interval(data: dict) -> list[dict]:
+    """Old configs carried a global scan_interval; keep its cadence as a
+    time trigger so upgrades never silently stop evaluating."""
+    interval = data.get(CONF_SCAN_INTERVAL)
+    try:
+        interval = int(interval)
+    except (TypeError, ValueError):
+        interval = DEFAULT_SCAN_INTERVAL
+    interval = max(EVERY_SECONDS_MIN, min(interval, EVERY_SECONDS_MAX))
+    return [
+        {
+            "id": f"{TRG_ID_PREFIX}{uuid.uuid4().hex}",
+            "type": TRG_TIME,
+            "label": "（原扫描间隔）",
+            "enabled": True,
+            CONF_EVERY_SECONDS: interval,
+        }
+    ]
+
+
+def validate_triggers(data: dict) -> list[dict]:
+    """Validate the trigger list, mapping legacy scan_interval when absent."""
+    raw = data.get(CONF_TRIGGERS)
+    if raw is None:
+        # pre-0.5.0 config: preserve polling cadence as an explicit trigger
+        if data.get(CONF_SCAN_INTERVAL) is not None:
+            return _map_legacy_scan_interval(data)
+        return []
+    if not isinstance(raw, list):
+        _fail("触发器必须是列表")
+    return [validate_trigger(trg) for trg in raw]
+
+
+# ------------------------------------------------------------------
+# Conditions
+# ------------------------------------------------------------------
+
+
 def _validate_condition(cond) -> dict:
     if not isinstance(cond, dict):
         _fail("条件必须是对象")
@@ -132,8 +298,9 @@ def _validate_condition(cond) -> dict:
         _fail(f"条件 id 非法：{cid!r}（应为 cond_<32位hex>）")
 
     label = _optional_str(cond.get("label"), "条件标签")
+    enabled = _to_bool(cond.get("enabled", True), "条件 enabled")
 
-    result: dict = {"id": cid, "type": ctype, "label": label}
+    result: dict = {"id": cid, "type": ctype, "label": label, "enabled": enabled}
 
     if ctype == COND_NUMERIC_STATE:
         result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "条件实体")
@@ -176,6 +343,11 @@ def _validate_condition(cond) -> dict:
             result["for"] = for_cfg
 
     elif ctype == COND_TIME:
+        at = cond.get(CONF_AT)
+        if at not in (None, ""):
+            if not isinstance(at, str) or not _TIME_RE.match(at.strip()):
+                _fail("时间条件的 at 必须是 HH:MM 或 HH:MM:SS")
+            result[CONF_AT] = at.strip()
         for key in ("after", "before"):
             value = cond.get(key)
             if value in (None, ""):
@@ -183,8 +355,13 @@ def _validate_condition(cond) -> dict:
             if not isinstance(value, str) or not _TIME_RE.match(value.strip()):
                 _fail(f"时间条件的 {key} 必须是 HH:MM 或 HH:MM:SS")
             result[key] = value.strip()
-        if "after" not in result and "before" not in result:
-            _fail("时间条件必须提供 after 或 before")
+        if CONF_AT in result and ("after" in result or "before" in result):
+            _fail("时间条件的 at 与 after/before 不能同时使用")
+        if CONF_AT not in result and "after" not in result and "before" not in result:
+            _fail("时间条件必须提供 at、after 或 before")
+        weekdays = _validate_weekdays(cond.get(CONF_WEEKDAYS))
+        if weekdays:
+            result[CONF_WEEKDAYS] = weekdays
 
     elif ctype == COND_SUN:
         for key in ("after", "before"):
@@ -217,7 +394,32 @@ def _validate_condition(cond) -> dict:
             _fail(f"模板表达式长度不能超过 {_MAX_TEMPLATE_LEN}")
         result["value_template"] = template
 
-    else:  # and / or
+    elif ctype == COND_COOLDOWN:
+        seconds = cond.get(CONF_SECONDS)
+        if isinstance(seconds, float) and not seconds.is_integer():
+            _fail("冷却条件的 seconds 必须是整数秒")
+        try:
+            seconds = int(seconds)
+        except (OverflowError, TypeError, ValueError):
+            _fail("冷却条件的 seconds 必须是秒数整数")
+        if not 1 <= seconds <= COOLDOWN_MAX:
+            _fail(f"冷却条件的 seconds 必须在 1-{COOLDOWN_MAX} 秒之间")
+        result[CONF_SECONDS] = seconds
+
+    elif ctype == COND_CALENDAR:
+        result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "日历实体")
+        if not result["entity_id"].startswith("calendar."):
+            _fail("日历条件的实体必须是 calendar.* 域")
+        hours = cond.get(CONF_HOURS, 24)
+        try:
+            hours = float(hours)
+        except (OverflowError, TypeError, ValueError):
+            _fail("日历条件的 hours 必须是数字")
+        if not math.isfinite(hours) or not 0 < hours <= CALENDAR_HOURS_MAX:
+            _fail(f"日历条件的 hours 必须在 0-{CALENDAR_HOURS_MAX} 之间")
+        result[CONF_HOURS] = hours
+
+    else:  # and / or / not
         members = cond.get("conditions")
         if not isinstance(members, list) or not members:
             _fail(f"{ctype} 组条件必须至少引用一个成员条件")
@@ -320,14 +522,6 @@ def validate_controller(data) -> dict:
     if not name:
         _fail("控制器名称不能为空")
 
-    scan_interval = data.get("scan_interval", DEFAULT_SCAN_INTERVAL)
-    try:
-        scan_interval = int(scan_interval)
-    except (OverflowError, TypeError, ValueError):
-        _fail("扫描间隔必须是秒数整数")
-    if not SCAN_INTERVAL_MIN <= scan_interval <= SCAN_INTERVAL_MAX:
-        _fail(f"扫描间隔必须在 {SCAN_INTERVAL_MIN}-{SCAN_INTERVAL_MAX} 秒之间")
-
     sensors: list[dict] = []
     seen_sensors: set[str] = set()
     raw_sensors = data.get("sensors") or []
@@ -354,15 +548,15 @@ def validate_controller(data) -> dict:
         _fail("输出列表必须是列表")
     outputs = [_validate_output(out) for out in raw_outputs]
 
+    triggers = validate_triggers(data)
     _check_graph(conditions, outputs)
 
     return {
         "name": name,
         "enabled": _to_bool(data.get("enabled", True), "控制器 enabled"),
-        "scan_interval": scan_interval,
         "logging_enabled": _to_bool(data.get("logging_enabled", False), "控制器 logging_enabled"),
+        "triggers": triggers,
         "sensors": sensors,
         "conditions": conditions,
         "outputs": outputs,
     }
-

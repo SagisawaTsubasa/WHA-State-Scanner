@@ -72,6 +72,7 @@ class ConfigView(HomeAssistantView):
     name = "api:sensor_switch_controller:config"
     requires_auth = True
 
+    @require_admin
     async def get(self, request: web.Request) -> web.Response:
         hass = request.app["hass"]
         hub = get_hub(hass)
@@ -123,7 +124,8 @@ class ControllerDetailView(HomeAssistantView):
         if hub is None:
             return self.json({"ok": False, "error": "集成未加载"}, status_code=503)
         cid = controller_id
-        if cid not in hub.controllers:
+        repairing = cid in hub.invalid
+        if cid not in hub.controllers and not repairing:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
         try:
             body = await _parse_json(request)
@@ -133,8 +135,11 @@ class ControllerDetailView(HomeAssistantView):
         except _WebError as err:
             return _error_response(self, err)
 
-        # Honor the id the client saved under (URL wins over body).
-        hub.update_controller(cid, config)
+        if repairing:
+            hub.repair_controller(cid, config)
+        else:
+            # Honor the id the client saved under (URL wins over body).
+            hub.update_controller(cid, config)
         await hub.async_save()
         _schedule_reload(hass, hub)
         _LOGGER.info("Updated controller %s (%s) via web", cid, config["name"])
@@ -148,7 +153,7 @@ class ControllerDetailView(HomeAssistantView):
         if hub is None:
             return self.json({"ok": False, "error": "集成未加载"}, status_code=503)
         cid = controller_id
-        if cid not in hub.controllers:
+        if cid not in hub.controllers and cid not in hub.invalid:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
         hub.remove_controller(cid)
         await hub.async_save()
@@ -194,6 +199,7 @@ class LogsView(HomeAssistantView):
     name = "api:sensor_switch_controller:logs"
     requires_auth = True
 
+    @require_admin
     async def get(self, request: web.Request) -> web.Response:
         hass = request.app["hass"]
         hub = get_hub(hass)

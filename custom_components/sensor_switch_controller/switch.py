@@ -80,9 +80,7 @@ class SensorSwitch(SwitchEntity):
             "controller_id": self._controller_id,
             "controller_name": self._manager.name,
             "manual_override": self._manual_override,
-            "scan_interval_seconds": int(
-                self._manager.scan_interval.total_seconds()
-            ),
+            "trigger_count": len(self._manager.triggers),
         }
 
     async def async_controller_turn_on(self) -> bool:

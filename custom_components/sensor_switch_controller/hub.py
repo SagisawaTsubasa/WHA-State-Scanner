@@ -34,6 +34,7 @@ class ScannerHub:
         self.hass = hass
         self.store = Store(hass, STORE_VERSION, STORE_KEY)
         self.controllers: dict[str, dict] = {}
+        self.invalid: dict[str, dict] = {}
         self.managers: dict[str, ControllerManager] = {}
         self.entry_id: str | None = None
 
@@ -46,6 +47,7 @@ class ScannerHub:
         data = await self.store.async_load()
         raw = (data or {}).get(CONF_CONTROLLERS) or {}
         controllers: dict[str, dict] = {}
+        self.invalid: dict[str, dict] = {}
         for cid, cfg in raw.items():
             if not isinstance(cid, str) or not CTRL_ID_RE.match(cid):
                 _LOGGER.warning("Ignoring malformed controller id %r", cid)
@@ -53,15 +55,24 @@ class ScannerHub:
             try:
                 controllers[cid] = validate_controller(cfg)
             except ControllerValidationError as err:
+                # Keep the raw config so the next save round-trips it instead
+                # of silently deleting user data; surface it in the panel.
+                self.invalid[cid] = {"config": cfg, "error": str(err)}
                 _LOGGER.warning(
-                    "Ignoring invalid stored config for %s: %s", cid, err
+                    "Stored config for %s is invalid (kept as-is): %s", cid, err
                 )
         self.controllers = controllers
-        _LOGGER.debug("Loaded %d controllers from storage", len(controllers))
+        _LOGGER.debug(
+            "Loaded %d controllers (+%d invalid) from storage",
+            len(controllers), len(self.invalid),
+        )
 
     async def async_save(self) -> None:
-        """Persist controllers to storage."""
-        await self.store.async_save({CONF_CONTROLLERS: self.controllers})
+        """Persist controllers to storage (invalid configs round-trip as-is)."""
+        payload = dict(self.controllers)
+        for cid, item in self.invalid.items():
+            payload[cid] = item["config"]
+        await self.store.async_save({CONF_CONTROLLERS: payload})
 
     # ------------------------------------------------------------------
     # Controllers CRUD (web API; caller schedules the entry reload)
@@ -79,6 +90,11 @@ class ScannerHub:
             raise KeyError(cid)
         self.controllers[cid] = config
 
+    def repair_controller(self, cid: str, config: dict) -> None:
+        """Replace a previously invalid stored config with a valid one."""
+        self.invalid.pop(cid, None)
+        self.controllers[cid] = config
+
     def remove_controller(self, cid: str) -> None:
         """Delete a controller and its entity-registry entries."""
         manager = self.managers.pop(cid, None)
@@ -92,6 +108,7 @@ class ScannerHub:
                     registry.async_remove(entity_id)
             manager.async_unload()
         self.controllers.pop(cid, None)
+        self.invalid.pop(cid, None)
 
     def _fresh_id(self) -> str:
         while True:
@@ -115,7 +132,9 @@ class ScannerHub:
                 continue
             manager = ControllerManager(self.hass, cid, config)
             self.managers[cid] = manager
-            self.hass.async_create_task(manager.async_setup())
+            self.hass.async_create_background_task(
+                manager.async_setup(), f"{cid}-setup"
+            )
 
     def teardown_managers(self) -> None:
         """Stop all polling and drop entity references."""
@@ -153,5 +172,18 @@ class ScannerHub:
                 **config,
                 "active": manager is not None,
                 "runtime": manager.runtime_snapshot() if manager else {},
+            }
+        for cid, item in self.invalid.items():
+            controllers[cid] = {
+                "_invalid": True,
+                "invalid_error": item["error"],
+                "name": cid,
+                "enabled": False,
+                "triggers": [],
+                "sensors": [],
+                "conditions": [],
+                "outputs": [],
+                "active": False,
+                "runtime": {},
             }
         return {"controllers": controllers}

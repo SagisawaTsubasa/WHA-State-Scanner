@@ -13,7 +13,7 @@
   "services": {
     "force_evaluate": {
       "name": "强制评估",
-      "description": "立即触发指定输出实体的条件评估（不影响轮询定时器）。",
+      "description": "立即触发指定输出实体的条件评估（不影响触发器调度）。",
       "fields": {
         "entity_id": {
           "name": "输出实体",

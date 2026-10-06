@@ -74,7 +74,7 @@
 
 **编辑器节点语义 / Node semantics:**
 
-- 条件节点（六类叶子）→ 用连线加入 **AND/OR 组**（成员可进多组）
+- 条件节点（七类叶子）→ 用连线加入 **AND/OR/NOT 组**（成员可进多组）
 - 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
 - **试运行**与正式评估语义完全相同（会实际写输出实体、写决策日志），并把每个条件的满足结果染色到节点上
 - 保存后控制器整条重载，FOR 计时器清零
@@ -117,8 +117,8 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 ```
 Config Entry（单一条目 / single entry）
 ├── Store                → 全部控制器配置（hub.SannerHub, storage.Store）
-├── ControllerManager    → 每控制器一个：轮询调度 + 评估 + 实体注册（controller.py）
-├── Condition Engine     → 六类叶子 + AND/OR 嵌套 + FOR 计时 + 逐条件追踪（condition_engine.py）
+├── ControllerManager    → 每控制器一个：触发调度 + 评估 + 实体注册（controller.py）
+├── Condition Engine     → 七类叶子 + AND/OR/NOT 嵌套 + FOR 计时 + 逐条件追踪（condition_engine.py）
 ├── Output Platforms     → switch / binary_sensor（每控制器一个设备）
 ├── Web Layer            → 侧边栏面板 + REST API + 静态资源（web.py + static/）
 └── Decision Logger      → 独立 JSONL（decision_log.py）
@@ -129,8 +129,8 @@ Config Entry（单一条目 / single entry）
 | 文件 / File | 职责 / Purpose |
 |-------------|----------------|
 | `hub.py` | 域级单例：Store 读写、控制器 CRUD、运行时快照 / Domain singleton: store, controller CRUD, snapshots |
-| `controller.py` | 轮询、评估（含 applied/override 记录）、试运行 API / Polling, evaluation, trial-run API |
-| `condition_engine.py` | 递归条件评估（六类叶子 + 嵌套 + FOR 计时器 + detail 追踪）/ Recursive evaluator |
+| `controller.py` | 触发调度、全量评估（含 applied/override 记录）、试运行 API / Trigger scheduling, evaluation, trial-run API |
+| `condition_engine.py` | 递归条件评估（七类叶子 + AND/OR/NOT 嵌套 + FOR 计时器 + detail 追踪）/ Recursive evaluator |
 | `schema.py` | 共享校验（Web API 与 config flow 同源）/ Shared validation |
 | `web.py` | REST views、面板注册、静态资源 / REST views, panel & static registration |
 | `static/panel.js` | 面板前端（零构建自定义元素 + Drawflow）/ Zero-build panel frontend |
@@ -143,7 +143,7 @@ Config Entry（单一条目 / single entry）
 
 ### `sensor_switch_controller.force_evaluate`
 
-立即触发指定输出实体的条件评估（不影响轮询定时器）。
+立即触发指定输出实体的条件评估（不影响触发器调度）。
 
 ```yaml
 service: sensor_switch_controller.force_evaluate
@@ -152,6 +152,11 @@ target:
 ```
 
 ---
+
+## 已知限制 / Known limits
+
+- 事件驱动下若传感器池内实体持续高频变化，评估频率上限约为每 200ms 一次（防抖窗口）；如需更低频控制，可在触发器中只用时间触发并调大间隔
+- `time` 条件的 `at` 依赖引擎精确唤醒（窗口起点即唤醒点）；系统休眠或时钟跳变可能导致错过该分钟窗口
 
 ## 兼容性 / Compatibility
 
@@ -169,6 +174,32 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.5.0 — 自包含自动化框架：触发器自选 + 条件库增强
+
+**定位重述**：内嵌于集成的自动化框架（触发器 + 条件 + 中间层输出实体），自研引擎不随 HA 升级波动；刻意不做设备控制——动作由 HA 自动化消费输出实体完成。
+
+#### 求值触发模型重构
+- 控制器配置改为**触发器自选**（对标 HA 自动化/米家中枢心智）：状态触发（实体缺省=整个池，支持 attribute/from/to 过滤）、时间触发（每日时刻 HH:MM 或每 N 秒周期）、太阳触发（日出/日落±偏移）、HA 启动触发；每条触发器可单独禁用
+- 任一触发 → 200ms 防抖合并 → **全量电平评估**（求值语义不变，电平模型的滞回/FOR/日志带依据等优点全保留）
+- **FOR 到期精确唤醒**：存在持续计时条件时，引擎在到期时刻自动唤醒评估（事件驱动无轮询兜底，靠精确唤醒保证 duration 到期判定）
+- 全局 `scan_interval` 字段废弃；旧配置自动映射为一条等价时间触发器（可删改）
+- 决策日志 record 新增 `triggered_by`（本轮评估由哪些触发器引起）
+
+#### 条件库增强
+- **NOT 非门**（组：任一成员为真即不通过，语义对齐 HA `not`）
+- **翻转冷却 cooldown**：距本输出上次实际翻转 ≥ N 秒为真（节流/防抖原生支持）
+- **time 条件扩展**：`weekdays` 星期几 + `at` 每日时刻（与 after/before 互斥）
+- **条件级 enabled**：临时禁用单条件（跳过求值、不影响 AND/OR 结果）
+- **calendar 日历条件**：指定日历未来 N 小时有事件
+
+#### 编辑器
+- 控制器配置改**三段式**：触发器 / 传感器池 / 流程图
+- 条件面板新增翻转冷却、日历、NOT 组三种节点；time 表单加星期几与 at；每个条件节点带"启用"开关
+- 手机查看模式同步适配（触发器配置区在窄屏隐藏）
+
+#### 兼容性
+- 旧配置（scan_interval）自动迁移映射；`runtime_snapshot`/实体属性中 `scan_interval_seconds` 由 `trigger_count` 取代
 
 ### 0.4.2
 - **手机/窄屏支持（只读）**：总览单列、表格长 ID 自动换行（无横向溢出）；编辑器在窄屏切"查看模式"——隐藏全部编辑控件，画布占满并带 ＋/－/⌂ 缩放浮钮（Drawflow 原生触摸平移/拖线），提示"编辑请用电脑"；桌面布局不变

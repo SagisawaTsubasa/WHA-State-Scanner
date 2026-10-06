@@ -77,9 +77,7 @@ class SensorBinarySensor(BinarySensorEntity):
         return {
             "controller_id": self._controller_id,
             "controller_name": self._manager.name,
-            "scan_interval_seconds": int(
-                self._manager.scan_interval.total_seconds()
-            ),
+            "trigger_count": len(self._manager.triggers),
         }
 
     async def async_controller_turn_on(self) -> bool:

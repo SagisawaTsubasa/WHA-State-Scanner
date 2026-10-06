@@ -41,14 +41,12 @@ const LANG = {
     lastEval: "上次评估",
     never: "从未",
     sensors: "传感器池",
-    scanInterval: "扫描间隔",
     logging: "决策日志",
     enabled: "启用",
     controllerName: "控制器名称",
     save: "保存",
     back: "返回总览",
     trialRun: "试运行",
-    trialWarn: "试运行与正式评估完全相同，会实际改变输出实体状态。",
     trialNeedSave: "试运行按已保存配置执行；当前有未保存的修改，先保存再试运行。",
     dirtyReload: "保存后控制器将重载，FOR 计时器会清零。",
     addCondition: "添加条件",
@@ -98,6 +96,28 @@ const LANG = {
     evalDone: "评估完成",
     loading: "加载中…",
     mobileNote: "查看模式：编辑请用电脑",
+    triggersTitle: "触发器",
+    addTrigger: "添加触发器",
+    noTriggers: "尚未配置触发器：控制器只在手动评估时更新。",
+    triggerState: "状态触发",
+    triggerTime: "时间触发",
+    triggerSun: "太阳触发",
+    triggerStart: "HA 启动（重载也会触发）",
+    triggerEntity: "实体（留空=整个传感器池）",
+    triggerAttribute: "attribute",
+    triggerFrom: "从状态（可选）",
+    triggerTo: "到状态（可选）",
+    triggerAt: "每日时刻 HH:MM",
+    triggerEvery: "每 N 秒",
+    triggerOffset: "偏移（秒，可负）",
+    condCooldown: "翻转冷却",
+    condCalendar: "日历",
+    condNot: "NOT 组",
+    cooldownSeconds: "冷却秒数",
+    calendarHours: "未来小时数",
+    weekdaysLabel: "星期几",
+    byLabel: "触发来源",
+    enabledLabel: "启用",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -120,14 +140,12 @@ const LANG = {
     lastEval: "Last evaluation",
     never: "never",
     sensors: "Sensor pool",
-    scanInterval: "Scan interval",
     logging: "Decision log",
     enabled: "Enabled",
     controllerName: "Controller name",
     save: "Save",
     back: "Back to overview",
     trialRun: "Trial run",
-    trialWarn: "A trial run is identical to a real evaluation and will change output entity states.",
     trialNeedSave: "Trial runs use the saved config; you have unsaved changes — save first.",
     dirtyReload: "Saving reloads the controller; FOR timers reset.",
     addCondition: "Add condition",
@@ -177,6 +195,28 @@ const LANG = {
     evalDone: "Evaluation done",
     loading: "Loading…",
     mobileNote: "Read-only view — edit on a desktop",
+    triggersTitle: "Triggers",
+    addTrigger: "Add trigger",
+    noTriggers: "No triggers configured — the controller only updates on manual evaluation.",
+    triggerState: "State",
+    triggerTime: "Time",
+    triggerSun: "Sun",
+    triggerStart: "HA start (also fires on reload)",
+    triggerEntity: "Entity (empty = whole pool)",
+    triggerAttribute: "attribute",
+    triggerFrom: "From state (optional)",
+    triggerTo: "To state (optional)",
+    triggerAt: "Daily at HH:MM",
+    triggerEvery: "Every N seconds",
+    triggerOffset: "Offset (seconds, may be negative)",
+    condCooldown: "Flip cooldown",
+    condCalendar: "Calendar",
+    condNot: "NOT group",
+    cooldownSeconds: "Cooldown seconds",
+    calendarHours: "Upcoming hours",
+    weekdaysLabel: "Weekdays",
+    byLabel: "By",
+    enabledLabel: "Enabled",
   },
 };
 
@@ -201,8 +241,11 @@ const TYPE_LABEL_KEY = {
   time: "condTime",
   sun: "condSun",
   template: "condTemplate",
+  cooldown: "condCooldown",
+  calendar: "condCalendar",
   and: "condAnd",
   or: "condOr",
+  not: "condNot",
 };
 
 const TYPE_ICON = {
@@ -211,9 +254,16 @@ const TYPE_ICON = {
   time: "🕐",
   sun: "🌤",
   template: "ƒ",
+  cooldown: "⏱",
+  calendar: "📅",
   and: "⊕",
   or: "⊗",
+  not: "¬",
 };
+
+const TRIGGER_ICON = { state: "⚡", time: "🕐", sun: "🌤", homeassistant: "🏠" };
+const TRIGGER_LABEL_KEY = { state: "triggerState", time: "triggerTime", sun: "triggerSun", homeassistant: "triggerStart" };
+const isGroupType = (t) => t === "and" || t === "or" || t === "not";
 
 function conditionSummary(cond) {
   let text = "";
@@ -228,14 +278,25 @@ function conditionSummary(cond) {
     case "state":
       text = `${cond.entity_id} = ${Array.isArray(cond.state) ? cond.state.join("/") : cond.state}`;
       break;
-    case "time":
+    case "time": {
+      if (cond.at) {
+        text = `每日 ${cond.at}`;
+        break;
+      }
       text = [cond.after ? `自 ${cond.after}` : "", cond.before ? `至 ${cond.before}` : ""].filter(Boolean).join(" ");
       break;
+    }
     case "sun":
       text = [cond.after ? `${cond.after} 后` : "", cond.before ? `${cond.before} 前` : ""].filter(Boolean).join(" ");
       break;
     case "template":
       text = cond.value_template || "";
+      break;
+    case "cooldown":
+      text = `距上次翻转 ≥ ${cond.seconds}s`;
+      break;
+    case "calendar":
+      text = `${cond.entity_id} 未来 ${cond.hours}h 有事件`;
       break;
     default:
       text = `${(cond.conditions || []).length} 个成员`;
@@ -243,6 +304,12 @@ function conditionSummary(cond) {
   if (cond.for && (cond.for.hours || cond.for.minutes || cond.for.seconds)) {
     const f = cond.for;
     text += ` 持续 ${String(f.hours).padStart(2, "0")}:${String(f.minutes).padStart(2, "0")}:${String(f.seconds).padStart(2, "0")}`;
+  }
+  if (cond.weekdays && cond.weekdays.length) {
+    text += ` [${cond.weekdays.join(",")}]`;
+  }
+  if (cond.enabled === false) {
+    text = `⏸ ${text}`;
   }
   return cond.label ? `${cond.label}｜${text}` : text;
 }
@@ -470,6 +537,18 @@ class ScannerPanel extends HTMLElement {
     const rows = cids
       .map((cid) => {
         const c = controllers[cid];
+        if (c._invalid) {
+          return `
+          <div class="wha-card" data-cid="${esc(cid)}">
+            <div class="wha-row">
+              <h2 style="margin:0">${esc(cid)}</h2>
+              <span class="badge off">配置无效</span>
+              <span class="spacer" style="flex:1"></span>
+              <button class="wha-btn danger" data-act="del">${esc(this.tr("delete"))}</button>
+            </div>
+            <p class="wha-sub" style="margin-top:8px">存储中的配置无法载入：${esc(c.invalid_error || "")}。请删除后重新创建控制器。</p>
+          </div>`;
+        }
         const outputs = (c.outputs || [])
           .map((o) => {
             const rt = c.runtime?.outputs?.[o.entity_id];
@@ -483,8 +562,10 @@ class ScannerPanel extends HTMLElement {
           <div class="wha-card" data-cid="${esc(cid)}">
             <div class="wha-row">
               <h2 style="margin:0">${esc(c.name)}</h2>
-              <span class="badge ${c.enabled ? "on" : "hold"}">${c.enabled ? esc(this.tr("enabled")) : "off"}</span>
+              ${c._invalid ? `<span class="badge off">配置无效</span>` : `<span class="badge ${c.enabled ? "on" : "hold"}">${c.enabled ? esc(this.tr("enabled")) : "off"}</span>`}
               <span class="badge meta">${esc(cid)}</span>
+              <span class="badge meta">${esc(this.tr("triggersTitle"))} ${c.triggers ? c.triggers.length : 0}${c.triggers && c.triggers.length === 0 ? " ⚠" : ""}</span>
+              ${c.runtime?.trigger_errors ? `<span class="badge off">触发器错误 ${c.runtime.trigger_errors}</span>` : ""}
               <span class="spacer" style="flex:1"></span>
               <button class="wha-btn" data-act="edit">${esc(this.tr("edit"))}</button>
               <button class="wha-btn" data-act="logs">${esc(this.tr("logs"))}</button>
@@ -601,14 +682,15 @@ class ScannerPanel extends HTMLElement {
       config = {
         name: "",
         enabled: true,
-        scan_interval: 180,
         logging_enabled: true,
+        triggers: [],
         sensors: [],
         conditions: [],
         outputs: [],
       };
     } else {
       config = JSON.parse(JSON.stringify(this._controllerConfig(cid)));
+      config.triggers = config.triggers || [];
     }
     this._editor = {
       cid: isNew ? null : cid,
@@ -630,7 +712,6 @@ class ScannerPanel extends HTMLElement {
         <div class="wha-editor-head">
           <label>${esc(this.tr("controllerName"))}<input class="wha-input" data-field="name" value="${esc(config.name)}" style="min-width:180px"></label>
           <label class="field-inline" style="justify-content:center"><input type="checkbox" data-field="enabled" ${config.enabled ? "checked" : ""}> ${esc(this.tr("enabled"))}</label>
-          <label>${esc(this.tr("scanInterval"))}(s)<input class="wha-input" type="number" min="10" max="3600" data-field="scan_interval" value="${esc(config.scan_interval)}" style="width:90px"></label>
           <label class="field-inline" style="justify-content:center"><input type="checkbox" data-field="logging_enabled" ${config.logging_enabled ? "checked" : ""}> ${esc(this.tr("logging"))}</label>
           <span class="spacer" style="flex:1"></span>
           <button class="wha-btn" data-act="delete-node">${esc(this.tr("deleteSelected"))}</button>
@@ -638,14 +719,18 @@ class ScannerPanel extends HTMLElement {
           <button class="wha-btn primary" data-act="save">${esc(this.tr("save"))}</button>
           <button class="wha-btn" data-act="back">${esc(this.tr("back"))}</button>
         </div>
-        <details class="wha-card" style="flex:none">
+        <details class="wha-card wha-edit-only" style="flex:none">
+          <summary>${esc(this.tr("triggersTitle"))} (${config.triggers.length})</summary>
+          <div data-triggers></div>
+        </details>
+        <details class="wha-card wha-edit-only" style="flex:none">
           <summary>${esc(this.tr("sensors"))} (${config.sensors.length})</summary>
           <div data-sensors></div>
         </details>
         <div class="wha-editor-body">
           <div class="wha-palette">
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "and", "or"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "and", "or", "not"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addOutput"))}</h3>
@@ -670,6 +755,7 @@ class ScannerPanel extends HTMLElement {
         <div class="wha-sub wha-reload-note" style="padding:4px 2px">${esc(this.tr("dirtyReload"))}</div>
       </div>`;
 
+    this._renderTriggerPool(main.querySelector("[data-triggers]"));
     this._renderSensorPool(main.querySelector("[data-sensors]"));
 
     // head field bindings
@@ -677,7 +763,6 @@ class ScannerPanel extends HTMLElement {
       input.addEventListener("change", () => {
         const f = input.dataset.field;
         if (f === "enabled" || f === "logging_enabled") this._editor.controller[f] = input.checked;
-        else if (f === "scan_interval") this._editor.controller[f] = Number(input.value) || 180;
         else this._editor.controller[f] = input.value;
         this._editor.dirty = true;
       });
@@ -755,6 +840,137 @@ class ScannerPanel extends HTMLElement {
     });
   }
 
+  _triggerFieldInputs(t, i) {
+    const f = (key, placeholder, value, type = "text", style = "width:110px", list = "") => {
+      const num = type === "number" ? ` min="${key === "offset" ? -86400 : 10}" max="86400"` : "";
+      const lst = list ? ` list="${list}"` : "";
+      return `<input class="wha-input" type="${type}"${num}${lst} data-ti="${i}" data-tf="${key}" placeholder="${esc(placeholder)}" value="${esc(value ?? "")}" style="${style}">`;
+    };
+    if (t.type === "state") {
+      return `
+        ${f("entity_id", this.tr("triggerEntity"), t.entity_id || "", "text", "width:200px;min-width:160px", "wha-trg-ents")}
+        ${f("attribute", this.tr("triggerAttribute"), t.attribute || "")}
+        ${f("from", this.tr("triggerFrom"), t.from || "")}
+        ${f("to", this.tr("triggerTo"), t.to || "")}`;
+    }
+    if (t.type === "time") {
+      return `
+        ${f("at", this.tr("triggerAt"), t.at || "", "text", "width:110px")}
+        ${f("every_seconds", this.tr("triggerEvery"), t.every_seconds ?? "", "number", "width:110px")}`;
+    }
+    if (t.type === "sun") {
+      return `
+        <select class="wha-input" data-ti="${i}" data-tf="event">
+          <option value="sunrise" ${t.event !== "sunset" ? "selected" : ""}>sunrise</option>
+          <option value="sunset" ${t.event === "sunset" ? "selected" : ""}>sunset</option>
+        </select>
+        ${f("offset", this.tr("triggerOffset"), t.offset ?? 0, "number")}`;
+    }
+    return "";
+  }
+
+  _triggerHeadHtml(t) {
+    return `${TRIGGER_ICON[t.type] || "?"} ${esc(this.tr(TRIGGER_LABEL_KEY[t.type] || t.type))}｜${esc(this._triggerSummary(t))}`;
+  }
+
+  _triggerSummary(t) {
+    let detail = "";
+    if (t.type === "state") {
+      detail = t.entity_id || this.tr("triggerEntity");
+      if (t.attribute) detail += ` · ${t.attribute}`;
+    } else if (t.type === "time") {
+      detail = t.at ? `${this.tr("triggerAt")} ${t.at}` : `${this.tr("triggerEvery")} ${t.every_seconds}`;
+    } else if (t.type === "sun") {
+      detail = `${t.event || "sunrise"} ${t.offset ? (t.offset > 0 ? "+" : "") + t.offset + "s" : ""}`;
+    } else {
+      detail = "start";
+    }
+    return detail;
+  }
+
+  _renderTriggerPool(container) {
+    const triggers = this._editor.controller.triggers || [];
+    container.innerHTML = `
+      ${triggers.length === 0 ? `<p class="wha-sub">⚠ ${esc(this.tr("noTriggers"))}</p>` : ""}
+      <datalist id="wha-trg-ents">${Object.keys(this._hass?.states || {}).sort().map((e) => `<option value="${esc(e)}">`).join("")}</datalist>
+      <table class="wha-table">
+        <tbody>
+          ${triggers
+            .map(
+              (t, i) => `
+            <tr>
+              <td>
+                <div>${this._triggerHeadHtml(t)}</div>
+                <div class="wha-row" style="margin-top:4px">${this._triggerFieldInputs(t, i)}</div>
+              </td>
+              <td class="field-inline"><input type="checkbox" data-ti="${i}" data-tk="enabled" ${t.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</td>
+              <td><button class="wha-btn danger" data-tdel="${i}">✕</button></td>
+            </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+      <div class="wha-row" style="margin-top:8px">
+        <select class="wha-input" data-tadd-type>
+          <option value="state">${esc(this.tr("triggerState"))}</option>
+          <option value="time">${esc(this.tr("triggerTime"))}</option>
+          <option value="sun">${esc(this.tr("triggerSun"))}</option>
+          <option value="homeassistant">${esc(this.tr("triggerStart"))}</option>
+        </select>
+        <button class="wha-btn" data-tadd>＋ ${esc(this.tr("addTrigger"))}</button>
+      </div>
+      <div data-trigger-fields></div>`;
+
+    container.querySelectorAll("[data-tf]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const t = triggers[Number(input.dataset.ti)];
+        const key = input.dataset.tf;
+        const v = input.value.trim();
+        if (v === "" || (input.type === "number" && v === "")) {
+          delete t[key];
+        } else if (key === "every_seconds" || key === "offset") {
+          const n = Number(v);
+          if (!Number.isFinite(n)) return;
+          t[key] = n;
+        } else {
+          t[key] = v;
+        }
+        if (key === "at" && v) delete t.every_seconds;
+        if (key === "every_seconds" && v) delete t.at;
+        this._editor.dirty = true;
+        const cell = container.querySelector(`[data-ti="${input.dataset.ti}"][data-tk="enabled"]`);
+        if (cell) cell.closest("tr").querySelector("td > div").innerHTML =
+          this._triggerHeadHtml(t);
+      });
+    });
+
+    const refresh = () => {
+      this._editor.dirty = true;
+      this._renderTriggerPool(container);
+    };
+    container.querySelectorAll("[data-tk]").forEach((input) =>
+      input.addEventListener("change", () => {
+        triggers[Number(input.dataset.ti)][input.dataset.tk] = input.checked;
+        this._editor.dirty = true;
+      })
+    );
+    container.querySelectorAll("[data-tdel]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        triggers.splice(Number(btn.dataset.tdel), 1);
+        refresh();
+      })
+    );
+    container.querySelector("[data-tadd]")?.addEventListener("click", () => {
+      const type = container.querySelector("[data-tadd-type]").value;
+      const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true };
+      if (type === "time") t.every_seconds = 300;
+      if (type === "sun") t.event = "sunrise";
+      if (type === "state") t.entity_id = "";
+      triggers.push(t);
+      refresh();
+    });
+  }
+
   /* ----- drawflow wiring ----- */
 
   _initCanvas(container) {
@@ -798,8 +1014,7 @@ class ScannerPanel extends HTMLElement {
     // import existing model
     const conds = ed.controller.conditions;
     conds.forEach((cond, i) => {
-      const isGroup = cond.type === "and" || cond.type === "or";
-      const x = isGroup ? 420 : 20;
+      const x = isGroupType(cond.type) ? 420 : 20;
       this._dfAddCondNode(cond, x, 20 + i * 120);
     });
     ed.controller.outputs.forEach((out, i) => {
@@ -807,7 +1022,7 @@ class ScannerPanel extends HTMLElement {
     });
     // connections
     for (const cond of conds) {
-      if (cond.type !== "and" && cond.type !== "or") continue;
+      if (!isGroupType(cond.type)) continue;
       const gid = ed.condToNode.get(cond.id);
       for (const m of cond.conditions || []) {
         const mid = ed.condToNode.get(m);
@@ -864,7 +1079,7 @@ class ScannerPanel extends HTMLElement {
 
   _dfAddCondNode(cond, x, y) {
     const ed = this._editor;
-    const isGroup = cond.type === "and" || cond.type === "or";
+    const isGroup = isGroupType(cond.type);
     const nodeId = ed.df.addNode(
       cond.type,
       isGroup ? 1 : 0,
@@ -912,12 +1127,17 @@ class ScannerPanel extends HTMLElement {
       cond.after = "sunset";
     } else if (type === "template") {
       cond.value_template = "{{ true }}";
+    } else if (type === "cooldown") {
+      cond.seconds = 60;
+    } else if (type === "calendar") {
+      cond.entity_id = "";
+      cond.hours = 24;
     } else {
       cond.conditions = [];
     }
     ed.controller.conditions.push(cond);
     const count = ed.controller.conditions.length;
-    const nodeId = this._dfAddCondNode(cond, type === "and" || type === "or" ? 420 : 20, 20 + (count - 1) * 120);
+    const nodeId = this._dfAddCondNode(cond, isGroupType(type) ? 420 : 20, 20 + (count - 1) * 120);
     this._selectNode(nodeId);
     ed.dirty = true;
   }
@@ -1022,11 +1242,12 @@ class ScannerPanel extends HTMLElement {
 
     const cond = ed.controller.conditions.find((c) => c.id === sel.condId);
     if (!cond) return;
-    const isGroup = cond.type === "and" || cond.type === "or";
+    const isGroup = isGroupType(cond.type);
     const f = cond.for || { hours: 0, minutes: 0, seconds: 0 };
     box.innerHTML = `
       ${isGroup ? "" : datalist}
       <h3>${esc(this.tr(TYPE_LABEL_KEY[cond.type]))}</h3>
+      <label class="field field-inline"><input type="checkbox" data-insk="enabled" ${cond.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</label>
       <label class="field"><span>${esc(this.tr("label"))}</span><input class="wha-input" data-insk="label" value="${esc(cond.label || "")}"></label>
       ${isGroup
         ? `<p class="wha-sub">${esc(this.tr("members"))}: ${(cond.conditions || []).length}</p>`
@@ -1043,9 +1264,11 @@ class ScannerPanel extends HTMLElement {
     box.querySelectorAll("[data-insk]").forEach((input) =>
       input.addEventListener("change", () => {
         const k = input.dataset.insk;
-        let v = input.value;
-        if (k === "above" || k === "below" || k.endsWith("_offset")) {
+        let v = input.type === "checkbox" ? input.checked : input.value;
+        if (k === "above" || k === "below" || k.endsWith("_offset") || k === "hours") {
           v = v === "" ? null : Number(v);
+        } else if (k === "seconds") {
+          v = Number(v) || 60;
         } else if (k === "state") {
           const parts = String(v).split(",").map((s) => s.trim()).filter(Boolean);
           v = parts.length > 1 ? parts : parts[0] || "on";
@@ -1067,6 +1290,16 @@ class ScannerPanel extends HTMLElement {
         this._refreshNodeBody(sel.nodeId);
       })
     );
+    box.querySelectorAll("[data-wd]").forEach((input) =>
+      input.addEventListener("change", () => {
+        const set = new Set(cond.weekdays || []);
+        if (input.checked) set.add(input.dataset.wd);
+        else set.delete(input.dataset.wd);
+        cond.weekdays = set.size ? [...set] : undefined;
+        ed.dirty = true;
+        this._refreshNodeBody(sel.nodeId);
+      })
+    );
   }
 
   _condFieldsHtml(cond) {
@@ -1081,10 +1314,23 @@ class ScannerPanel extends HTMLElement {
         return `
           <label class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
           <label class="field"><span>${esc(trk("state"))}</span><input class="wha-input" data-insk="state" value="${esc(Array.isArray(cond.state) ? cond.state.join(",") : cond.state || "")}"></label>`;
-      case "time":
+      case "time": {
+        const wd = cond.weekdays || [];
         return `
+          <label class="field"><span>at (HH:MM)</span><input class="wha-input" placeholder="07:30" data-insk="at" value="${esc(cond.at || "")}"></label>
           <label class="field"><span>${esc(trk("after"))}(HH:MM)</span><input class="wha-input" placeholder="22:00" data-insk="after" value="${esc(cond.after || "")}"></label>
-          <label class="field"><span>${esc(trk("before"))}(HH:MM)</span><input class="wha-input" placeholder="06:00" data-insk="before" value="${esc(cond.before || "")}"></label>`;
+          <label class="field"><span>${esc(trk("before"))}(HH:MM)</span><input class="wha-input" placeholder="06:00" data-insk="before" value="${esc(cond.before || "")}"></label>
+          <label class="field"><span>${esc(trk("weekdaysLabel"))}</span><span class="wha-row">
+            ${["mon","tue","wed","thu","fri","sat","sun"].map((d) => `<label class="field-inline" style="font-size:12px"><input type="checkbox" data-wd="${d}" ${wd.includes(d) ? "checked" : ""}>${d}</label>`).join("")}
+          </span></label>`;
+      }
+      case "cooldown":
+        return `
+          <label class="field"><span>${esc(trk("cooldownSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>`;
+      case "calendar":
+        return `
+          <label class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
+          <label class="field"><span>${esc(trk("calendarHours"))}</span><input class="wha-input" type="number" min="1" max="168" data-insk="hours" value="${esc(cond.hours ?? 24)}"></label>`;
       case "sun":
         return `
           <label class="field"><span>${esc(trk("after"))}</span>
@@ -1128,7 +1374,7 @@ class ScannerPanel extends HTMLElement {
         .filter(Boolean);
     };
     for (const cond of ed.controller.conditions) {
-      if (cond.type !== "and" && cond.type !== "or") continue;
+      if (!isGroupType(cond.type)) continue;
       const nid = ed.condToNode.get(cond.id);
       cond.conditions = nid ? nodeRefs(nid, "input_1") : [];
     }
@@ -1262,6 +1508,7 @@ class ScannerPanel extends HTMLElement {
           <td>${r.on_met ? "✓" : "—"}</td>
           <td>${r.off_met ? "✓" : "—"}</td>
           <td>${r.applied ? "✓" : "—"}${r.override ? " ✋" : ""}</td>
+          <td class="wha-sub">${esc(r.triggered_by || "—")}</td>
           <td>
             <details class="wha-json"><summary>${esc(this.tr("readouts"))}</summary>
               <pre>${esc(JSON.stringify(r.readings || {}, null, 2))}</pre>
@@ -1275,7 +1522,7 @@ class ScannerPanel extends HTMLElement {
       ${rows
         ? `<table class="wha-table"><thead><tr>
             <th>${esc(this.tr("time"))}</th><th>${esc(this.tr("outputs"))}</th><th>${esc(this.tr("decision"))}</th>
-            <th>on_met</th><th>off_met</th><th>applied</th><th>${esc(this.tr("readouts"))}</th>
+            <th>on_met</th><th>off_met</th><th>applied</th><th>${esc(this.tr("byLabel"))}</th><th>${esc(this.tr("readouts"))}</th>
           </tr></thead><tbody>${rows}</tbody></table>`
         : `<p class="wha-sub">—</p>`}`;
   }

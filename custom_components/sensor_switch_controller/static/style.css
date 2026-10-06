@@ -356,7 +356,7 @@ details.wha-json pre {
   .wha-table th, .wha-table td { word-break: break-all; white-space: normal; }
 
   /* editor: read-only view — hide every editing control */
-  .wha-palette, .wha-inspector, .wha-editor-head, .wha-reload-note { display: none !important; }
+  .wha-palette, .wha-inspector, .wha-editor-head, .wha-reload-note, .wha-edit-only { display: none !important; }
   .wha-editor-note { display: flex !important; }
   .wha-editor-body { grid-template-columns: 1fr; grid-template-rows: 1fr; }
   .wha-canvas-wrap { min-height: 380px; }
