@@ -702,6 +702,8 @@ class ScannerPanel extends HTMLElement {
       condToNode: new Map(),
       nodeToOut: new Map(),
       outToNode: new Map(),
+      nodeToTrg: new Map(),
+      trgToNode: new Map(),
       selected: null,
       trial: null,
     };
@@ -720,15 +722,15 @@ class ScannerPanel extends HTMLElement {
           <button class="wha-btn" data-act="back">${esc(this.tr("back"))}</button>
         </div>
         <details class="wha-card wha-edit-only" style="flex:none">
-          <summary>${esc(this.tr("triggersTitle"))} (${config.triggers.length})</summary>
-          <div data-triggers></div>
-        </details>
-        <details class="wha-card wha-edit-only" style="flex:none">
           <summary>${esc(this.tr("sensors"))} (${config.sensors.length})</summary>
           <div data-sensors></div>
         </details>
         <div class="wha-editor-body">
           <div class="wha-palette">
+            <h3>${esc(this.tr("addTrigger"))}</h3>
+            ${["state", "time", "sun", "homeassistant"]
+              .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
+              .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
             ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "and", "or", "not"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
@@ -755,7 +757,6 @@ class ScannerPanel extends HTMLElement {
         <div class="wha-sub wha-reload-note" style="padding:4px 2px">${esc(this.tr("dirtyReload"))}</div>
       </div>`;
 
-    this._renderTriggerPool(main.querySelector("[data-triggers]"));
     this._renderSensorPool(main.querySelector("[data-sensors]"));
 
     // head field bindings
@@ -769,6 +770,9 @@ class ScannerPanel extends HTMLElement {
     });
 
     // palette
+    main.querySelectorAll("[data-add-trg]").forEach((btn) =>
+      btn.addEventListener("click", () => this._addTriggerNode(btn.dataset.addTrg))
+    );
     main.querySelectorAll("[data-add-cond]").forEach((btn) =>
       btn.addEventListener("click", () => this._addConditionNode(btn.dataset.addCond))
     );
@@ -888,87 +892,94 @@ class ScannerPanel extends HTMLElement {
     return detail;
   }
 
-  _renderTriggerPool(container) {
-    const triggers = this._editor.controller.triggers || [];
-    container.innerHTML = `
-      ${triggers.length === 0 ? `<p class="wha-sub">⚠ ${esc(this.tr("noTriggers"))}</p>` : ""}
-      <datalist id="wha-trg-ents">${Object.keys(this._hass?.states || {}).sort().map((e) => `<option value="${esc(e)}">`).join("")}</datalist>
-      <table class="wha-table">
-        <tbody>
-          ${triggers
-            .map(
-              (t, i) => `
-            <tr>
-              <td>
-                <div>${this._triggerHeadHtml(t)}</div>
-                <div class="wha-row" style="margin-top:4px">${this._triggerFieldInputs(t, i)}</div>
-              </td>
-              <td class="field-inline"><input type="checkbox" data-ti="${i}" data-tk="enabled" ${t.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</td>
-              <td><button class="wha-btn danger" data-tdel="${i}">✕</button></td>
-            </tr>`
-            )
-            .join("")}
-        </tbody>
-      </table>
-      <div class="wha-row" style="margin-top:8px">
-        <select class="wha-input" data-tadd-type>
-          <option value="state">${esc(this.tr("triggerState"))}</option>
-          <option value="time">${esc(this.tr("triggerTime"))}</option>
-          <option value="sun">${esc(this.tr("triggerSun"))}</option>
-          <option value="homeassistant">${esc(this.tr("triggerStart"))}</option>
-        </select>
-        <button class="wha-btn" data-tadd>＋ ${esc(this.tr("addTrigger"))}</button>
-      </div>
-      <div data-trigger-fields></div>`;
+  _addTriggerNode(type) {
+    const ed = this._editor;
+    const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true };
+    if (type === "time") t.every_seconds = 300;
+    if (type === "sun") t.event = "sunrise";
+    if (type === "state") t.entity_id = "";
+    ed.controller.triggers = ed.controller.triggers || [];
+    ed.controller.triggers.push(t);
+    const count = ed.controller.triggers.length;
+    const nodeId = this._dfAddTriggerNode(t, 20, 20 + (count - 1) * 120);
+    this._selectNode(nodeId);
+    ed.dirty = true;
+  }
 
-    container.querySelectorAll("[data-tf]").forEach((input) => {
-      input.addEventListener("change", () => {
-        const t = triggers[Number(input.dataset.ti)];
-        const key = input.dataset.tf;
-        const v = input.value.trim();
-        if (v === "" || (input.type === "number" && v === "")) {
-          delete t[key];
-        } else if (key === "every_seconds" || key === "offset") {
-          const n = Number(v);
-          if (!Number.isFinite(n)) return;
-          t[key] = n;
-        } else {
-          t[key] = v;
-        }
-        if (key === "at" && v) delete t.every_seconds;
-        if (key === "every_seconds" && v) delete t.at;
-        this._editor.dirty = true;
-        const cell = container.querySelector(`[data-ti="${input.dataset.ti}"][data-tk="enabled"]`);
-        if (cell) cell.closest("tr").querySelector("td > div").innerHTML =
-          this._triggerHeadHtml(t);
-      });
-    });
+  _dfAddTriggerNode(t, x, y) {
+    const ed = this._editor;
+    const nodeId = ed.df.addNode(
+      "trigger_" + t.type,
+      0,
+      0,
+      x,
+      y,
+      `wha-node trg-${t.type}${t.enabled === false ? " trg-off" : ""}`,
+      { trgId: t.id },
+      this._triggerNodeHtml(t)
+    );
+    ed.nodeToTrg.set(nodeId, t.id);
+    ed.trgToNode.set(t.id, nodeId);
+    return nodeId;
+  }
 
-    const refresh = () => {
-      this._editor.dirty = true;
-      this._renderTriggerPool(container);
-    };
-    container.querySelectorAll("[data-tk]").forEach((input) =>
-      input.addEventListener("change", () => {
-        triggers[Number(input.dataset.ti)][input.dataset.tk] = input.checked;
-        this._editor.dirty = true;
-      })
-    );
-    container.querySelectorAll("[data-tdel]").forEach((btn) =>
-      btn.addEventListener("click", () => {
-        triggers.splice(Number(btn.dataset.tdel), 1);
-        refresh();
-      })
-    );
-    container.querySelector("[data-tadd]")?.addEventListener("click", () => {
-      const type = container.querySelector("[data-tadd-type]").value;
-      const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true };
-      if (type === "time") t.every_seconds = 300;
-      if (type === "sun") t.event = "sunrise";
-      if (type === "state") t.entity_id = "";
-      triggers.push(t);
-      refresh();
-    });
+  _triggerNodeHtml(t) {
+    return `
+      <div class="wha-node-body-wrap">
+        <div class="wha-node-head">
+          <span>${TRIGGER_ICON[t.type] || "?"}</span>
+          <span data-nhead>${esc(this.tr(TRIGGER_LABEL_KEY[t.type] || t.type))}</span>
+          <span class="wha-node-tag">trigger</span>
+        </div>
+        <div class="wha-node-body" data-nbody>${esc(this._triggerSummary(t))}</div>
+      </div>`;
+  }
+
+  _refreshTriggerNode(nodeId) {
+    const ed = this._editor;
+    const trgId = ed.nodeToTrg.get(nodeId);
+    if (trgId === undefined) return;
+    const el = ed.df.container ? ed.df.container.querySelector(`#node-${nodeId}`) : null;
+    const t = (ed.controller.triggers || []).find((x) => x.id === trgId);
+    if (!el || !t) return;
+    const head = el.querySelector("[data-nhead]");
+    const body = el.querySelector("[data-nbody]");
+    if (head) head.textContent = this.tr(TRIGGER_LABEL_KEY[t.type] || t.type);
+    if (body) body.textContent = this._triggerSummary(t);
+    el.classList.toggle("trg-off", t.enabled === false);
+  }
+
+  _triggerInspectorHtml(t) {
+    const fi = (key, label, placeholder, value, type = "text") =>
+      `<label class="field"><span>${esc(label)}</span><input class="wha-input" type="${type}" data-trgsk="${key}" placeholder="${esc(placeholder)}" value="${esc(value ?? "")}"></label>`;
+    const ents = Object.keys(this._hass?.states || {}).sort();
+    let fields = "";
+    if (t.type === "state") {
+      fields = `
+        <label class="field"><span>${esc(this.tr("triggerEntity"))}</span>
+          <input class="wha-input" list="wha-trg-ents-insp" data-trgsk="entity_id" value="${esc(t.entity_id ?? "")}">
+          <datalist id="wha-trg-ents-insp">${ents.map((e) => `<option value="${esc(e)}">`).join("")}</datalist>
+        </label>
+        ${fi("attribute", this.tr("triggerAttribute"), t.attribute || "")}
+        ${fi("from", this.tr("triggerFrom"), t.from || "")}
+        ${fi("to", this.tr("triggerTo"), t.to || "")}`;
+    } else if (t.type === "time") {
+      fields = `
+        ${fi("at", this.tr("triggerAt"), "", t.at || "", "time")}
+        ${fi("every_seconds", this.tr("triggerEvery"), t.every_seconds ?? "", "number")}`;
+    } else if (t.type === "sun") {
+      fields = `
+        <label class="field"><span>${esc(this.tr("triggerSunEvent"))}</span>
+          <select class="wha-input" data-trgsk="event">
+            <option value="sunrise" ${t.event !== "sunset" ? "selected" : ""}>sunrise</option>
+            <option value="sunset" ${t.event === "sunset" ? "selected" : ""}>sunset</option>
+          </select></label>
+        ${fi("offset", this.tr("triggerOffset"), t.offset ?? 0, "number")}`;
+    }
+    return `
+      <label class="field field-inline"><input type="checkbox" data-trgsk="enabled" ${t.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</label>
+      ${fields}
+      <p class="wha-sub">${esc(t.id)}</p>`;
   }
 
   /* ----- drawflow wiring ----- */
@@ -988,6 +999,12 @@ class ScannerPanel extends HTMLElement {
     });
     df.on("nodeRemoved", (nodeId) => {
       const n = Number(nodeId);
+      const trgId = ed.nodeToTrg.get(n);
+      if (trgId !== undefined && trgId !== null) {
+        ed.nodeToTrg.delete(n);
+        ed.trgToNode.delete(trgId);
+        ed.controller.triggers = (ed.controller.triggers || []).filter((t) => t.id !== trgId);
+      }
       const condId = ed.nodeToCond.get(n);
       if (condId) {
         ed.nodeToCond.delete(n);
@@ -1012,9 +1029,13 @@ class ScannerPanel extends HTMLElement {
     });
 
     // import existing model
+    // triggers live on the leftmost column as standalone (port-less) nodes
+    (ed.controller.triggers || []).forEach((t, i) => {
+      this._dfAddTriggerNode(t, 20, 20 + i * 120);
+    });
     const conds = ed.controller.conditions;
     conds.forEach((cond, i) => {
-      const x = isGroupType(cond.type) ? 420 : 20;
+      const x = isGroupType(cond.type) ? 560 : 280;
       this._dfAddCondNode(cond, x, 20 + i * 120);
     });
     ed.controller.outputs.forEach((out, i) => {
@@ -1137,7 +1158,7 @@ class ScannerPanel extends HTMLElement {
     }
     ed.controller.conditions.push(cond);
     const count = ed.controller.conditions.length;
-    const nodeId = this._dfAddCondNode(cond, isGroupType(type) ? 420 : 20, 20 + (count - 1) * 120);
+    const nodeId = this._dfAddCondNode(cond, isGroupType(type) ? 560 : 280, 20 + (count - 1) * 120);
     this._selectNode(nodeId);
     ed.dirty = true;
   }
@@ -1172,7 +1193,8 @@ class ScannerPanel extends HTMLElement {
     const ed = this._editor;
     const condId = ed.nodeToCond.get(nodeId);
     const outId = ed.nodeToOut.get(nodeId);
-    ed.selected = { nodeId, condId: condId || null, outId: outId || null };
+    const trgId = ed.nodeToTrg.get(nodeId);
+    ed.selected = { nodeId, condId: condId || null, outId: outId || null, trgId: trgId ?? null };
     this._renderInspector();
   }
 
@@ -1195,6 +1217,10 @@ class ScannerPanel extends HTMLElement {
       if (!out) return;
       if (head) head.textContent = out.name;
       if (body) body.innerHTML = `${out.manual_override ? "✋ " : ""}${esc(out.entity_id)}`;
+    } else {
+      const trgId = ed.nodeToTrg.get(nodeId);
+      if (trgId === undefined) return;
+      this._refreshTriggerNode(nodeId);
     }
   }
 
@@ -1212,6 +1238,35 @@ class ScannerPanel extends HTMLElement {
     }
     const entities = Object.keys(this._hass?.states || {}).sort();
     const datalist = `<datalist id="wha-entities-insp">${entities.map((e) => `<option value="${esc(e)}">${esc(this._friendlyName(e))}</option>`).join("")}</datalist>`;
+
+    if (sel.trgId !== null && sel.trgId !== undefined) {
+      const t = (ed.controller.triggers || []).find((x) => x.id === sel.trgId);
+      if (!t) return;
+      box.innerHTML = `
+        <h3>${esc(this.tr(TRIGGER_LABEL_KEY[t.type] || t.type))}</h3>
+        ${this._triggerInspectorHtml(t)}
+        ${this._trialHtml()}`;
+      box.querySelectorAll("[data-trgsk]").forEach((input) =>
+        input.addEventListener("change", () => {
+          const k = input.dataset.trgsk;
+          let v = input.type === "checkbox" ? input.checked : input.value.trim();
+          if (k === "every_seconds" || k === "offset") {
+            v = Number(v);
+            if (!Number.isFinite(v)) return;
+          }
+          if (v === "" && k !== "entity_id") {
+            delete t[k];
+          } else {
+            if (k === "at") delete t.every_seconds;
+            if (k === "every_seconds") delete t.at;
+            t[k] = v;
+          }
+          ed.dirty = true;
+          this._refreshTriggerNode(sel.nodeId);
+        })
+      );
+      return;
+    }
 
     if (sel.outId) {
       const out = ed.controller.outputs.find((o) => o.entity_id === sel.outId);
