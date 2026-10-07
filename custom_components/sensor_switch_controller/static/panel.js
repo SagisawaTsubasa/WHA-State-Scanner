@@ -11,7 +11,9 @@
 
 const TAG = "sensor-switch-controller-panel";
 const API = "/api/sensor_switch_controller";
-const STYLE_URL = "/sensor_switch_controller/style.css";
+// inherit the panel module's version query (?ver=...) so style.css and
+// panel.js always invalidate together (WHA-F-052)
+const STYLE_URL = `/sensor_switch_controller/style.css${new URL(import.meta.url).search}`;
 const DF_JS_URL = "/sensor_switch_controller/vendor/drawflow.min.js";
 const DF_CSS_URL = "/sensor_switch_controller/vendor/drawflow.min.css";
 
@@ -122,7 +124,14 @@ const LANG = {
     wiredAbort: "中止（可选，由连线决定）",
     conditionSink3: "信号口：触发器连线直达（input_3）",
     trgRoutesLabel: "路由（由信号线决定）",
-    badConnection: "连线不合法：信号线只能从触发器拉到门/输出的信号口（下数第三个）。",
+    badConnection: "连线被拒：琥珀信号线从触发器拖到带「信号」字的口；条件线连「成员/开始/中止/满足则开/满足则关」口。",
+    portSignal: "信号",
+    portOn: "满足则开",
+    portOff: "满足则关",
+    portStart: "开始",
+    portAbort: "中止",
+    portMembers: "成员",
+    portOut: "出",
     weekdaysLabel: "星期几",
     byLabel: "触发来源",
     enabledLabel: "启用",
@@ -246,7 +255,14 @@ const LANG = {
     wiredAbort: "Abort (optional, wired)",
     conditionSink3: "Signal port: direct trigger wires (input_3)",
     trgRoutesLabel: "Routes (from signal wires)",
-    badConnection: "Invalid wire: signal wires only go from a trigger to a gate/output signal port (third one).",
+    badConnection: "Wire rejected: amber signal wires go from a trigger to the port labelled signal; gate wires go to the ports labelled members/start/abort/met → on/met → off.",
+    portSignal: "signal",
+    portOn: "met → on",
+    portOff: "met → off",
+    portStart: "start",
+    portAbort: "abort",
+    portMembers: "members",
+    portOut: "out",
     weekdaysLabel: "Weekdays",
     byLabel: "By",
     enabledLabel: "Enabled",
@@ -864,6 +880,37 @@ class ScannerPanel extends HTMLElement {
     this._initCanvas(main.querySelector("#wha-drawflow"));
   }
 
+  static _PORT_LABELS = {
+    trigger: { output_1: "portSignal" },
+    output: { input_1: "portOn", input_2: "portOff", input_3: "portSignal" },
+    duration: { input_1: "portStart", input_2: "portAbort", input_3: "portSignal", output_1: "portOut" },
+    group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
+    leaf: { input_3: "portSignal", output_1: "portOut" },
+  };
+
+  _labelNodePorts(nodeId, kind) {
+    // Blender-style socket labels: a small tag next to every port dot, so
+    // "which dot is which" never depends on trial and error.
+    const el = this._editor?.df?.container?.querySelector(`#node-${nodeId}`);
+    if (!el) {
+      console.debug("[wha] port labels skipped: node DOM not found", nodeId);
+      return;
+    }
+    const spec = ScannerPanel._PORT_LABELS[kind];
+    if (!spec) {
+      console.debug("[wha] port labels skipped: unregistered kind", kind);
+      return;
+    }
+    for (const [port, key] of Object.entries(spec)) {
+      const portEl = el.querySelector(`.${port}`);
+      if (!portEl || portEl.querySelector(".wha-port-label")) continue;
+      const span = document.createElement("span");
+      span.className = "wha-port-label";
+      span.textContent = this.tr(key);
+      portEl.appendChild(span);
+    }
+  }
+
   async _getEntityPickerClass() {
     // Resolve HA's native entity picker. It lives in a lazily-loaded
     // frontend chunk, so loading card helpers is the community-standard
@@ -1033,6 +1080,7 @@ class ScannerPanel extends HTMLElement {
       this._triggerNodeHtml(t)
     );
     ed.nodeToTrg.set(nodeId, t.id);
+    this._labelNodePorts(nodeId, "trigger");
     return nodeId;
   }
 
@@ -1345,6 +1393,8 @@ class ScannerPanel extends HTMLElement {
     );
     ed.nodeToCond.set(nodeId, cond.id);
     ed.condToNode.set(cond.id, nodeId);
+    const kind = cond.type === "duration" ? "duration" : isGroupType(cond.type) ? "group" : "leaf";
+    this._labelNodePorts(nodeId, kind);
     return nodeId;
   }
 
@@ -1362,6 +1412,7 @@ class ScannerPanel extends HTMLElement {
     );
     ed.nodeToOut.set(nodeId, out.entity_id);
     ed.outToNode.set(out.entity_id, nodeId);
+    this._labelNodePorts(nodeId, "output");
     return nodeId;
   }
 

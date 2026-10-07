@@ -329,10 +329,60 @@ details.wha-json pre {
   background: #d97706;
 }
 
-/* gate wiring hides input_2 everywhere except duration (abort port) */
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration) .input_2 {
+/* port colours carry the semantics (Blender socket convention):
+   amber = signal, green = met->on, red = met->off / abort, slate = gate */
+.parent-drawflow .drawflow .wha-node.wha-out .input_1 {
+  background: var(--wha-ok, #43a047);
+}
+.parent-drawflow .drawflow .wha-node.wha-out .input_2 {
+  background: var(--wha-bad, #db4437);
+}
+.parent-drawflow .drawflow .wha-node.cond-duration .input_1 {
+  background: var(--wha-accent, #03a9f4);
+}
+.parent-drawflow .drawflow .wha-node.cond-duration .input_2 {
+  background: var(--wha-bad, #db4437);
+}
+.parent-drawflow .drawflow .wha-node.cond-and .input_1,
+.parent-drawflow .drawflow .wha-node.cond-or .input_1,
+.parent-drawflow .drawflow .wha-node.cond-not .input_1 {
+  background: #64748b;
+}
+/* groups keep input_1 (members) but their input_2 is a dead port too */
+.parent-drawflow .drawflow .wha-node.cond-and .input_2,
+.parent-drawflow .drawflow .wha-node.cond-or .input_2,
+.parent-drawflow .drawflow .wha-node.cond-not .input_2 {
   display: none;
 }
+
+/* plain leaves have no gate-input semantics - hide the dead ports */
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_1,
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_2 {
+  display: none;
+}
+
+/* gate output dot: slate like the gate wiring */
+.parent-drawflow .drawflow .wha-node.cond-node .output_1 {
+  background: #64748b;
+}
+
+/* Blender-style socket labels: small tag hugging each port dot */
+.parent-drawflow .drawflow .wha-node .wha-port-label {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  line-height: 1;
+  color: var(--wha-sub, #727272);
+  background: var(--wha-card, #fff);
+  border: 1px solid var(--wha-line, #e0e0e0);
+  border-radius: 3px;
+  padding: 0 3px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.parent-drawflow .drawflow .wha-node .input .wha-port-label { left: 16px; }
+.parent-drawflow .drawflow .wha-node .output .wha-port-label { right: 16px; }
 
 /* signal wires (sourced from a trigger node) are amber */
 .parent-drawflow .drawflow .connection.signal .main-path { stroke: #d97706 !important; }
