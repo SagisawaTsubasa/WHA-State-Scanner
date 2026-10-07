@@ -80,9 +80,7 @@ const LANG = {
     conditionSink2: "满足则关（off_conditions，优先）",
     members: "成员（由连线决定）",
     logsTitle: "决策日志",
-    date: "日期",
     decision: "决策",
-    limit: "条数上限",
     query: "查询",
     time: "时间",
     readouts: "读数",
@@ -98,10 +96,10 @@ const LANG = {
     mobileNote: "查看模式：编辑请用电脑",
     triggersTitle: "触发器",
     addTrigger: "添加触发器",
-    noTriggers: "尚未配置触发器：控制器只在手动评估时更新。",
     triggerState: "状态触发",
     triggerTime: "时间触发",
     triggerSun: "太阳触发",
+    triggerSunEvent: "太阳事件",
     triggerStart: "HA 启动（重载也会触发）",
     triggerEntity: "实体（留空=整个传感器池）",
     triggerAttribute: "attribute",
@@ -179,9 +177,7 @@ const LANG = {
     conditionSink2: "Met → off (off_conditions, wins)",
     members: "Members (wired)",
     logsTitle: "Decision logs",
-    date: "Date",
     decision: "Decision",
-    limit: "Limit",
     query: "Query",
     time: "Time",
     readouts: "Readings",
@@ -197,10 +193,10 @@ const LANG = {
     mobileNote: "Read-only view — edit on a desktop",
     triggersTitle: "Triggers",
     addTrigger: "Add trigger",
-    noTriggers: "No triggers configured — the controller only updates on manual evaluation.",
     triggerState: "State",
     triggerTime: "Time",
     triggerSun: "Sun",
+    triggerSunEvent: "Sun event",
     triggerStart: "HA start (also fires on reload)",
     triggerEntity: "Entity (empty = whole pool)",
     triggerAttribute: "attribute",
@@ -703,7 +699,6 @@ class ScannerPanel extends HTMLElement {
       nodeToOut: new Map(),
       outToNode: new Map(),
       nodeToTrg: new Map(),
-      trgToNode: new Map(),
       selected: null,
       trial: null,
     };
@@ -844,46 +839,17 @@ class ScannerPanel extends HTMLElement {
     });
   }
 
-  _triggerFieldInputs(t, i) {
-    const f = (key, placeholder, value, type = "text", style = "width:110px", list = "") => {
-      const num = type === "number" ? ` min="${key === "offset" ? -86400 : 10}" max="86400"` : "";
-      const lst = list ? ` list="${list}"` : "";
-      return `<input class="wha-input" type="${type}"${num}${lst} data-ti="${i}" data-tf="${key}" placeholder="${esc(placeholder)}" value="${esc(value ?? "")}" style="${style}">`;
-    };
-    if (t.type === "state") {
-      return `
-        ${f("entity_id", this.tr("triggerEntity"), t.entity_id || "", "text", "width:200px;min-width:160px", "wha-trg-ents")}
-        ${f("attribute", this.tr("triggerAttribute"), t.attribute || "")}
-        ${f("from", this.tr("triggerFrom"), t.from || "")}
-        ${f("to", this.tr("triggerTo"), t.to || "")}`;
-    }
-    if (t.type === "time") {
-      return `
-        ${f("at", this.tr("triggerAt"), t.at || "", "text", "width:110px")}
-        ${f("every_seconds", this.tr("triggerEvery"), t.every_seconds ?? "", "number", "width:110px")}`;
-    }
-    if (t.type === "sun") {
-      return `
-        <select class="wha-input" data-ti="${i}" data-tf="event">
-          <option value="sunrise" ${t.event !== "sunset" ? "selected" : ""}>sunrise</option>
-          <option value="sunset" ${t.event === "sunset" ? "selected" : ""}>sunset</option>
-        </select>
-        ${f("offset", this.tr("triggerOffset"), t.offset ?? 0, "number")}`;
-    }
-    return "";
-  }
-
-  _triggerHeadHtml(t) {
-    return `${TRIGGER_ICON[t.type] || "?"} ${esc(this.tr(TRIGGER_LABEL_KEY[t.type] || t.type))}｜${esc(this._triggerSummary(t))}`;
-  }
-
   _triggerSummary(t) {
     let detail = "";
     if (t.type === "state") {
       detail = t.entity_id || this.tr("triggerEntity");
       if (t.attribute) detail += ` · ${t.attribute}`;
     } else if (t.type === "time") {
-      detail = t.at ? `${this.tr("triggerAt")} ${t.at}` : `${this.tr("triggerEvery")} ${t.every_seconds}`;
+      detail = t.at
+        ? `${this.tr("triggerAt")} ${t.at}`
+        : t.every_seconds >= 10
+          ? `${this.tr("triggerEvery")} ${t.every_seconds}`
+          : this.tr("triggerEvery");
     } else if (t.type === "sun") {
       detail = `${t.event || "sunrise"} ${t.offset ? (t.offset > 0 ? "+" : "") + t.offset + "s" : ""}`;
     } else {
@@ -919,7 +885,6 @@ class ScannerPanel extends HTMLElement {
       this._triggerNodeHtml(t)
     );
     ed.nodeToTrg.set(nodeId, t.id);
-    ed.trgToNode.set(t.id, nodeId);
     return nodeId;
   }
 
@@ -950,8 +915,13 @@ class ScannerPanel extends HTMLElement {
   }
 
   _triggerInspectorHtml(t) {
+    // numeric limits mirror schema.py (EVERY_SECONDS 10..86400, SUN_OFFSET ±86400)
+    const NUM_LIMITS = {
+      every_seconds: ' min="10" max="86400"',
+      offset: ' min="-86400" max="86400"',
+    };
     const fi = (key, label, placeholder, value, type = "text") =>
-      `<label class="field"><span>${esc(label)}</span><input class="wha-input" type="${type}" data-trgsk="${key}" placeholder="${esc(placeholder)}" value="${esc(value ?? "")}"></label>`;
+      `<label class="field"><span>${esc(label)}</span><input class="wha-input" type="${type}"${NUM_LIMITS[key] || ""} data-trgsk="${key}" placeholder="${esc(placeholder)}" value="${esc(value ?? "")}"></label>`;
     const ents = Object.keys(this._hass?.states || {}).sort();
     let fields = "";
     if (t.type === "state") {
@@ -960,13 +930,13 @@ class ScannerPanel extends HTMLElement {
           <input class="wha-input" list="wha-trg-ents-insp" data-trgsk="entity_id" value="${esc(t.entity_id ?? "")}">
           <datalist id="wha-trg-ents-insp">${ents.map((e) => `<option value="${esc(e)}">`).join("")}</datalist>
         </label>
-        ${fi("attribute", this.tr("triggerAttribute"), t.attribute || "")}
-        ${fi("from", this.tr("triggerFrom"), t.from || "")}
-        ${fi("to", this.tr("triggerTo"), t.to || "")}`;
+        ${fi("attribute", this.tr("triggerAttribute"), "", t.attribute ?? "")}
+        ${fi("from", this.tr("triggerFrom"), "", t.from ?? "")}
+        ${fi("to", this.tr("triggerTo"), "", t.to ?? "")}`;
     } else if (t.type === "time") {
       fields = `
         ${fi("at", this.tr("triggerAt"), "", t.at || "", "time")}
-        ${fi("every_seconds", this.tr("triggerEvery"), t.every_seconds ?? "", "number")}`;
+        ${fi("every_seconds", this.tr("triggerEvery"), "", t.every_seconds ?? "", "number")}`;
     } else if (t.type === "sun") {
       fields = `
         <label class="field"><span>${esc(this.tr("triggerSunEvent"))}</span>
@@ -974,7 +944,7 @@ class ScannerPanel extends HTMLElement {
             <option value="sunrise" ${t.event !== "sunset" ? "selected" : ""}>sunrise</option>
             <option value="sunset" ${t.event === "sunset" ? "selected" : ""}>sunset</option>
           </select></label>
-        ${fi("offset", this.tr("triggerOffset"), t.offset ?? 0, "number")}`;
+        ${fi("offset", this.tr("triggerOffset"), "", t.offset ?? "", "number")}`;
     }
     return `
       <label class="field field-inline"><input type="checkbox" data-trgsk="enabled" ${t.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</label>
@@ -1002,7 +972,6 @@ class ScannerPanel extends HTMLElement {
       const trgId = ed.nodeToTrg.get(n);
       if (trgId !== undefined && trgId !== null) {
         ed.nodeToTrg.delete(n);
-        ed.trgToNode.delete(trgId);
         ed.controller.triggers = (ed.controller.triggers || []).filter((t) => t.id !== trgId);
       }
       const condId = ed.nodeToCond.get(n);
@@ -1067,7 +1036,9 @@ class ScannerPanel extends HTMLElement {
 
   _outX() {
     const width = this._editor.df?.container?.clientWidth || 1000;
-    return Math.max(520, width - 300);
+    // floor = group column x (560) + node max width (240) + 20px gap — keep
+    // the output column clear of group nodes on narrow canvases (WHA-F-009)
+    return Math.max(820, width - 300);
   }
 
   _condNodeHtml(cond) {
@@ -1251,6 +1222,12 @@ class ScannerPanel extends HTMLElement {
           const k = input.dataset.trgsk;
           let v = input.type === "checkbox" ? input.checked : input.value.trim();
           if (k === "every_seconds" || k === "offset") {
+            if (v === "") {
+              delete t[k];
+              ed.dirty = true;
+              this._refreshTriggerNode(sel.nodeId);
+              return;
+            }
             v = Number(v);
             if (!Number.isFinite(v)) return;
           }
