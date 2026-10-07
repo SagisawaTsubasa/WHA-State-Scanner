@@ -409,6 +409,10 @@ class ScannerPanel extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // keep every mounted native picker's entity list current
+    this.shadowRoot?.querySelectorAll("ha-entity-picker").forEach((p) => {
+      if (p.hass !== hass) p.hass = hass;
+    });
   }
 
   set narrow(narrow) {
@@ -427,6 +431,7 @@ class ScannerPanel extends HTMLElement {
       <link rel="stylesheet" href="${DF_CSS_URL}">
       <div class="wha-app"><main class="wha-main"><p class="wha-sub">${this.tr("loading")}</p></main></div>`
     window.addEventListener("hashchange", this._onHash);
+    this._getEntityPickerClass(); // warm up the lazy-loaded native picker
     this._applyHash(false);
     this._boot();
     this._pollTimer = setInterval(() => this._poll(), 5000);
@@ -859,6 +864,86 @@ class ScannerPanel extends HTMLElement {
     this._initCanvas(main.querySelector("#wha-drawflow"));
   }
 
+  async _getEntityPickerClass() {
+    // Resolve HA's native entity picker. It lives in a lazily-loaded
+    // frontend chunk, so loading card helpers is the community-standard
+    // way to pull it in. Only a POSITIVE resolution is cached: a failed
+    // probe (helpers not ready, 4s race lost) clears itself so the next
+    // upgrade pass retries instead of silently staying on datalist for the
+    // whole session (WHA-F-039). Concurrent callers share one probe.
+    if (this._epickTag) return this._epickTag;
+    if (!this._epickProbe) {
+      this._epickProbe = this._probeEntityPicker();
+    }
+    const tag = await this._epickProbe;
+    if (tag) {
+      this._epickTag = tag;
+      // self-heal: the picker may have arrived long after this view
+      // rendered - upgrade whatever is on screen without waiting for a
+      // re-render (WHA-F-043)
+      this._upgradeEntityPickers(this.shadowRoot);
+    } else {
+      this._epickProbe = null;
+      if (!this._epickWarned) {
+        this._epickWarned = true;
+        console.debug("[wha] native ha-entity-picker unavailable; using datalist fallback");
+      }
+    }
+    return this._epickTag || null;
+  }
+
+  async _probeEntityPicker() {
+    if (customElements.get("ha-entity-picker")) return "ha-entity-picker";
+    try {
+      if (typeof window.loadCardHelpers === "function") {
+        const helpers = await window.loadCardHelpers();
+        try { helpers.createEntityPicker?.(); } catch { /* optional */ }
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 4000);
+          customElements.whenDefined("ha-entity-picker").then(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+    } catch { /* helpers unavailable - datalist fallback stays */ }
+    return customElements.get("ha-entity-picker") ? "ha-entity-picker" : null;
+  }
+
+  async _upgradeEntityPickers(root) {
+    // Swap every input carrying data-epick for a native ha-entity-picker.
+    // The picker's value-changed is bridged back onto the original input
+    // (value + change event), so all existing change-to-model wiring keeps
+    // working unchanged. Fallback: inputs stay as-is (datalist).
+    if (!root) return;
+    const tag = await this._getEntityPickerClass();
+    if (!tag) return;
+    let replaced = 0;
+    root.querySelectorAll("input[data-epick]").forEach((input) => {
+      if (!input.isConnected) return;
+      const picker = document.createElement(tag);
+      picker.hass = this._hass;
+      picker.value = input.value || "";
+      picker.allowCustomEntity = true;
+      picker.style.width = "100%";
+      const domain = input.dataset.epick;
+      if (domain) {
+        picker.includeDomains = [domain];
+      }
+      picker.addEventListener("value-changed", (ev) => {
+        const v = (ev.detail && ev.detail.value) || "";
+        if (input.value === v) return;
+        input.value = v;
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      input.replaceWith(picker);
+      replaced += 1;
+    });
+    if (replaced) {
+      root.querySelectorAll("datalist").forEach((d) => d.remove());
+    }
+  }
+
   _renderSensorPool(container) {
     const sensors = this._editor.controller.sensors;
     const entities = Object.keys(this._hass?.states || {}).sort();
@@ -870,7 +955,7 @@ class ScannerPanel extends HTMLElement {
             .map(
               (s, i) => `
             <tr>
-              <td><input class="wha-input" list="wha-entities" data-si="${i}" data-sk="entity_id" value="${esc(s.entity_id)}" style="width:100%"></td>
+              <td><input class="wha-input" list="wha-entities" data-si="${i}" data-sk="entity_id" data-epick value="${esc(s.entity_id)}" style="width:100%"></td>
               <td><input class="wha-input" data-si="${i}" data-sk="alias" value="${esc(s.alias || "")}" style="width:120px"></td>
               <td><button class="wha-btn danger" data-sdel="${i}">✕</button></td>
             </tr>`
@@ -899,6 +984,7 @@ class ScannerPanel extends HTMLElement {
       this._editor.dirty = true;
       this._renderSensorPool(container);
     });
+    this._upgradeEntityPickers(container);
   }
 
   _triggerSummary(t) {
@@ -988,10 +1074,10 @@ class ScannerPanel extends HTMLElement {
     let fields = "";
     if (t.type === "state") {
       fields = `
-        <label class="field"><span>${esc(this.tr("triggerEntity"))}</span>
-          <input class="wha-input" list="wha-trg-ents-insp" data-trgsk="entity_id" value="${esc(t.entity_id ?? "")}">
+        <div class="field"><span>${esc(this.tr("triggerEntity"))}</span>
+          <input class="wha-input" list="wha-trg-ents-insp" data-trgsk="entity_id" data-epick value="${esc(t.entity_id ?? "")}">
           <datalist id="wha-trg-ents-insp">${ents.map((e) => `<option value="${esc(e)}">`).join("")}</datalist>
-        </label>
+        </div>
         ${fi("attribute", this.tr("triggerAttribute"), "", t.attribute ?? "")}
         ${fi("from", this.tr("triggerFrom"), "", t.from ?? "")}
         ${fi("to", this.tr("triggerTo"), "", t.to ?? "")}`;
@@ -1424,6 +1510,7 @@ class ScannerPanel extends HTMLElement {
           this._refreshTriggerNode(sel.nodeId);
         })
       );
+      this._upgradeEntityPickers(box);
       return;
     }
 
@@ -1517,6 +1604,7 @@ class ScannerPanel extends HTMLElement {
         this._refreshNodeBody(sel.nodeId);
       })
     );
+    this._upgradeEntityPickers(box);
   }
 
   _condFieldsHtml(cond) {
@@ -1524,12 +1612,12 @@ class ScannerPanel extends HTMLElement {
     switch (cond.type) {
       case "numeric_state":
         return `
-          <label class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
+          <div class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick value="${esc(cond.entity_id || "")}"></div>
           <label class="field"><span>${esc(trk("above"))}</span><input class="wha-input" type="number" step="any" data-insk="above" value="${esc(cond.above ?? "")}"></label>
           <label class="field"><span>${esc(trk("below"))}</span><input class="wha-input" type="number" step="any" data-insk="below" value="${esc(cond.below ?? "")}"></label>`;
       case "state":
         return `
-          <label class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
+          <div class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick value="${esc(cond.entity_id || "")}"></div>
           <label class="field"><span>${esc(trk("state"))}</span><input class="wha-input" data-insk="state" value="${esc(Array.isArray(cond.state) ? cond.state.join(",") : cond.state || "")}"></label>`;
       case "time": {
         const wd = cond.weekdays || [];
@@ -1548,11 +1636,11 @@ class ScannerPanel extends HTMLElement {
           <label class="field"><span>${esc(trk("durationSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>`;
       case "debounce":
         return `
-          <label class="field"><span>${esc(trk("debounceEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
+          <div class="field"><span>${esc(trk("debounceEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick value="${esc(cond.entity_id || "")}"></div>
           <label class="field"><span>${esc(trk("debounceSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>`;
       case "calendar":
         return `
-          <label class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
+          <div class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick="calendar" value="${esc(cond.entity_id || "")}"></div>
           <label class="field"><span>${esc(trk("calendarHours"))}</span><input class="wha-input" type="number" min="1" max="168" data-insk="hours" value="${esc(cond.hours ?? 24)}"></label>`;
       case "sun":
         return `
