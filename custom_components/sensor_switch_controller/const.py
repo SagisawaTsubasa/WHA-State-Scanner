@@ -8,7 +8,7 @@ ENTRY_TITLE = "HA 全屋状态扫描"
 # Storage (single config entry, all controllers in one Store)
 # ------------------------------------------------------------------
 STORE_KEY = DOMAIN
-STORE_VERSION = 2
+STORE_VERSION = 3
 CONF_CONTROLLERS = "controllers"
 CTRL_ID_PREFIX = "ctrl_"
 
@@ -40,6 +40,8 @@ COND_SUN = "sun"
 COND_TEMPLATE = "template"
 COND_COOLDOWN = "cooldown"
 COND_CALENDAR = "calendar"
+COND_DURATION = "duration"
+COND_DEBOUNCE = "debounce"
 COND_AND = "and"
 COND_OR = "or"
 COND_NOT = "not"
@@ -59,6 +61,9 @@ CONF_EVERY_SECONDS = "every_seconds"
 CONF_HOURS = "hours"
 CONF_SECONDS = "seconds"
 CONF_OFFSET = "offset"
+CONF_ROUTES = "routes"
+CONF_START = "start"
+CONF_ABORT = "abort"
 TRG_ID_PREFIX = "trg_"
 
 # Output types
@@ -68,6 +73,8 @@ OUTPUT_BINARY_SENSOR = "binary_sensor"
 DEFAULT_SCAN_INTERVAL = 180
 SUN_OFFSET_LIMIT = 86400
 COOLDOWN_MAX = 86400
+DURATION_MAX = 86400
+DEBOUNCE_MAX = 86400
 CALENDAR_HOURS_MAX = 168
 EVAL_DEBOUNCE_SECONDS = 0.2
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")

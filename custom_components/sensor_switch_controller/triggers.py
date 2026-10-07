@@ -166,11 +166,12 @@ class TriggerManager:
 
     @callback
     def _make_cb(self, trg: dict):
+        trg_id = trg.get("id")
         description = trg.get("label") or trg.get("id", trg.get("type", "?"))
 
         @callback
         def _fire(_now_or_event=None) -> None:
-            self._on_fire(description)
+            self._on_fire(trg_id, description)
 
         return _fire
 
@@ -179,6 +180,7 @@ class TriggerManager:
         attribute = trg.get(CONF_ATTRIBUTE)
         from_filter = trg.get(CONF_FROM)
         to_filter = trg.get(CONF_TO)
+        trg_id = trg.get("id")
         description = trg.get("label") or trg.get("id", "state")
 
         @callback
@@ -201,7 +203,7 @@ class TriggerManager:
                 return
             if not _match_filter(new_val, to_filter):
                 return
-            self._on_fire(description)
+            self._on_fire(trg_id, description)
 
         return _on_event
 

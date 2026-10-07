@@ -306,7 +306,38 @@ details.wha-json pre {
 /* drawflow default theme tweaks */
 .parent-drawflow { width: 100%; height: 100%; }
 
-/* trigger nodes: standalone evaluation-timing nodes (no ports) */
+/* signal/gate visual language (0.6.0):
+   - amber frame = triggers (signal sources), amber wires = signal wires
+   - blue-gray frame = gates (conditions), blue-gray wires = gate wiring
+   - green frame = outputs (actuators) */
+.parent-drawflow .drawflow .wha-node.trg-node {
+  border-color: #d97706;
+}
+.parent-drawflow .drawflow .wha-node.cond-node {
+  border-color: #64748b;
+}
+.parent-drawflow .drawflow .wha-node.wha-out {
+  border-color: var(--wha-ok, #43a047);
+}
+
+/* signal port (input_3) on every wired node + trigger output dot: amber */
+.parent-drawflow .drawflow .wha-node .input.input_3,
+.parent-drawflow .drawflow .wha-node .input_3 {
+  background: #d97706;
+}
+.parent-drawflow .drawflow .wha-node.trg-node .output {
+  background: #d97706;
+}
+
+/* gate wiring hides input_2 everywhere except duration (abort port) */
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration) .input_2 {
+  display: none;
+}
+
+/* signal wires (sourced from a trigger node) are amber */
+.parent-drawflow .drawflow .connection.signal .main-path { stroke: #d97706 !important; }
+
+/* trigger nodes: evaluation-timing nodes with one signal output */
 .parent-drawflow .drawflow .wha-node.trg-state .wha-node-head { color: #00695c; }
 .parent-drawflow .drawflow .wha-node.trg-time .wha-node-head { color: #4a148c; }
 .parent-drawflow .drawflow .wha-node.trg-sun .wha-node-head { color: #e65100; }

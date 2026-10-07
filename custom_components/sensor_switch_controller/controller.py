@@ -2,9 +2,16 @@
 
 Since 0.5.0 evaluation is trigger-driven: the controller's TriggerManager
 fires on configured events (state changes / time / sun / HA start), the
-controller debounces bursts, runs one full level-based evaluation and —
-whenever a FOR timer is running — schedules a precise wakeup at the exact
-moment that duration elapses.
+controller debounces bursts, runs one level-based evaluation and —
+whenever a timer is running — schedules a precise wakeup at the exact
+moment a gate can flip on its own.
+
+Since 0.6.0 evaluation is *directed*: each trigger carries ``routes``
+(outputs + conditions wired on the canvas). A firing trigger only wakes
+the outputs it can reach (routes absent → legacy evaluate-everything;
+wired to nothing → wakes nothing). Timed wakeups (FOR/duration expiry,
+debounce quiet points, cooldown ends, time-range/sun edges) are directed
+too, via a precomputed condition→outputs reverse index.
 """
 
 from __future__ import annotations
@@ -22,10 +29,13 @@ from homeassistant.util import dt as dt_util
 
 from .condition_engine import ConditionEngine
 from .const import (
+    CONF_ABORT,
     CONF_CONDITIONS,
     CONF_LOGGING,
     CONF_OUTPUTS,
+    CONF_ROUTES,
     CONF_SENSORS,
+    CONF_START,
     CONF_TRIGGERS,
     EVAL_DEBOUNCE_SECONDS,
 )
@@ -75,14 +85,30 @@ class ControllerManager:
         self._first_eval_pending = True
         self._warned_bad_sensors = False
 
-        # Debounced trigger firings.
+        # Debounced trigger firings (trigger ids + log descriptions).
         self._debounce_unsub = None
-        self._pending_sources: set[str] = set()
+        self._pending_triggers: set[str | None] = set()
+        self._pending_descs: set[str] = set()
+
+        # Routing index (rebuilt once per manager; config is immutable here):
+        # cond id → outputs whose chains contain it; trigger id → outputs it
+        # may wake; ``_legacy_routing`` when any trigger lacks routes.
+        self._cond_to_outs: dict[str, set[str]] = {}
+        self._trg_targets: dict[str, set[str]] = {}
+        self._legacy_routing = False
+        self._build_route_index()
 
         # Serialized evaluation guard (see _async_evaluate).
         self._evaluating = False
         self._rerun_pending = False
         self._rerun_sources: set[str] = set()
+        # Backlog of evaluation scope swallowed mid-run. None vs set is a
+        # real distinction: ``_rerun_full`` marks a swallowed full sweep
+        # (legacy trigger / wakeup without targets), ``_rerun_targets``
+        # accumulates directed sets. An empty set is a valid backlog
+        # (wired-to-nothing → evaluate nothing).
+        self._rerun_full = False
+        self._rerun_targets: set[str] = set()
         # Shared by every evaluation entry point (trigger ticks, web trial
         # runs, force_evaluate) so engine state is never mutated concurrently.
         self._eval_lock = asyncio.Lock()
@@ -161,17 +187,83 @@ class ControllerManager:
         return self._entities
 
     # ------------------------------------------------------------------
+    # Routing index
+    # ------------------------------------------------------------------
+
+    def _build_route_index(self) -> None:
+        """Precompute condition→outputs reachability and trigger targets.
+
+        Reachability follows the graph the wires describe: output chains
+        (on/off), group members, and duration start/abort inputs. A trigger
+        with ``routes`` wakes exactly its listed outputs plus everything its
+        listed conditions can reach; a trigger without ``routes`` (legacy
+        config) flips the whole controller into evaluate-everything mode.
+        """
+        cond_by_id = {
+            c["id"]: c
+            for c in self.conditions
+            if isinstance(c, dict) and c.get("id")
+        }
+        cond_to_outs: dict[str, set[str]] = {}
+
+        def add_chain(out_id: str, cond_ids: list[str]) -> None:
+            stack = list(cond_ids)
+            seen: set[str] = set()
+            while stack:
+                cid = stack.pop()
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                cond_to_outs.setdefault(cid, set()).add(out_id)
+                cond = cond_by_id.get(cid)
+                if not cond:
+                    continue
+                stack.extend(cond.get("conditions") or [])
+                if cond.get(CONF_START):
+                    stack.append(cond[CONF_START])
+                if cond.get(CONF_ABORT):
+                    stack.append(cond[CONF_ABORT])
+
+        for out in self.outputs:
+            if not isinstance(out, dict) or not out.get("entity_id"):
+                continue
+            out_id = out["entity_id"]
+            add_chain(out_id, out.get("on_conditions") or [])
+            add_chain(out_id, out.get("off_conditions") or [])
+        self._cond_to_outs = cond_to_outs
+
+        legacy = False
+        targets_by_trg: dict[str, set[str]] = {}
+        for trg in self.triggers:
+            if not isinstance(trg, dict):
+                continue
+            trg_id = trg.get("id")
+            routes = trg.get(CONF_ROUTES)
+            if routes is None:
+                legacy = True
+                continue
+            targets = set(routes.get("outputs") or [])
+            for cid in routes.get("conditions") or []:
+                targets |= cond_to_outs.get(cid) or set()
+            if trg_id:
+                targets_by_trg[trg_id] = targets
+        self._trg_targets = targets_by_trg
+        self._legacy_routing = legacy
+
+    # ------------------------------------------------------------------
     # Trigger plumbing
     # ------------------------------------------------------------------
 
     @callback
-    def _on_trigger_fire(self, source: str) -> None:
+    def _on_trigger_fire(self, trg_id: str | None, description: str | None) -> None:
         """A trigger fired: open (or join) a debounced evaluation window.
 
         The window is opened once and never reset — a chatty pool delays
         evaluation by at most EVAL_DEBOUNCE_SECONDS, never indefinitely.
         """
-        self._pending_sources.add(source)
+        self._pending_triggers.add(trg_id)
+        if description:
+            self._pending_descs.add(description)
         if self._debounce_unsub is None:
             self._debounce_unsub = async_call_later(
                 self.hass, EVAL_DEBOUNCE_SECONDS, self._async_debounced_evaluate
@@ -180,10 +272,21 @@ class ControllerManager:
     @callback
     def _async_debounced_evaluate(self, _now) -> None:
         self._debounce_unsub = None
-        sources = sorted(self._pending_sources) or ["unknown"]
-        self._pending_sources.clear()
+        trg_ids = self._pending_triggers
+        self._pending_triggers = set()
+        sources = sorted(self._pending_descs) or ["unknown"]
+        self._pending_descs = set()
+
+        if self._legacy_routing or None in trg_ids:
+            targets: set[str] | None = None  # legacy / unknown → full sweep
+        else:
+            targets = set()
+            for tid in trg_ids:
+                targets |= self._trg_targets.get(tid, set())
+            # empty targets = wired to nothing → wakes nothing (by design)
         self.hass.async_create_background_task(
-            self._async_evaluate(None, sources), f"{self.controller_id}-evaluate"
+            self._async_evaluate(None, sources, targets),
+            f"{self.controller_id}-evaluate",
         )
 
     @callback
@@ -194,18 +297,21 @@ class ControllerManager:
 
     @callback
     def _rearm_for_wakeup(self) -> None:
-        """Wake up at the earliest instant some condition may flip on its own
-        (FOR expiry, time.at window start, cooldown end)."""
+        """Wake up at the earliest instant some gate may flip on its own
+        (FOR/duration expiry, debounce quiet point, cooldown end, time/sun
+        range edge) — and re-evaluate only the outputs it can reach."""
         self._cancel_for_wakeup()
-        out_ids = [oid for oid in self._entities if self._entities.get(oid)]
-        expiry = self.engine.next_wakeup(out_ids)
-        if expiry is None:
+        pending = self.engine.next_wakeup(self._cond_to_outs)
+        if pending is None:
             return
+        expiry, out_ids = pending
 
         @callback
         def _woken(_now) -> None:
             self._for_wakeup_unsub = None
-            self.hass.async_create_task(self._async_evaluate(None, ["for_expiry"]))
+            self.hass.async_create_task(
+                self._async_evaluate(None, ["wakeup"], set(out_ids))
+            )
 
         self._for_wakeup_unsub = async_track_point_in_time(
             self.hass, _woken, expiry
@@ -233,35 +339,66 @@ class ControllerManager:
             readings[eid] = state.state if state else None
         return readings
 
-    async def _async_evaluate(self, _now: Any, sources: list[str] | None = None) -> None:
-        """Evaluate all outputs; one output failing never blocks the rest.
+    def _stack_targets(self, targets: set[str] | None) -> None:
+        """Accumulate a swallowed run's scope. ``None`` = full sweep and
+        absorbs any directed set already stacked; directed sets union."""
+        if targets is None:
+            self._rerun_full = True
+        else:
+            self._rerun_targets |= targets
 
-        Serialized: a trigger arriving mid-run sets ``_rerun_pending`` and a
-        fresh run happens afterwards, so overlapping runs never interleave
-        their engine state. Sources of swallowed runs are carried over so the
-        decision log keeps telling which triggers caused the cycle.
+    def _pop_backlog(self) -> tuple[list[str], set[str] | None]:
+        """Take the swallowed sources+scope out of the backlog."""
+        sources = sorted(self._rerun_sources)
+        self._rerun_sources.clear()
+        targets = None if self._rerun_full else set(self._rerun_targets)
+        self._rerun_full = False
+        self._rerun_targets = set()
+        return sources, targets
+
+    async def _async_evaluate(
+        self,
+        _now: Any,
+        sources: list[str] | None = None,
+        targets: set[str] | None = None,
+    ) -> None:
+        """Evaluate the outputs in ``targets`` (None = all of them); one
+        output failing never blocks the rest.
+
+        Serialized: a trigger arriving mid-run stacks its sources+targets as
+        backlog and a drain pass happens afterwards, so overlapping runs
+        never interleave their engine state and the backlog keeps exactly
+        the scope of the runs that were swallowed (a directed swallow never
+        widens into a full sweep — WHA-F-012).
         """
         if sources:
             self._rerun_sources.update(sources)
+        self._stack_targets(targets)
         if self._evaluating:
             self._rerun_pending = True
             return
-        self._evaluating = True
-        try:
-            async with self._eval_lock:
-                sources = sorted(self._rerun_sources)
-                self._rerun_sources.clear()
-                await self._async_evaluate_locked(sources)
-        finally:
-            self._evaluating = False
-            self._rearm_for_wakeup()
-            if self._rerun_pending:
-                self._rerun_pending = False
-                self.hass.async_create_background_task(
-                    self._async_evaluate(None, None), f"{self.controller_id}-rerun"
-                )
+        await self._async_drain()
 
-    async def _async_evaluate_locked(self, sources: list[str] | None = None) -> None:
+    async def _async_drain(self) -> None:
+        """Run stacked evaluations until no backlog is left."""
+        while True:
+            self._evaluating = True
+            try:
+                async with self._eval_lock:
+                    sources, targets = self._pop_backlog()
+                    await self._async_evaluate_locked(sources, targets)
+            finally:
+                self._evaluating = False
+                self._rearm_for_wakeup()
+            if not self._rerun_pending:
+                return
+            self._rerun_pending = False
+
+    async def _async_evaluate_locked(
+        self,
+        sources: list[str] | None = None,
+        targets: set[str] | None = None,
+    ) -> None:
         self._first_eval_pending = False
         readings = self._async_read_sensors()
         source_desc = ", ".join(sources or ["unknown"])
@@ -269,6 +406,9 @@ class ControllerManager:
         records: list[dict] = []
         for out_cfg in self.outputs:
             if not isinstance(out_cfg, dict):
+                continue
+            out_id = out_cfg.get("entity_id")
+            if targets is not None and out_id not in targets:
                 continue
             try:
                 record, _details = await self._async_evaluate_output(out_cfg, readings)

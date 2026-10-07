@@ -4,7 +4,11 @@ The persisted JSON shape intentionally matches the pre-0.4.0 options-flow
 schema: sensors / conditions / outputs lists with ``cond_<hex>`` ids and
 ``ssc_<hex>`` output ids. Since 0.5.0 evaluation is trigger-driven:
 ``triggers`` replaces the global ``scan_interval`` (old configs map their
-interval to a time trigger on load).
+interval to a time trigger on load). Since 0.6.0 triggers carry optional
+``routes`` (directed evaluation: absent → legacy evaluate-everything,
+present → exactly the listed outputs and conditions) and two new leaf
+conditions exist: ``duration`` (TON gate with start/abort inputs) and
+``debounce`` (true once the entity has been quiet for N seconds).
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ from .const import (
     COND_AND,
     COND_CALENDAR,
     COND_COOLDOWN,
+    COND_DEBOUNCE,
+    COND_DURATION,
     COND_NOT,
     COND_NUMERIC_STATE,
     COND_OR,
@@ -28,16 +34,21 @@ from .const import (
     COND_SUN,
     COND_TEMPLATE,
     COND_TIME,
+    CONF_ABORT,
     CONF_AT,
     CONF_EVERY_SECONDS,
     CONF_HOURS,
     CONF_OFFSET,
+    CONF_ROUTES,
     CONF_SCAN_INTERVAL,
     CONF_SECONDS,
+    CONF_START,
     CONF_TRIGGERS,
     CONF_WEEKDAYS,
     COOLDOWN_MAX,
+    DEBOUNCE_MAX,
     DEFAULT_SCAN_INTERVAL,
+    DURATION_MAX,
     OUTPUT_BINARY_SENSOR,
     OUTPUT_SWITCH,
     SUN_OFFSET_LIMIT,
@@ -51,6 +62,7 @@ from .const import (
 
 _COND_ID_RE = re.compile(r"^cond_[0-9a-f]{32}$")
 _OUT_ID_RE = re.compile(r"^ssc_[0-9a-f]{32}$")
+_TRG_ID_RE = re.compile(r"^trg_[0-9a-f]{32}$")
 CTRL_ID_RE = re.compile(r"^ctrl_[0-9a-f]{8}$")
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
 _MAX_LABEL_LEN = 100
@@ -64,6 +76,8 @@ LEAF_TYPES = (
     COND_TEMPLATE,
     COND_COOLDOWN,
     COND_CALENDAR,
+    COND_DURATION,
+    COND_DEBOUNCE,
 )
 GROUP_TYPES = (COND_AND, COND_OR, COND_NOT)
 OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR)
@@ -154,6 +168,16 @@ def _validate_weekdays(value) -> list[str] | None:
     return deduped or None
 
 
+def _normalize_time(value: str) -> str:
+    """Zero-pad a validated HH:MM[:SS] so the stored form is canonical.
+
+    ``dt_util.parse_time`` may reject unpadded hours like "7:30"; storing
+    "07:30" keeps evaluation and wakeup discovery reading the same value.
+    """
+    parts = value.split(":")
+    return ":".join(f"{int(p):02d}" for p in parts)
+
+
 # ------------------------------------------------------------------
 # Triggers
 # ------------------------------------------------------------------
@@ -172,19 +196,38 @@ def _validate_state_filter(value, field: str) -> str | list[str] | None:
 
 
 def validate_trigger(trg) -> dict:
-    """Validate and normalize one trigger; raises on bad input."""
+    """Validate and normalize one trigger; raises on bad input.
+
+    A well-formed caller-supplied ``id`` is preserved so canvas wires
+    (trigger routes) survive save/reload round-trips; only a missing or
+    malformed id gets a fresh one. ``routes`` is optional: present means
+    directed routing (evaluate exactly the listed outputs + conditions),
+    absent means legacy behaviour (evaluate everything).
+    """
     if not isinstance(trg, dict):
         _fail("触发器必须是对象")
     ttype = trg.get("type")
     if ttype not in TRIGGER_TYPES:
         _fail(f"未知触发器类型：{ttype!r}")
 
+    tid = trg.get("id")
+    if isinstance(tid, str) and _TRG_ID_RE.match(tid):
+        result_id = tid
+    else:
+        result_id = f"{TRG_ID_PREFIX}{uuid.uuid4().hex}"
+
     result: dict = {
-        "id": f"{TRG_ID_PREFIX}{uuid.uuid4().hex}",
+        "id": result_id,
         "type": ttype,
         "label": _optional_str(trg.get("label"), "触发器标签"),
         "enabled": _to_bool(trg.get("enabled", True), "触发器 enabled"),
     }
+
+    routes = trg.get(CONF_ROUTES)
+    if routes is not None:
+        if not isinstance(routes, dict):
+            _fail("触发器的 routes 必须是对象")
+        result[CONF_ROUTES] = _validate_routes(routes)
 
     if ttype == TRG_STATE:
         entity_id = trg.get("entity_id")
@@ -244,6 +287,25 @@ def validate_trigger(trg) -> dict:
         result["event"] = "start"
 
     return result
+
+
+def _validate_routes(routes: dict) -> dict:
+    """Normalize trigger routes: {outputs: [out_id], conditions: [cond_id]}."""
+    validated: dict[str, list[str]] = {}
+    for key, pattern, name in (
+        ("outputs", _OUT_ID_RE, "输出"),
+        ("conditions", _COND_ID_RE, "条件"),
+    ):
+        members = routes.get(key) or []
+        if not isinstance(members, list) or not all(
+            isinstance(m, str) for m in members
+        ):
+            _fail(f"触发器路由的 {key} 必须是 {name} id 字符串列表")
+        for member in members:
+            if not pattern.match(member):
+                _fail(f"触发器路由的 {key} 含非法 id：{member!r}")
+        validated[key] = list(dict.fromkeys(members))
+    return validated
 
 
 def _map_legacy_scan_interval(data: dict) -> list[dict]:
@@ -320,9 +382,6 @@ def _validate_condition(cond) -> dict:
             result["above"] = above_f
         if below_f is not None:
             result["below"] = below_f
-        for_cfg = _validate_for(cond.get("for"), "数值条件")
-        if for_cfg:
-            result["for"] = for_cfg
 
     elif ctype == COND_STATE:
         result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "条件实体")
@@ -338,27 +397,22 @@ def _validate_condition(cond) -> dict:
         if not states:
             _fail("状态条件的 state 不能为空")
         result["state"] = states[0] if len(states) == 1 else states
-        for_cfg = _validate_for(cond.get("for"), "状态条件")
-        if for_cfg:
-            result["for"] = for_cfg
 
     elif ctype == COND_TIME:
-        at = cond.get(CONF_AT)
-        if at not in (None, ""):
-            if not isinstance(at, str) or not _TIME_RE.match(at.strip()):
-                _fail("时间条件的 at 必须是 HH:MM 或 HH:MM:SS")
-            result[CONF_AT] = at.strip()
+        if cond.get(CONF_AT) not in (None, ""):
+            _fail(
+                "时间条件已不支持 at：每日时刻请改用「每日时刻」触发器，"
+                "持续等待请改用「持续」条件"
+            )
         for key in ("after", "before"):
             value = cond.get(key)
             if value in (None, ""):
                 continue
             if not isinstance(value, str) or not _TIME_RE.match(value.strip()):
                 _fail(f"时间条件的 {key} 必须是 HH:MM 或 HH:MM:SS")
-            result[key] = value.strip()
-        if CONF_AT in result and ("after" in result or "before" in result):
-            _fail("时间条件的 at 与 after/before 不能同时使用")
-        if CONF_AT not in result and "after" not in result and "before" not in result:
-            _fail("时间条件必须提供 at、after 或 before")
+            result[key] = _normalize_time(value.strip())
+        if "after" not in result and "before" not in result:
+            _fail("时间条件必须提供 after 或 before")
         weekdays = _validate_weekdays(cond.get(CONF_WEEKDAYS))
         if weekdays:
             result[CONF_WEEKDAYS] = weekdays
@@ -419,6 +473,51 @@ def _validate_condition(cond) -> dict:
             _fail(f"日历条件的 hours 必须在 0-{CALENDAR_HOURS_MAX} 之间")
         result[CONF_HOURS] = hours
 
+    elif ctype == COND_DURATION:
+        # TON gate: true once `start` has held for `seconds`, reset when
+        # `start` drops or `abort` turns true. Reference validity is
+        # checked against the whole graph in _check_graph.
+        seconds = cond.get(CONF_SECONDS)
+        if isinstance(seconds, float) and not seconds.is_integer():
+            _fail("持续条件的 seconds 必须是整数秒")
+        try:
+            seconds = int(seconds)
+        except (OverflowError, TypeError, ValueError):
+            _fail("持续条件的 seconds 必须是秒数整数")
+        if not 1 <= seconds <= DURATION_MAX:
+            _fail(f"持续条件的 seconds 必须在 1-{DURATION_MAX} 秒之间")
+        result[CONF_SECONDS] = seconds
+        start = cond.get(CONF_START)
+        if not isinstance(start, str) or not _COND_ID_RE.match(start):
+            _fail("持续条件必须提供 start（开始条件的 id）")
+        if start == cid:
+            _fail("持续条件不能以自身作为开始条件")
+        result[CONF_START] = start
+        abort = cond.get(CONF_ABORT)
+        if abort in (None, ""):
+            result[CONF_ABORT] = None
+        else:
+            if not isinstance(abort, str) or not _COND_ID_RE.match(abort):
+                _fail("持续条件的 abort 必须是条件 id 或留空")
+            if abort == cid:
+                _fail("持续条件不能以自身作为中止条件")
+            result[CONF_ABORT] = abort
+
+    elif ctype == COND_DEBOUNCE:
+        # True once the entity has been quiet (no state change) for
+        # `seconds` — the "reset on retrigger" delay, stateless by design.
+        seconds = cond.get(CONF_SECONDS)
+        if isinstance(seconds, float) and not seconds.is_integer():
+            _fail("防抖条件的 seconds 必须是整数秒")
+        try:
+            seconds = int(seconds)
+        except (OverflowError, TypeError, ValueError):
+            _fail("防抖条件的 seconds 必须是秒数整数")
+        if not 1 <= seconds <= DEBOUNCE_MAX:
+            _fail(f"防抖条件的 seconds 必须在 1-{DEBOUNCE_MAX} 秒之间")
+        result[CONF_SECONDS] = seconds
+        result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "防抖实体")
+
     else:  # and / or / not
         members = cond.get("conditions")
         if not isinstance(members, list) or not members:
@@ -428,6 +527,14 @@ def _validate_condition(cond) -> dict:
         if len(set(members)) != len(members):
             _fail("组条件的成员不能重复")
         result["conditions"] = list(members)
+
+    if ctype in LEAF_TYPES and ctype not in (COND_DURATION, COND_DEBOUNCE):
+        # `for` (hold-before-true) is valid on every ordinary leaf; the
+        # engine applies it generically. duration/debounce are timing gates
+        # themselves and must not nest one.
+        for_cfg = _validate_for(cond.get("for"), "条件")
+        if for_cfg:
+            result["for"] = for_cfg
 
     return result
 
@@ -460,8 +567,22 @@ def _validate_output(out) -> dict:
     return result
 
 
-def _check_graph(conditions: list[dict], outputs: list[dict]) -> None:
-    """Cross checks: unique ids, group refs, cycles, output refs."""
+def _condition_neighbors(cond: dict) -> list[str]:
+    """Referenced condition ids of one condition (group members, duration
+    start/abort) — the edge set for graph checks."""
+    edges = list(cond.get("conditions") or [])
+    for key in (CONF_START, CONF_ABORT):
+        ref = cond.get(key)
+        if isinstance(ref, str):
+            edges.append(ref)
+    return edges
+
+
+def _check_graph(
+    conditions: list[dict], outputs: list[dict], triggers: list[dict] | None = None
+) -> None:
+    """Cross checks: unique ids, group/duration refs, cycles, output and
+    trigger-route refs."""
     by_id: dict[str, dict] = {}
     for cond in conditions:
         if cond["id"] in by_id:
@@ -469,18 +590,19 @@ def _check_graph(conditions: list[dict], outputs: list[dict]) -> None:
         by_id[cond["id"]] = cond
 
     for cond in conditions:
-        if cond["type"] in GROUP_TYPES:
-            for member in cond["conditions"]:
-                if member not in by_id:
-                    _fail(f"组条件引用了不存在的成员：{member}")
+        for member in _condition_neighbors(cond):
+            if member not in by_id:
+                label = cond.get("label") or cond["id"]
+                _fail(f"条件「{label}」引用了不存在的成员：{member}")
 
-    # Cycle detection over group references (iterative DFS with colors).
+    # Cycle detection over group references and duration start/abort edges
+    # (iterative DFS with colors).
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {cid: WHITE for cid in by_id}
     for root, root_cond in by_id.items():
         if color[root] != WHITE:
             continue
-        stack = [(root, iter(root_cond.get("conditions", []) or []))]
+        stack = [(root, iter(_condition_neighbors(root_cond)))]
         color[root] = GRAY
         while stack:
             node, members = stack[-1]
@@ -490,12 +612,10 @@ def _check_graph(conditions: list[dict], outputs: list[dict]) -> None:
                     continue
                 state = color[member]
                 if state == GRAY:
-                    _fail("组条件存在循环引用")
+                    _fail("条件存在循环引用（组成员或持续的开始/中止链）")
                 if state == WHITE:
                     color[member] = GRAY
-                    stack.append(
-                        (member, iter(by_id[member].get("conditions", []) or []))
-                    )
+                    stack.append((member, iter(_condition_neighbors(by_id[member]))))
                     advanced = True
                     break
             if not advanced:
@@ -511,6 +631,23 @@ def _check_graph(conditions: list[dict], outputs: list[dict]) -> None:
             for member in out[key]:
                 if member not in by_id:
                     _fail(f"输出的 {key} 引用了不存在的条件：{member}")
+
+    for trg in triggers or []:
+        tid = trg.get("id")
+        if tid and any(
+            other is not trg and other.get("id") == tid for other in (triggers or [])
+        ):
+            _fail(f"触发器 id 重复：{tid}")
+        routes = trg.get(CONF_ROUTES)
+        if not routes:
+            continue
+        label = trg.get("label") or trg.get("id") or "?"
+        for member in routes.get("outputs", []):
+            if member not in seen_out:
+                _fail(f"触发器「{label}」的路由引用了不存在的输出：{member}")
+        for member in routes.get("conditions", []):
+            if member not in by_id:
+                _fail(f"触发器「{label}」的路由引用了不存在的条件：{member}")
 
 
 def validate_controller(data) -> dict:
@@ -549,7 +686,7 @@ def validate_controller(data) -> dict:
     outputs = [_validate_output(out) for out in raw_outputs]
 
     triggers = validate_triggers(data)
-    _check_graph(conditions, outputs)
+    _check_graph(conditions, outputs, triggers)
 
     return {
         "name": name,

@@ -12,8 +12,9 @@
 
 - **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
 - **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，试运行实时染色（绿=满足/红=不满足/输出徽章显示决策）
+- **触发器可连线路由（0.6.0）** — 触发器是画布上的信号源：信号线拉到哪个门/输出，触发时就只评估哪条链；未连线=不评估，到期唤醒同样定向
 - **传感器池** — 一个控制器可引用任意数量的实体；总览页有全局传感器池视图，共享传感器高亮
-- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`，支持 `AND`/`OR` 嵌套组合与 `FOR` 持续计时
+- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒），支持 `AND`/`OR`/`NOT` 嵌套组合
 - **多路输出** — 一个控制器可生成多个开关或二进制传感器；`off_conditions` 优先于 `on_conditions`（防抖动）
 - **决策日志** — 每周期逐输出写入独立 JSONL（含传感器读数快照、applied/override 标记），面板内可直接查询
 - **手动覆盖** — 开关类型支持可选的手动强制控制
@@ -24,7 +25,7 @@
 - **Sidebar web panel** — overview / visual flow editor / decision-log viewer, fully built-in, zero CDN
 - **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; trial runs color nodes live (green=met / red=unmet, decision badges on outputs)
 - **Sensor pool** — any number of entities per controller; a global pool view highlights sensors shared across controllers
-- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, plus `AND`/`OR` nesting and `FOR` durations
+- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), plus `AND`/`OR`/`NOT` nesting
 - **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
 - **Decision log** — per-cycle JSONL with sensor readings, applied/override flags; queryable in the panel
 - **Manual override** — optional per-switch manual control lock
@@ -74,7 +75,7 @@
 
 **编辑器节点语义 / Node semantics:**
 
-- 条件节点（七类叶子）→ 用连线加入 **AND/OR/NOT 组**（成员可进多组）
+- 条件节点（九类叶子，含 duration/debounce 计时门）→ 用连线加入 **AND/OR/NOT 组**（成员可进多组）；触发器信号线直达门/输出的信号口（input_3）
 - 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
 - **试运行**与正式评估语义完全相同（会实际写输出实体、写决策日志），并把每个条件的满足结果染色到节点上
 - 保存后控制器整条重载，FOR 计时器清零
@@ -118,7 +119,7 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 Config Entry（单一条目 / single entry）
 ├── Store                → 全部控制器配置（hub.SannerHub, storage.Store）
 ├── ControllerManager    → 每控制器一个：触发调度 + 评估 + 实体注册（controller.py）
-├── Condition Engine     → 七类叶子 + AND/OR/NOT 嵌套 + FOR 计时 + 逐条件追踪（condition_engine.py）
+├── Condition Engine     → 九类叶子（含 duration/debounce 计时门）+ AND/OR/NOT 嵌套 + 逐条件追踪（condition_engine.py）
 ├── Output Platforms     → switch / binary_sensor（每控制器一个设备）
 ├── Web Layer            → 侧边栏面板 + REST API + 静态资源（web.py + static/）
 └── Decision Logger      → 独立 JSONL（decision_log.py）
@@ -129,8 +130,8 @@ Config Entry（单一条目 / single entry）
 | 文件 / File | 职责 / Purpose |
 |-------------|----------------|
 | `hub.py` | 域级单例：Store 读写、控制器 CRUD、运行时快照 / Domain singleton: store, controller CRUD, snapshots |
-| `controller.py` | 触发调度、全量评估（含 applied/override 记录）、试运行 API / Trigger scheduling, evaluation, trial-run API |
-| `condition_engine.py` | 递归条件评估（七类叶子 + AND/OR/NOT 嵌套 + FOR 计时器 + detail 追踪）/ Recursive evaluator |
+| `controller.py` | 触发调度、定向路由评估（含 applied/override 记录）、试运行 API / Trigger scheduling, directed evaluation, trial-run API |
+| `condition_engine.py` | 递归条件评估（九类叶子 + AND/OR/NOT 嵌套 + 计时账本 + 定向唤醒）/ Recursive evaluator |
 | `schema.py` | 共享校验（Web API 与 config flow 同源）/ Shared validation |
 | `web.py` | REST views、面板注册、静态资源 / REST views, panel & static registration |
 | `static/panel.js` | 面板前端（零构建自定义元素 + Drawflow）/ Zero-build panel frontend |
@@ -153,10 +154,25 @@ target:
 
 ---
 
-## 已知限制 / Known limits
+## 信号与门 / Signals & Gates
 
-- 事件驱动下若传感器池内实体持续高频变化，评估频率上限约为每 200ms 一次（防抖窗口）；如需更低频控制，可在触发器中只用时间触发并调大间隔
-- `time` 条件的 `at` 依赖引擎精确唤醒（窗口起点即唤醒点）；系统休眠或时钟跳变可能导致错过该分钟窗口
+0.6.0 起画布连线遵循统一的「信号+门」语义，与米家自动化极客版的事件/状态模型同构：
+
+- **⚡ 触发器 = 信号源**：触发器节点带一个信号输出口（琥珀色框）。触发器 fire = 发出一个信号，信号沿**琥珀色信号线**流动，只唤醒它连到的门和输出——**未连线 = 不评估**。
+- **👁 条件 = 判定门**：条件节点（灰蓝色框）是拦在链上的门，条件为真门开、为假门关。`AND`/`OR`/`NOT` 组是多信号汇聚门。
+- **⏳ 持续（duration）= 掐表门**：三个口——开始口（input_1）进线的条件为真时开始掐表，持续满 N 秒放行；开始掉线或中止口（input_2）进线的条件为真即复位。
+- **🕯 防抖（debounce）= 静默门**：实体最后一次变化后安静满 N 秒才放行（每次变化重置）。
+- **⏱ 翻转冷却（cooldown）= 闭锁门**：输出翻转一次后 N 秒内拒绝再次翻转。
+- **输出 = 执行器**：on 门（input_1）/ off 门（input_2，优先）哪个开就翻到哪个位置；底部信号口（input_3，琥珀色）接收触发器直连信号。
+
+**到期也定向**：掐表门到点、静默门放行、冷却结束、时间范围进/出点、日出日落时刻——引擎只在那个精确瞬间唤醒这些时刻**能影响到的输出**，其余输出保持沉默。手动评估与试运行始终全量。
+
+**升级兼容**：0.5.x 存量配置自动迁移（存储 v2→v3）——带 `for` 的条件拆出独立「持续」节点并改写连线、条件型 `at` 降级为时间范围（每日时刻请改用触发器）、所有触发器物化为「连接全部输出」（升级后行为严格不变，可后续在画布上收窄）。
+
+## 路线图 / Roadmap
+
+- **0.7 候选** — 旗标节点（控制器内置虚拟布尔，极客版「自定义状态」等价物，赋值语义绑定输出翻转）；执行路径引擎（信号沿边串行传播、中途赋值、动作序列链）专项调研
+
 
 ## 兼容性 / Compatibility
 
@@ -174,6 +190,29 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.6.0 — 触发器可连线路由 + 持续/防抖门（信号与门模型）
+
+#### 触发器路由（画布连线）
+- 触发器节点 0 入 1 出：信号线从触发器拉到门/输出的信号口（input_3），fire 时**只评估可达输出**；未连=不评估；多条触发线合并时取并集
+- 触发器配置新增 `routes:{outputs,conditions}`；无 `routes` 字段的遗留配置保持全量评估语义
+- 到期唤醒定向化：FOR/持续到期、防抖静默点、冷却结束、时间范围/日出日落的进出门槛——只唤醒该时刻可达的输出（预计算条件→输出反向索引）
+- 拖线即时校验：非法连线当场弹回（信号线只能从触发器到信号口，门线只能到门入口），不再等保存时报 400
+- 信号/门视觉语言：触发器琥珀框+琥珀信号线，条件灰蓝框+灰蓝门线，输出绿框；信号口（input_3）琥珀色
+
+#### 新条件节点
+- **持续 duration**（三口 TON 门）：开始口条件持续为真满 N 秒→真；开始掉或中止口为真→复位。对应极客版「状态维持」
+- **防抖 debounce**（静默门）：实体最后一次变化后安静满 N 秒→真，零运行时状态（读 `last_changed`）。对应极客版「延时」的重触发重置语义
+- 条件型 `time.at` 移除：每日时刻只用「每日时刻」触发器（与 HA 语义一致）
+
+#### 存储迁移 v2→v3
+- 带 `for` 的 `state`/`numeric_state` 条件自动拆出独立「持续」节点并改写组/输出引用（计时语义逐字保留）
+- 含 `at` 的时间条件降级为 `after` 范围条件
+- 全部触发器物化为「路由到全部输出」——升级后行为严格不变，用户可在画布上收窄
+- 触发器 id 稳定化：校验不再无条件重新生成 id（连线跨保存/重载保持）
+
+#### 修复
+- `_rerun_targets` 积压合并的首轮语义：被吞掉的定向评估不再错误扩成全量（smoke 抓获）
 
 ### 0.5.2
 - 修复 0.5.1 触发器画布节点的三轮审查发现（11 条，全部收口）：

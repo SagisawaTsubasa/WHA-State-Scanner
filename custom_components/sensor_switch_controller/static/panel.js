@@ -61,7 +61,7 @@ const LANG = {
     outSwitch: "开关输出",
     outBinary: "二进制传感器",
     paletteHint: "点选添加节点；从节点右侧圆点拖线到目标输入端口。",
-    canvasHint: "拖线组成条件→组→输出的流程；点击节点在右侧编辑参数。",
+    canvasHint: "⚡触发器是信号源：信号线（琥珀）拉到门/输出底部的信号口；灰蓝线组成判定门；点节点编辑参数。",
     inspectorEmpty: "点击画布上的节点编辑参数。",
     entity: "实体",
     label: "标签",
@@ -111,11 +111,38 @@ const LANG = {
     condCooldown: "翻转冷却",
     condCalendar: "日历",
     condNot: "NOT 组",
+    condDuration: "持续（满 N 秒）",
+    condDebounce: "防抖（静默 N 秒）",
     cooldownSeconds: "冷却秒数",
     calendarHours: "未来小时数",
+    durationSeconds: "持续秒数",
+    debounceSeconds: "静默秒数",
+    debounceEntity: "静默实体",
+    wiredStart: "开始（由连线决定）",
+    wiredAbort: "中止（可选，由连线决定）",
+    conditionSink3: "信号口：触发器连线直达（input_3）",
+    trgRoutesLabel: "路由（由信号线决定）",
+    badConnection: "连线不合法：信号线只能从触发器拉到门/输出的信号口（下数第三个）。",
     weekdaysLabel: "星期几",
     byLabel: "触发来源",
     enabledLabel: "启用",
+    summaryAnd: " 且 ",
+    summaryFrom: "自",
+    summaryTo: "至",
+    summarySunAfter: "后",
+    summarySunBefore: "前",
+    summaryCooldown: "距上次翻转 ≥",
+    summaryDuration: "开始后持续",
+    summaryDebounce: "静默 ≥",
+    summaryCalendarLead: "未来",
+    summaryCalendarTail: "h 有事件",
+    summaryMembers: " 个成员",
+    summaryFor: " 持续 ",
+    loadFailed: "加载失败",
+    invalidBadge: "配置无效",
+    invalidStoredLead: "存储中的配置无法载入：",
+    invalidStoredTail: "请删除后重新创建控制器。",
+    triggerErrorBadge: "触发器错误",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -158,7 +185,7 @@ const LANG = {
     outSwitch: "Switch output",
     outBinary: "Binary sensor",
     paletteHint: "Click to add nodes; drag from the right dot to a target input port.",
-    canvasHint: "Wire condition → group → output; click a node to edit it on the right.",
+    canvasHint: "⚡Triggers are signal sources: amber signal wires go to the bottom signal port of gates/outputs; blue wires build gates; click a node to edit it.",
     inspectorEmpty: "Click a node on the canvas to edit it.",
     entity: "Entity",
     label: "Label",
@@ -208,11 +235,38 @@ const LANG = {
     condCooldown: "Flip cooldown",
     condCalendar: "Calendar",
     condNot: "NOT group",
+    condDuration: "Hold duration",
+    condDebounce: "Debounce",
     cooldownSeconds: "Cooldown seconds",
     calendarHours: "Upcoming hours",
+    durationSeconds: "Hold seconds",
+    debounceSeconds: "Quiet seconds",
+    debounceEntity: "Quiet entity",
+    wiredStart: "Start (wired)",
+    wiredAbort: "Abort (optional, wired)",
+    conditionSink3: "Signal port: direct trigger wires (input_3)",
+    trgRoutesLabel: "Routes (from signal wires)",
+    badConnection: "Invalid wire: signal wires only go from a trigger to a gate/output signal port (third one).",
     weekdaysLabel: "Weekdays",
     byLabel: "By",
     enabledLabel: "Enabled",
+    summaryAnd: " and ",
+    summaryFrom: "from",
+    summaryTo: "until",
+    summarySunAfter: "onwards",
+    summarySunBefore: "or earlier",
+    summaryCooldown: "≥ since last flip",
+    summaryDuration: "held for",
+    summaryDebounce: "quiet ≥",
+    summaryCalendarLead: "events within",
+    summaryCalendarTail: "h",
+    summaryMembers: " member(s)",
+    summaryFor: " for ",
+    loadFailed: "Failed to load",
+    invalidBadge: "Invalid config",
+    invalidStoredLead: "Stored config failed to load: ",
+    invalidStoredTail: "Delete and recreate the controller.",
+    triggerErrorBadge: "Trigger errors",
   },
 };
 
@@ -239,6 +293,8 @@ const TYPE_LABEL_KEY = {
   template: "condTemplate",
   cooldown: "condCooldown",
   calendar: "condCalendar",
+  duration: "condDuration",
+  debounce: "condDebounce",
   and: "condAnd",
   or: "condOr",
   not: "condNot",
@@ -252,6 +308,8 @@ const TYPE_ICON = {
   template: "ƒ",
   cooldown: "⏱",
   calendar: "📅",
+  duration: "⏳",
+  debounce: "🕯",
   and: "⊕",
   or: "⊗",
   not: "¬",
@@ -261,45 +319,49 @@ const TRIGGER_ICON = { state: "⚡", time: "🕐", sun: "🌤", homeassistant: "
 const TRIGGER_LABEL_KEY = { state: "triggerState", time: "triggerTime", sun: "triggerSun", homeassistant: "triggerStart" };
 const isGroupType = (t) => t === "and" || t === "or" || t === "not";
 
-function conditionSummary(cond) {
+function conditionSummary(cond, tr) {
+  // `tr` is the panel's translation fn — node summaries follow hass.language
+  const trk = tr || ((k) => k);
   let text = "";
   switch (cond.type) {
     case "numeric_state": {
       const parts = [];
       if (cond.above !== undefined && cond.above !== null) parts.push(`> ${cond.above}`);
       if (cond.below !== undefined && cond.below !== null) parts.push(`< ${cond.below}`);
-      text = `${cond.entity_id} ${parts.join(" 且 ")}`;
+      text = `${cond.entity_id} ${parts.join(trk("summaryAnd"))}`;
       break;
     }
     case "state":
       text = `${cond.entity_id} = ${Array.isArray(cond.state) ? cond.state.join("/") : cond.state}`;
       break;
     case "time": {
-      if (cond.at) {
-        text = `每日 ${cond.at}`;
-        break;
-      }
-      text = [cond.after ? `自 ${cond.after}` : "", cond.before ? `至 ${cond.before}` : ""].filter(Boolean).join(" ");
+      text = [cond.after ? `${trk("summaryFrom")} ${cond.after}` : "", cond.before ? `${trk("summaryTo")} ${cond.before}` : ""].filter(Boolean).join(" ");
       break;
     }
     case "sun":
-      text = [cond.after ? `${cond.after} 后` : "", cond.before ? `${cond.before} 前` : ""].filter(Boolean).join(" ");
+      text = [cond.after ? `${cond.after} ${trk("summarySunAfter")}` : "", cond.before ? `${cond.before} ${trk("summarySunBefore")}` : ""].filter(Boolean).join(" ");
       break;
     case "template":
       text = cond.value_template || "";
       break;
     case "cooldown":
-      text = `距上次翻转 ≥ ${cond.seconds}s`;
+      text = `${trk("summaryCooldown")} ${cond.seconds}s`;
+      break;
+    case "duration":
+      text = `${trk("summaryDuration")} ${cond.seconds}s`;
+      break;
+    case "debounce":
+      text = `${cond.entity_id || "?"} ${trk("summaryDebounce")} ${cond.seconds}s`;
       break;
     case "calendar":
-      text = `${cond.entity_id} 未来 ${cond.hours}h 有事件`;
+      text = `${cond.entity_id} ${trk("summaryCalendarLead")} ${cond.hours}${trk("summaryCalendarTail")}`;
       break;
     default:
-      text = `${(cond.conditions || []).length} 个成员`;
+      text = `${(cond.conditions || []).length}${trk("summaryMembers")}`;
   }
   if (cond.for && (cond.for.hours || cond.for.minutes || cond.for.seconds)) {
     const f = cond.for;
-    text += ` 持续 ${String(f.hours).padStart(2, "0")}:${String(f.minutes).padStart(2, "0")}:${String(f.seconds).padStart(2, "0")}`;
+    text += `${trk("summaryFor")}${String(f.hours).padStart(2, "0")}:${String(f.minutes).padStart(2, "0")}:${String(f.seconds).padStart(2, "0")}`;
   }
   if (cond.weekdays && cond.weekdays.length) {
     text += ` [${cond.weekdays.join(",")}]`;
@@ -475,7 +537,7 @@ class ScannerPanel extends HTMLElement {
       if (!root) return;
       if (this._error) {
         root.querySelector(".wha-app").innerHTML = `
-          <main class="wha-main"><div class="wha-card"><b>加载失败</b><p class="wha-sub">${esc(this._error)}</p></div></main>`;
+          <main class="wha-main"><div class="wha-card"><b>${esc(this.tr("loadFailed"))}</b><p class="wha-sub">${esc(this._error)}</p></div></main>`;
         return;
       }
       if (!this._data) return;
@@ -538,11 +600,11 @@ class ScannerPanel extends HTMLElement {
           <div class="wha-card" data-cid="${esc(cid)}">
             <div class="wha-row">
               <h2 style="margin:0">${esc(cid)}</h2>
-              <span class="badge off">配置无效</span>
+              <span class="badge off">${esc(this.tr("invalidBadge"))}</span>
               <span class="spacer" style="flex:1"></span>
               <button class="wha-btn danger" data-act="del">${esc(this.tr("delete"))}</button>
             </div>
-            <p class="wha-sub" style="margin-top:8px">存储中的配置无法载入：${esc(c.invalid_error || "")}。请删除后重新创建控制器。</p>
+            <p class="wha-sub" style="margin-top:8px">${esc(this.tr("invalidStoredLead"))}${esc(c.invalid_error || "")}${esc(this.tr("invalidStoredTail"))}</p>
           </div>`;
         }
         const outputs = (c.outputs || [])
@@ -558,10 +620,10 @@ class ScannerPanel extends HTMLElement {
           <div class="wha-card" data-cid="${esc(cid)}">
             <div class="wha-row">
               <h2 style="margin:0">${esc(c.name)}</h2>
-              ${c._invalid ? `<span class="badge off">配置无效</span>` : `<span class="badge ${c.enabled ? "on" : "hold"}">${c.enabled ? esc(this.tr("enabled")) : "off"}</span>`}
+              ${c._invalid ? `<span class="badge off">${esc(this.tr("invalidBadge"))}</span>` : `<span class="badge ${c.enabled ? "on" : "hold"}">${c.enabled ? esc(this.tr("enabled")) : "off"}</span>`}
               <span class="badge meta">${esc(cid)}</span>
               <span class="badge meta">${esc(this.tr("triggersTitle"))} ${c.triggers ? c.triggers.length : 0}${c.triggers && c.triggers.length === 0 ? " ⚠" : ""}</span>
-              ${c.runtime?.trigger_errors ? `<span class="badge off">触发器错误 ${c.runtime.trigger_errors}</span>` : ""}
+              ${c.runtime?.trigger_errors ? `<span class="badge off">${esc(this.tr("triggerErrorBadge"))} ${c.runtime.trigger_errors}</span>` : ""}
               <span class="spacer" style="flex:1"></span>
               <button class="wha-btn" data-act="edit">${esc(this.tr("edit"))}</button>
               <button class="wha-btn" data-act="logs">${esc(this.tr("logs"))}</button>
@@ -727,14 +789,14 @@ class ScannerPanel extends HTMLElement {
               .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "and", "or", "not"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "and", "or", "not"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addOutput"))}</h3>
             <button class="wha-btn" data-add-out="switch">⏻ ${esc(this.tr("outSwitch"))}</button>
             <button class="wha-btn" data-add-out="binary_sensor">◉ ${esc(this.tr("outBinary"))}</button>
             <p class="wha-sub" style="margin-top:10px">${esc(this.tr("paletteHint"))}</p>
-            <p class="wha-sub">${esc(this.tr("conditionSink1"))}<br>${esc(this.tr("conditionSink2"))}</p>
+            <p class="wha-sub">${esc(this.tr("conditionSink1"))}<br>${esc(this.tr("conditionSink2"))}<br>${esc(this.tr("conditionSink3"))}</p>
           </div>
           <div class="wha-canvas-wrap">
             <div id="wha-drawflow"></div>
@@ -877,10 +939,10 @@ class ScannerPanel extends HTMLElement {
     const nodeId = ed.df.addNode(
       "trigger_" + t.type,
       0,
-      0,
+      1,
       x,
       y,
-      `wha-node trg-${t.type}${t.enabled === false ? " trg-off" : ""}`,
+      `wha-node trg-node trg-${t.type}${t.enabled === false ? " trg-off" : ""}`,
       { trgId: t.id },
       this._triggerNodeHtml(t)
     );
@@ -949,6 +1011,7 @@ class ScannerPanel extends HTMLElement {
     return `
       <label class="field field-inline"><input type="checkbox" data-trgsk="enabled" ${t.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</label>
       ${fields}
+      <p class="wha-sub">${esc(this.tr("trgRoutesLabel"))}: ${(t.routes?.outputs || []).length} / ${(t.routes?.conditions || []).length}</p>
       <p class="wha-sub">${esc(t.id)}</p>`;
   }
 
@@ -961,11 +1024,27 @@ class ScannerPanel extends HTMLElement {
     ed.df = df;
     ed.importing = true;
     df.on("nodeSelected", (nodeId) => this._selectNode(Number(nodeId)));
-    df.on("connectionCreated", () => {
-      if (!ed.importing) ed.dirty = true;
+    df.on("connectionCreated", (e) => {
+      if (ed.importing) return;
+      if (!this._connectionAllowed(e)) {
+        try {
+          df.removeSingleConnection(
+            String(e.output_id), String(e.input_id), e.output_class, e.input_class
+          );
+        } catch {
+          /* already refused by the canvas */
+        }
+        this.toast(this.tr("badConnection"), true);
+        return;
+      }
+      ed.dirty = true;
+      this._styleConnections();
     });
     df.on("connectionRemoved", () => {
-      if (!ed.importing) ed.dirty = true;
+      if (!ed.importing) {
+        ed.dirty = true;
+        this._styleConnections();
+      }
     });
     df.on("nodeRemoved", (nodeId) => {
       const n = Number(nodeId);
@@ -979,13 +1058,19 @@ class ScannerPanel extends HTMLElement {
         ed.nodeToCond.delete(n);
         ed.condToNode.delete(condId);
         ed.controller.conditions = ed.controller.conditions.filter((c) => c.id !== condId);
-        // cascade: drop dangling references from groups and outputs
+        // cascade: drop dangling references from groups, outputs and routes
         for (const c of ed.controller.conditions) {
           if (c.conditions) c.conditions = c.conditions.filter((m) => m !== condId);
+          if (c.start === condId) delete c.start;
+          if (c.abort === condId) delete c.abort;
         }
         for (const o of ed.controller.outputs) {
           o.on_conditions = o.on_conditions.filter((m) => m !== condId);
           o.off_conditions = o.off_conditions.filter((m) => m !== condId);
+        }
+        for (const t of ed.controller.triggers || []) {
+          if (!t.routes) continue;
+          t.routes.conditions = (t.routes.conditions || []).filter((m) => m !== condId);
         }
       }
       const outId = ed.nodeToOut.get(n);
@@ -993,24 +1078,29 @@ class ScannerPanel extends HTMLElement {
         ed.nodeToOut.delete(n);
         ed.outToNode.delete(outId);
         ed.controller.outputs = ed.controller.outputs.filter((o) => o.entity_id !== outId);
+        for (const t of ed.controller.triggers || []) {
+          if (!t.routes) continue;
+          t.routes.outputs = (t.routes.outputs || []).filter((m) => m !== outId);
+        }
       }
       ed.dirty = true;
     });
 
     // import existing model
-    // triggers live on the leftmost column as standalone (port-less) nodes
+    // triggers live on the leftmost column, each with one signal output
+    const trgNodeById = new Map();
     (ed.controller.triggers || []).forEach((t, i) => {
-      this._dfAddTriggerNode(t, 20, 20 + i * 120);
+      const nid = this._dfAddTriggerNode(t, 20, 20 + i * 120);
+      trgNodeById.set(t.id, nid);
     });
     const conds = ed.controller.conditions;
     conds.forEach((cond, i) => {
-      const x = isGroupType(cond.type) ? 560 : 280;
-      this._dfAddCondNode(cond, x, 20 + i * 120);
+      this._dfAddCondNode(cond, 20 + i * 120);
     });
     ed.controller.outputs.forEach((out, i) => {
       this._dfAddOutNode(out, this._outX(), 30 + i * 140);
     });
-    // connections
+    // gate wires: group members, output chains, duration start/abort
     for (const cond of conds) {
       if (!isGroupType(cond.type)) continue;
       const gid = ed.condToNode.get(cond.id);
@@ -1018,6 +1108,14 @@ class ScannerPanel extends HTMLElement {
         const mid = ed.condToNode.get(m);
         if (mid && gid) df.addConnection(String(mid), String(gid), "output_1", "input_1");
       }
+    }
+    for (const cond of conds) {
+      if (cond.type !== "duration") continue;
+      const did = ed.condToNode.get(cond.id);
+      const sid = cond.start ? ed.condToNode.get(cond.start) : null;
+      if (did && sid) df.addConnection(String(sid), String(did), "output_1", "input_1");
+      const aid = cond.abort ? ed.condToNode.get(cond.abort) : null;
+      if (did && aid) df.addConnection(String(aid), String(did), "output_1", "input_2");
     }
     for (const out of ed.controller.outputs) {
       const oid = ed.outToNode.get(out.entity_id);
@@ -1031,7 +1129,81 @@ class ScannerPanel extends HTMLElement {
         if (mid) df.addConnection(String(mid), String(oid), "output_1", "input_2");
       }
     }
+    // signal wires: trigger routes → output/condition signal ports
+    for (const trg of ed.controller.triggers || []) {
+      const srcNode = trgNodeById.get(trg.id);
+      if (srcNode === undefined) continue;
+      for (const oid of trg.routes?.outputs || []) {
+        const dst = ed.outToNode.get(oid);
+        if (dst) df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
+      }
+      for (const cid of trg.routes?.conditions || []) {
+        const dst = ed.condToNode.get(cid);
+        if (dst) df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
+      }
+    }
     ed.importing = false;
+    this._styleConnections();
+  }
+
+  _connectionAllowed(e) {
+    // Wire legality: signal wires only from a trigger output into input_3
+    // of a gate/output; gate wires only from a condition into input_1/2.
+    const ed = this._editor;
+    const srcIsTrg = ed.nodeToTrg.has(Number(e.output_id));
+    const srcIsCond = ed.nodeToCond.has(Number(e.output_id));
+    const dstIsTrg = ed.nodeToTrg.has(Number(e.input_id));
+    const dstIsCond = ed.nodeToCond.has(Number(e.input_id));
+    const dstIsOut = ed.nodeToOut.has(Number(e.input_id));
+    if (srcIsTrg) {
+      return !dstIsTrg && e.input_class === "input_3";
+    }
+    if (srcIsCond) {
+      if (dstIsTrg) return false;
+      if (e.input_class === "input_3") return false;
+      if (dstIsCond) {
+        const dst = ed.controller.conditions.find(
+          (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
+        );
+        if (dst && isGroupType(dst.type)) return e.input_class === "input_1";
+        if (dst && dst.type === "duration") {
+          // start/abort are single-value ports: a second wire into the same
+          // input would be silently dropped on export (WHA-F-024)
+          if (e.input_class !== "input_1" && e.input_class !== "input_2") {
+            return false;
+          }
+          try {
+            const nd = ed.df.getNodeFromId(String(e.input_id));
+            return (nd?.inputs?.[e.input_class]?.connections || []).length <= 1;
+          } catch {
+            return true;
+          }
+        }
+        // leaf gates have no gate-input semantics: a wire here would be
+        // silently dropped on export (WHA-F-019)
+        return false;
+      }
+      if (dstIsOut) return e.input_class === "input_1" || e.input_class === "input_2";
+    }
+    return false;
+  }
+
+  _styleConnections() {
+    // Amber signal wires: connections whose source node is a trigger.
+    // Vendor renders connections with class `node_out_node-<id>` (the DOM
+    // id form), so strip the full "node_out_node-" prefix (WHA-F-015).
+    const ed = this._editor;
+    if (!ed.df?.container) return;
+    ed.df.container.querySelectorAll(".connection").forEach((g) => {
+      let signal = false;
+      for (const cls of g.classList) {
+        if (cls.startsWith("node_out_node-")) {
+          signal = ed.nodeToTrg.has(Number(cls.slice(14)));
+          break;
+        }
+      }
+      g.classList.toggle("signal", signal);
+    });
   }
 
   _outX() {
@@ -1042,7 +1214,7 @@ class ScannerPanel extends HTMLElement {
   }
 
   _condNodeHtml(cond) {
-    const group = cond.type === "and" || cond.type === "or";
+    const group = isGroupType(cond.type);
     return `
       <div class="wha-node-body-wrap">
         <div class="wha-node-head">
@@ -1050,7 +1222,7 @@ class ScannerPanel extends HTMLElement {
           <span data-nhead>${esc(this.tr(TYPE_LABEL_KEY[cond.type]))}</span>
           ${group ? "" : `<span class="wha-node-tag">${esc(cond.type)}</span>`}
         </div>
-        <div class="wha-node-body" data-nbody>${esc(conditionSummary(cond))}</div>
+        <div class="wha-node-body" data-nbody>${esc(conditionSummary(cond, (k) => this.tr(k)))}</div>
       </div>`;
   }
 
@@ -1069,16 +1241,19 @@ class ScannerPanel extends HTMLElement {
       </div>`;
   }
 
-  _dfAddCondNode(cond, x, y) {
+  _dfAddCondNode(cond, y) {
     const ed = this._editor;
-    const isGroup = isGroupType(cond.type);
+    // Port model (0.6.0): every gate carries input_1 (gate input; the abort
+    // input on duration), input_3 (signal port for trigger wires) and one
+    // output. input_2 exists only on duration (abort) — hidden by CSS on
+    // the rest. Duration sits in the leaf column like other leaves.
     const nodeId = ed.df.addNode(
       cond.type,
-      isGroup ? 1 : 0,
+      3,
       1,
-      x,
+      isGroupType(cond.type) ? 560 : 280,
       y,
-      `wha-node cond-${cond.type}`,
+      `wha-node cond-node cond-${cond.type}`,
       { condId: cond.id },
       this._condNodeHtml(cond)
     );
@@ -1091,7 +1266,7 @@ class ScannerPanel extends HTMLElement {
     const ed = this._editor;
     const nodeId = ed.df.addNode(
       "output",
-      2,
+      3,
       0,
       x,
       y,
@@ -1121,6 +1296,13 @@ class ScannerPanel extends HTMLElement {
       cond.value_template = "{{ true }}";
     } else if (type === "cooldown") {
       cond.seconds = 60;
+    } else if (type === "duration") {
+      cond.seconds = 60;
+      cond.start = null;
+      cond.abort = null;
+    } else if (type === "debounce") {
+      cond.seconds = 60;
+      cond.entity_id = "";
     } else if (type === "calendar") {
       cond.entity_id = "";
       cond.hours = 24;
@@ -1129,7 +1311,7 @@ class ScannerPanel extends HTMLElement {
     }
     ed.controller.conditions.push(cond);
     const count = ed.controller.conditions.length;
-    const nodeId = this._dfAddCondNode(cond, isGroupType(type) ? 560 : 280, 20 + (count - 1) * 120);
+    const nodeId = this._dfAddCondNode(cond, 20 + (count - 1) * 120);
     this._selectNode(nodeId);
     ed.dirty = true;
   }
@@ -1182,7 +1364,7 @@ class ScannerPanel extends HTMLElement {
       const cond = ed.controller.conditions.find((c) => c.id === condId);
       if (!cond) return;
       if (head) head.textContent = this.tr(TYPE_LABEL_KEY[cond.type]);
-      if (body) body.textContent = conditionSummary(cond);
+      if (body) body.textContent = conditionSummary(cond, (k) => this.tr(k));
     } else if (outId) {
       const out = ed.controller.outputs.find((o) => o.entity_id === outId);
       if (!out) return;
@@ -1284,13 +1466,16 @@ class ScannerPanel extends HTMLElement {
       ${isGroup
         ? `<p class="wha-sub">${esc(this.tr("members"))}: ${(cond.conditions || []).length}</p>`
         : this._condFieldsHtml(cond)}
-      ${isGroup
+      ${isGroup || cond.type === "duration" || cond.type === "debounce"
         ? ""
         : `<label class="field"><span>${esc(this.tr("forDuration"))}</span><span class="wha-row">
             <input class="wha-input" type="number" min="0" max="24" style="width:64px" data-for="hours" value="${esc(f.hours)}">:
             <input class="wha-input" type="number" min="0" max="59" style="width:64px" data-for="minutes" value="${esc(f.minutes)}">:
             <input class="wha-input" type="number" min="0" max="59" style="width:64px" data-for="seconds" value="${esc(f.seconds)}">
           </span></label>`}
+      ${cond.type === "duration"
+        ? `<p class="wha-sub">${esc(this.tr("wiredStart"))}：${cond.start ? "✓" : "—"}<br>${esc(this.tr("wiredAbort"))}：${cond.abort ? "✓" : "—"}</p>`
+        : ""}
       ${this._trialHtml()}`;
 
     box.querySelectorAll("[data-insk]").forEach((input) =>
@@ -1349,7 +1534,6 @@ class ScannerPanel extends HTMLElement {
       case "time": {
         const wd = cond.weekdays || [];
         return `
-          <label class="field"><span>at (HH:MM)</span><input class="wha-input" placeholder="07:30" data-insk="at" value="${esc(cond.at || "")}"></label>
           <label class="field"><span>${esc(trk("after"))}(HH:MM)</span><input class="wha-input" placeholder="22:00" data-insk="after" value="${esc(cond.after || "")}"></label>
           <label class="field"><span>${esc(trk("before"))}(HH:MM)</span><input class="wha-input" placeholder="06:00" data-insk="before" value="${esc(cond.before || "")}"></label>
           <label class="field"><span>${esc(trk("weekdaysLabel"))}</span><span class="wha-row">
@@ -1359,6 +1543,13 @@ class ScannerPanel extends HTMLElement {
       case "cooldown":
         return `
           <label class="field"><span>${esc(trk("cooldownSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>`;
+      case "duration":
+        return `
+          <label class="field"><span>${esc(trk("durationSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>`;
+      case "debounce":
+        return `
+          <label class="field"><span>${esc(trk("debounceEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
+          <label class="field"><span>${esc(trk("debounceSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>`;
       case "calendar":
         return `
           <label class="field"><span>${esc(trk("entity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" value="${esc(cond.entity_id || "")}"></label>
@@ -1398,22 +1589,62 @@ class ScannerPanel extends HTMLElement {
   _exportGraph() {
     const ed = this._editor;
     if (!ed.df) return;
+    // Drawflow stores nodes under the bare node id ("1", "2", ...) — NOT
+    // "node-<id>" (that prefix only exists on DOM ids and connection
+    // classes). Verified against vendor: addNode does `data[a]=w` with the
+    // bare id, drag-move reads `data[id.slice(5)]`. Using "node-" here
+    // silently exported empty graphs (WHA-F-014, latent since 0.5.0).
     const data = ed.df.export()?.drawflow?.Home?.data || {};
     const nodeRefs = (nodeId, inputClass) => {
-      const node = data[`node-${nodeId}`];
+      const node = data[String(nodeId)];
       return (node?.inputs?.[inputClass]?.connections || [])
         .map((c) => ed.nodeToCond.get(Number(c.node)))
         .filter(Boolean);
     };
+    const singleRef = (nodeId, inputClass) => {
+      const refs = nodeRefs(nodeId, inputClass);
+      return refs.length ? refs[0] : null;
+    };
     for (const cond of ed.controller.conditions) {
-      if (!isGroupType(cond.type)) continue;
       const nid = ed.condToNode.get(cond.id);
-      cond.conditions = nid ? nodeRefs(nid, "input_1") : [];
+      if (!nid) continue;
+      if (isGroupType(cond.type)) {
+        cond.conditions = nodeRefs(nid, "input_1");
+      } else if (cond.type === "duration") {
+        cond.start = singleRef(nid, "input_1");
+        const abort = singleRef(nid, "input_2");
+        if (abort) cond.abort = abort;
+        else cond.abort = null;
+      }
     }
     for (const out of ed.controller.outputs) {
       const nid = ed.outToNode.get(out.entity_id);
       out.on_conditions = nid ? nodeRefs(nid, "input_1") : [];
       out.off_conditions = nid ? nodeRefs(nid, "input_2") : [];
+    }
+    // trigger routes from signal wires leaving each trigger node
+    for (const trg of ed.controller.triggers || []) {
+      let srcNode = null;
+      for (const [nid, tid] of ed.nodeToTrg) {
+        if (tid === trg.id) {
+          srcNode = nid;
+          break;
+        }
+      }
+      const routes = { outputs: [], conditions: [] };
+      if (srcNode !== null) {
+        const conns =
+          data[String(srcNode)]?.outputs?.output_1?.connections || [];
+        for (const c of conns) {
+          const dstId = Number(c.node);
+          if (ed.nodeToOut.has(dstId)) {
+            routes.outputs.push(ed.nodeToOut.get(dstId));
+          } else if (ed.nodeToCond.has(dstId)) {
+            routes.conditions.push(ed.nodeToCond.get(dstId));
+          }
+        }
+      }
+      trg.routes = routes;
     }
   }
 

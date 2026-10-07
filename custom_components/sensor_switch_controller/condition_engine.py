@@ -2,9 +2,14 @@
 
 Since 0.5.0 conditions may reference the *evaluating output* (cooldown)
 via the ``out_id`` context, consult the owning manager's flip history,
-and query calendar entities. FOR timers still run per condition id and
-expose their earliest expiry so the controller can wake up exactly when
-a duration elapses (trigger-driven evaluation has no polling fallback).
+and query calendar entities. Since 0.6.0 two more timed gates exist:
+``duration`` (TON: true once ``start`` held for N seconds, reset when
+``start`` drops or ``abort`` turns true) and ``debounce`` (true once the
+entity has been quiet for N seconds — stateless, reads last_changed).
+Timers still run per condition id and expose their earliest expiry so the
+controller can wake up exactly when a gate flips (trigger-driven
+evaluation has no polling fallback); ``next_wakeup`` reports both the
+instant and the outputs that instant can reach (directed wakeups).
 """
 
 from __future__ import annotations
@@ -25,9 +30,10 @@ from homeassistant.helpers.template import Template
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_AT,
+    CONF_ABORT,
     CONF_HOURS,
     CONF_SECONDS,
+    CONF_START,
     CONF_WEEKDAYS,
 )
 
@@ -84,6 +90,7 @@ class ConditionEngine:
             self._conditions[cid] = cond
 
         self._for_timers: dict[str, datetime] = {}
+        self._duration_timers: dict[str, datetime] = {}
         self._template_cache: dict[str, Template] = {}
         self._sun_cache: dict[tuple[str, str], Any] = {}
 
@@ -123,66 +130,213 @@ class ConditionEngine:
                 results[cid] = False
         return met, results
 
-    def next_for_expiry(self) -> datetime | None:
-        """Earliest future expiry among running FOR timers (UTC), or None.
+    def next_wakeup(
+        self, reverse: dict[str, set[str]]
+    ) -> tuple[datetime, set[str]] | None:
+        """Earliest instant (UTC) at which some output's verdict may flip on
+        its own, plus the outputs that instant can reach.
 
-        The controller schedules a point-in-time wakeup at this instant so
-        duration-based conditions still flip in a trigger-driven (non
-        polling) setup.
+        Sources: running FOR/duration timers, debounce quiet periods,
+        active cooldowns, time-range entry/exit points, sun event moments.
+        ``reverse`` maps condition id → the set of output ids whose chains
+        contain it (the controller's precomputed routing index). Returns
+        ``(expiry_utc, out_ids)`` or None when nothing is pending; the
+        controller schedules a directed point-in-time wakeup here.
         """
-        now = dt_util.utcnow()
-        earliest: datetime | None = None
-        for cid, start in self._for_timers.items():
-            cond = self._conditions.get(cid)
-            if not cond:
-                continue
-            duration = self._parse_for(cond.get("for"))
-            if not duration:
-                continue
-            expiry = start + duration
-            if expiry > now and (earliest is None or expiry < earliest):
-                earliest = expiry
-        return earliest
-
-    def next_wakeup(self, out_ids) -> datetime | None:
-        """Earliest instant (UTC) at which some condition's verdict could
-        change on its own: a running FOR duration, the next `time.at`
-        minute window, or a cooldown elapsing. None when nothing is
-        pending. The controller schedules a point-in-time wakeup here."""
         now_utc = dt_util.utcnow()
         now_local = dt_util.now()
-        candidates: list[datetime] = []
-        for_expiry = self.next_for_expiry()
-        if for_expiry:
-            candidates.append(for_expiry)
+        best: tuple[datetime, set[str]] | None = None
+
+        def offer(expiry: Any, outs: set[str] | None) -> None:
+            nonlocal best
+            if expiry is None or not outs:
+                return
+            try:
+                expiry = dt_util.as_utc(expiry)
+            except (TypeError, ValueError, AttributeError):
+                return
+            if expiry <= now_utc:
+                return
+            if best is None or expiry < best[0]:
+                best = (expiry, set(outs))
+            elif expiry == best[0]:
+                # Same-instant wakeups must union their reachable outputs,
+                # else the loser's outputs are silently dropped and stay
+                # stale until an unrelated trigger fires (WHA-F-022).
+                best[1].update(outs)
+
+        # Running FOR timers (leaf `for` fields) and duration gates.
+        for timers, seconds_of in (
+            (self._for_timers, lambda c: self._parse_for(c.get("for"))),
+            (
+                self._duration_timers,
+                lambda c: timedelta(
+                    seconds=float(c.get(CONF_SECONDS, 0) or 0)
+                ),
+            ),
+        ):
+            for cid, start in timers.items():
+                cond = self._conditions.get(cid)
+                if not cond or cond.get("enabled") is False:
+                    continue
+                duration = seconds_of(cond)
+                if not duration or duration.total_seconds() <= 0:
+                    continue
+                offer(start + duration, reverse.get(cid))
+
         for cond in self._conditions.values():
             if not isinstance(cond, dict) or cond.get("enabled") is False:
                 continue
-            if cond.get("type") == "time" and cond.get(CONF_AT):
-                parts = str(cond[CONF_AT]).split(":")
-                weekdays = cond.get(CONF_WEEKDAYS)
-                for add_days in range(8):
-                    day = now_local + timedelta(days=add_days)
-                    if weekdays and _WEEKDAY_KEYS[day.weekday()] not in weekdays:
-                        continue
-                    target = dt_util.start_of_local_day(day) + timedelta(
-                        hours=int(parts[0]),
-                        minutes=int(parts[1]),
-                        seconds=int(parts[2]) if len(parts) > 2 else 0,
-                    )
-                    if target > now_local:
-                        candidates.append(dt_util.as_utc(target))
-                        break
-            elif cond.get("type") == "cooldown":
+            ctype = cond.get("type")
+            cid = cond.get("id")
+            outs = reverse.get(cid) if cid else None
+            if ctype == "cooldown":
                 seconds = float(cond.get(CONF_SECONDS, 0))
-                for oid in out_ids:
+                for oid in outs or ():
                     last = self._manager.last_flip_at(oid) if self._manager else None
                     if last is None:
                         continue
-                    expiry = last + timedelta(seconds=seconds)
-                    if expiry > now_utc:
-                        candidates.append(expiry)
-        return min(candidates) if candidates else None
+                    offer(last + timedelta(seconds=seconds), {oid})
+            elif ctype == "debounce":
+                state = self.hass.states.get(cond.get(CONF_ENTITY_ID))
+                last_changed = getattr(state, "last_changed", None) if state else None
+                if last_changed is None:
+                    continue
+                seconds = float(cond.get(CONF_SECONDS, 0) or 0)
+                offer(dt_util.as_utc(last_changed) + timedelta(seconds=seconds), outs)
+            elif ctype == "time":
+                self._offer_range_edges(cond, now_local, offer, outs)
+            elif ctype == "sun":
+                self._offer_sun_edges(cond, now_local, offer, outs)
+        return best
+
+    def _time_window_verdict(self, cond: dict, now_local) -> bool:
+        """Time-range verdict at ``now_local`` — the single source shared by
+        evaluation and wakeup-edge discovery so the two never drift."""
+        weekdays = cond.get(CONF_WEEKDAYS)
+        if weekdays and _WEEKDAY_KEYS[now_local.weekday()] not in weekdays:
+            return False
+        after = dt_util.parse_time(cond["after"]) if cond.get("after") else None
+        before = dt_util.parse_time(cond["before"]) if cond.get("before") else None
+        if after is not None and before is not None and after > before:
+            # Cross-midnight window (e.g. after 22:00, before 06:00).
+            return now_local.time() >= after or now_local.time() <= before
+        if after is not None and now_local.time() < after:
+            return False
+        return before is None or now_local.time() <= before
+
+    def _offer_range_edges(self, cond: dict, now_local, offer, outs) -> None:
+        """Offer the next entry/exit moments of a time-range condition.
+
+        Two edge kinds: (a) the configured `after`/`before` wall-clock
+        moments (up to 8 days out — with a weekday filter the next edge can
+        be 6 days away, WHA-F-013); (b) midnight membership boundaries —
+        with a weekday filter the verdict flips at day seams, not only at
+        the configured moments. For (b) we probe the next 8 local midnights
+        with the evaluator's own verdict and offer the first seam where it
+        changes; that one rule covers cross-midnight exits/entries
+        (WHA-F-023/F-028) and single-sided windows (after-only exit,
+        before-only entry, WHA-F-030) without duplicating the semantics.
+        """
+        if not outs:
+            return
+        weekdays = cond.get(CONF_WEEKDAYS)
+        for key in ("after", "before"):
+            text = cond.get(key)
+            if not text:
+                continue
+            parts = str(text).split(":")
+            try:
+                hh, mm = int(parts[0]), int(parts[1])
+                ss = int(parts[2]) if len(parts) > 2 else 0
+            except (IndexError, ValueError):
+                continue
+            for add_days in range(8):
+                day = now_local + timedelta(days=add_days)
+                if weekdays and _WEEKDAY_KEYS[day.weekday()] not in weekdays:
+                    continue
+                target = dt_util.start_of_local_day(day) + timedelta(
+                    hours=hh, minutes=mm, seconds=ss
+                )
+                if target > now_local:
+                    offer(target, outs)
+                    break
+        self._offer_midnight_seams(
+            lambda now: self._time_window_verdict(cond, now), now_local, offer, outs
+        )
+
+    def _offer_midnight_seams(self, verdict, now_local, offer, outs) -> None:
+        """Offer the next local midnight whose verdict differs from the
+        instant right before it — day-boundary flips (weekday filters,
+        per-date sun events) happen at the seam, not at any configured
+        moment (WHA-F-023/F-028/F-030/F-034). Eight midnights cover any
+        weekday pattern and beyond."""
+        for add_days in range(1, 9):
+            day = now_local + timedelta(days=add_days)
+            midnight = dt_util.start_of_local_day(day)
+            if verdict(midnight - timedelta(seconds=1)) != verdict(midnight):
+                offer(midnight, outs)
+                break
+
+    def _offer_sun_edges(self, cond: dict, now_local, offer, outs) -> None:
+        """Offer the next sun event moments (+offset) of a sun condition,
+        plus local-midnight seams: single-sided sun verdicts flip at the
+        per-date boundary, not at a sun event (WHA-F-034)."""
+        if not outs:
+            return
+        for key in ("after", "before"):
+            event = cond.get(key)
+            if event not in ("sunrise", "sunset"):
+                continue
+            offset = self._parse_offset(cond.get(f"{key}_offset", 0))
+            for add_days in range(2):
+                day = (now_local + timedelta(days=add_days)).date()
+                ev = self._sun_event(event, day)
+                if ev is None:
+                    continue
+                target = ev + offset
+                if target > now_local:
+                    offer(target, outs)
+                    break
+        self._offer_midnight_seams(
+            lambda now: self._sun_verdict(cond, now), now_local, offer, outs
+        )
+
+    def _sun_event_moment(self, event, offset_raw, today):
+        """Today's moment for a sun edge (event + offset), or None."""
+        if event not in ("sunrise", "sunset"):
+            return None
+        ev = self._sun_event(event, today)
+        if ev is None:
+            return None
+        return ev + self._parse_offset(offset_raw)
+
+    def _sun_verdict(self, cond: dict, now) -> bool:
+        """Sun-condition verdict at ``now`` — single source shared by
+        evaluation and wakeup-edge discovery (mirrors _time_window_verdict).
+
+        When both edges resolve and `after` lands after `before` on the same
+        day, the window spans midnight (e.g. sunset→sunrise night): true
+        from today's `after` through tomorrow's `before` — HA sun semantics
+        (WHA-F-037). Otherwise edges are plain bounds; single-sided forms
+        flip at the per-date boundary (`after` alone true from its event
+        until local midnight, `before` alone from midnight until its event).
+        """
+        today = now.date()
+        a_ev = self._sun_event_moment(
+            cond.get("after"), cond.get("after_offset", 0), today
+        )
+        b_ev = self._sun_event_moment(
+            cond.get("before"), cond.get("before_offset", 0), today
+        )
+        if a_ev is not None and b_ev is not None and a_ev > b_ev:
+            return now >= a_ev or now <= b_ev
+        ok = True
+        if a_ev is not None and now < a_ev:
+            ok = False
+        if b_ev is not None and now > b_ev:
+            ok = False
+        return ok
 
     # ------------------------------------------------------------------
     # Resolution / recursion
@@ -283,8 +437,57 @@ class ConditionEngine:
             # not (HA semantics): passes only when NO member is true.
             return not any(results)  # not
 
+        if ctype == "duration":
+            return await self._evaluate_duration(cond, path, visited, trace, out_id)
+        if ctype == "debounce":
+            return await self._evaluate_debounce(cond, path)
+
         raw = await self._evaluate_leaf(cond, ctype, path, out_id)
         return self._apply_for(cond, path, raw)
+
+    async def _evaluate_duration(
+        self,
+        cond: dict,
+        path: str,
+        visited: set[str],
+        trace: dict[str, bool] | None = None,
+        out_id: str | None = None,
+    ) -> bool:
+        """TON gate: start must hold for `seconds`; abort or a dropped
+        start resets the ledger. Timers are keyed by node id."""
+        key = cond.get("id") or path
+        start_met = await self._evaluate_id(
+            cond.get(CONF_START), visited, trace, out_id
+        )
+        abort_met = False
+        if cond.get(CONF_ABORT):
+            abort_met = await self._evaluate_id(
+                cond[CONF_ABORT], visited, trace, out_id
+            )
+        if not start_met or abort_met:
+            self._duration_timers.pop(key, None)
+            return False
+        seconds = float(cond.get(CONF_SECONDS, 0) or 0)
+        now = dt_util.utcnow()
+        started = self._duration_timers.get(key)
+        if started is None:
+            self._duration_timers[key] = now
+            return False
+        return (now - started).total_seconds() >= seconds
+
+    async def _evaluate_debounce(self, cond: dict, path: str) -> bool:
+        """Stateless: true once the entity has been quiet (no state change
+        at all) for `seconds`. Reads last_changed only."""
+        eid = cond.get(CONF_ENTITY_ID)
+        state = self.hass.states.get(eid)
+        if not state:
+            return False
+        last_changed = getattr(state, "last_changed", None)
+        if last_changed is None:
+            return False
+        seconds = float(cond.get(CONF_SECONDS, 0) or 0)
+        elapsed = (dt_util.utcnow() - dt_util.as_utc(last_changed)).total_seconds()
+        return elapsed >= seconds
 
     # ------------------------------------------------------------------
     # Leaf conditions
@@ -347,47 +550,10 @@ class ConditionEngine:
                 return False
 
         if ctype == "time":
-            now_local = dt_util.now()
-            weekdays = cond.get(CONF_WEEKDAYS)
-            if weekdays and _WEEKDAY_KEYS[now_local.weekday()] not in weekdays:
-                return False
-            at = cond.get(CONF_AT)
-            if at:
-                # Hit window: [at, at + 1 minute) local time (seconds honoured
-                # as the window start).
-                parts = [int(x) for x in at.split(":")]
-                target = now_local.replace(
-                    hour=parts[0], minute=parts[1],
-                    second=parts[2] if len(parts) > 2 else 0, microsecond=0,
-                )
-                delta = (now_local - target).total_seconds()
-                return 0 <= delta < 60
-            after = dt_util.parse_time(cond["after"]) if cond.get("after") else None
-            before = dt_util.parse_time(cond["before"]) if cond.get("before") else None
-            if after is not None and before is not None and after > before:
-                # Cross-midnight window (e.g. after 22:00, before 06:00).
-                return now_local.time() >= after or now_local.time() <= before
-            if after is not None and now_local.time() < after:
-                return False
-            return before is None or now_local.time() <= before
+            return self._time_window_verdict(cond, dt_util.now())
 
         if ctype == "sun":
-            now = dt_util.now()
-            today = now.date()
-            after = cond.get("after")
-            before = cond.get("before")
-            aoff = self._parse_offset(cond.get("after_offset", 0))
-            boff = self._parse_offset(cond.get("before_offset", 0))
-            ok = True
-            if after in ("sunrise", "sunset"):
-                ev = self._sun_event(after, today)
-                if ev and now < ev + aoff:
-                    ok = False
-            if before in ("sunrise", "sunset"):
-                ev = self._sun_event(before, today)
-                if ev and now > ev + boff:
-                    ok = False
-            return ok
+            return self._sun_verdict(cond, dt_util.now())
 
         if ctype == "cooldown":
             seconds = float(cond.get(CONF_SECONDS, 0))
