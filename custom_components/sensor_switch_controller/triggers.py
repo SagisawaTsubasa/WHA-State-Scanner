@@ -1,8 +1,9 @@
 """Trigger framework: registers the evaluation triggers of one controller.
 
 Every configured trigger funnels into ``on_fire``; the controller debounces
-those callbacks and runs one full evaluation. Semantics stay level-based —
-triggers only decide *when* to evaluate, never *what* the result is.
+those callbacks and runs one evaluation, directed to the outputs the firing
+trigger's routes reach (no routes → full sweep). Semantics stay level-based
+— triggers only decide *when* to evaluate, never *what* the result is.
 """
 
 from __future__ import annotations

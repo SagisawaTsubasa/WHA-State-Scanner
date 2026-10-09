@@ -6,12 +6,13 @@ controller debounces bursts, runs one level-based evaluation and —
 whenever a timer is running — schedules a precise wakeup at the exact
 moment a gate can flip on its own.
 
-Since 0.6.0 evaluation is *directed*: each trigger carries ``routes``
-(outputs + conditions wired on the canvas). A firing trigger only wakes
-the outputs it can reach (routes absent → legacy evaluate-everything;
-wired to nothing → wakes nothing). Timed wakeups (FOR/duration expiry,
-debounce quiet points, cooldown ends, time-range/sun edges) are directed
-too, via a precomputed condition→outputs reverse index.
+Since 0.6.0 evaluation is *directed*; since 0.7.0 triggers carry only
+``routes.conditions`` (the gates their canvas wires cover) and wake the
+outputs those chains reach — outputs are driven purely by condition
+chains (routes absent → legacy evaluate-everything; covering no gate →
+wakes nothing). Timed wakeups (FOR/duration expiry, debounce quiet
+points, cooldown ends, time-range/sun edges) are directed too, via a
+precomputed condition→outputs reverse index.
 """
 
 from __future__ import annotations
@@ -195,9 +196,10 @@ class ControllerManager:
 
         Reachability follows the graph the wires describe: output chains
         (on/off), group members, and duration start/abort inputs. A trigger
-        with ``routes`` wakes exactly its listed outputs plus everything its
-        listed conditions can reach; a trigger without ``routes`` (legacy
-        config) flips the whole controller into evaluate-everything mode.
+        with ``routes`` wakes the outputs its covered conditions can reach
+        (routes carry conditions only — triggers never wire outputs
+        directly); a trigger without ``routes`` (legacy config) flips the
+        whole controller into evaluate-everything mode.
         """
         cond_by_id = {
             c["id"]: c
@@ -242,7 +244,10 @@ class ControllerManager:
             if routes is None:
                 legacy = True
                 continue
-            targets = set(routes.get("outputs") or [])
+            # 0.7.0: signals flow through the condition graph only — a
+            # trigger's targets are the outputs its covered conditions can
+            # reach (direct output wiring was removed with v4 storage).
+            targets = set()
             for cid in routes.get("conditions") or []:
                 targets |= cond_to_outs.get(cid) or set()
             if trg_id:

@@ -8,7 +8,7 @@ ENTRY_TITLE = "HA 全屋状态扫描"
 # Storage (single config entry, all controllers in one Store)
 # ------------------------------------------------------------------
 STORE_KEY = DOMAIN
-STORE_VERSION = 3
+STORE_VERSION = 4
 CONF_CONTROLLERS = "controllers"
 CTRL_ID_PREFIX = "ctrl_"
 

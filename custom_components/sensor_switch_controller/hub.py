@@ -6,6 +6,7 @@ web API keeps answering (with torn-down runtime) while the entry reloads.
 
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 
@@ -42,6 +43,68 @@ def _for_seconds(for_cfg) -> int:
         )
     except (TypeError, ValueError):
         return 0
+
+
+def _covered_condition_ids(conditions: list, outputs: list, out_ids: list[str]) -> set[str]:
+    """All condition ids reachable from the given outputs' chains: on/off
+    members, group members (recursive) and duration start/abort inputs.
+    ``conditions`` builds the id table, ``outputs`` provides the seeds."""
+    by_id = {
+        c.get("id"): c
+        for c in conditions
+        if isinstance(c, dict) and isinstance(c.get("id"), str)
+    }
+    stack: list[str] = []
+    for o in outputs:
+        if not isinstance(o, dict) or o.get("entity_id") not in out_ids:
+            continue
+        stack.extend(o.get("on_conditions") or [])
+        stack.extend(o.get("off_conditions") or [])
+    seen: set[str] = set()
+    while stack:
+        cid = stack.pop()
+        if cid in seen:
+            continue
+        seen.add(cid)
+        cond = by_id.get(cid)
+        if not cond:
+            continue
+        stack.extend(cond.get("conditions") or [])
+        if isinstance(cond.get("start"), str):
+            stack.append(cond["start"])
+        if isinstance(cond.get("abort"), str):
+            stack.append(cond["abort"])
+    return seen
+
+
+def _migrate_controller_v4(cfg: dict) -> dict:
+    """v3→v4: triggers stop wiring outputs directly.
+
+    Each trigger's signal coverage becomes the union of the condition
+    chains of its previously wired outputs, materialized into
+    routes.conditions — legacy configs evaluate exactly as before, and
+    from now on evaluation scope flows through the condition graph only.
+    """
+    triggers = cfg.get(CONF_TRIGGERS)
+    conditions = cfg.get("conditions") or []
+    if not isinstance(triggers, list):
+        return cfg
+    for trg in triggers:
+        if not isinstance(trg, dict):
+            continue
+        routes = trg.get(CONF_ROUTES)
+        if not isinstance(routes, dict):
+            continue
+        old_outs = [x for x in (routes.get("outputs") or []) if isinstance(x, str)]
+        covered = (
+            _covered_condition_ids(conditions, cfg.get("outputs") or [], old_outs)
+            if old_outs
+            else set()
+        )
+        merged = {c for c in (routes.get("conditions") or []) if isinstance(c, str)}
+        merged |= covered
+        trg[CONF_ROUTES] = {"conditions": sorted(merged)}
+    return cfg
 
 
 def _migrate_controller_v2(cfg: dict) -> dict:
@@ -125,14 +188,18 @@ def _migrate_controller_v2(cfg: dict) -> dict:
             out_ids.append(oid)
         for trg in triggers:
             if isinstance(trg, dict):
-                trg.setdefault(
-                    CONF_ROUTES, {"outputs": list(out_ids), "conditions": []}
-                )
+                # v2 materializes full coverage; the conditions list is what
+                # v4 keeps (the outputs key is dropped when the v4 step runs).
+                trg.setdefault(CONF_ROUTES, {"outputs": list(out_ids), "conditions": [
+                    c.get("id")
+                    for c in cfg.get("conditions") or []
+                    if isinstance(c, dict) and isinstance(c.get("id"), str)
+                ]})
     return cfg
 
 
 class _MigratingStore(Store):
-    """Store with the v2→v3 migration wired in.
+    """Store with the v2→v4 / v3→v4 migrations wired in.
 
     ``Store`` has no ``migrate_func=`` constructor argument; a subclass
     overrides ``_async_migrate_func(old_major_version, old_data)`` and
@@ -144,12 +211,21 @@ class _MigratingStore(Store):
             return old_data
         raw = (old_data or {}).get(CONF_CONTROLLERS)
         if isinstance(raw, dict):
+            steps = {
+                2: (_migrate_controller_v2, _migrate_controller_v4),
+                3: (_migrate_controller_v4,),
+            }
+            chain = steps.get(old_major_version, ())
             for cid, cfg in raw.items():
                 if not isinstance(cfg, dict):
                     continue
                 try:
-                    raw[cid] = _migrate_controller_v2(cfg)
+                    migrated = copy.deepcopy(cfg)
+                    for step in chain:
+                        migrated = step(migrated)
+                    raw[cid] = migrated
                 except Exception:
+                    # keep the ORIGINAL untouched object, as advertised
                     _LOGGER.exception(
                         "Failed migrating controller %s; kept as-is", cid
                     )

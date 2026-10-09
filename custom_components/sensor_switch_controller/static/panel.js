@@ -63,7 +63,7 @@ const LANG = {
     outSwitch: "开关输出",
     outBinary: "二进制传感器",
     paletteHint: "点选添加节点；从节点右侧圆点拖线到目标输入端口。",
-    canvasHint: "⚡触发器是信号源：信号线（琥珀）拉到门/输出底部的信号口；灰蓝线组成判定门；点节点编辑参数。",
+    canvasHint: "⚡触发器信号线（琥珀）拉到条件的「信号」口开始评估流程；结果只由条件链（灰蓝）决定；点节点编辑参数。",
     inspectorEmpty: "点击画布上的节点编辑参数。",
     entity: "实体",
     label: "标签",
@@ -122,9 +122,10 @@ const LANG = {
     debounceEntity: "静默实体",
     wiredStart: "开始（由连线决定）",
     wiredAbort: "中止（可选，由连线决定）",
-    conditionSink3: "信号口：触发器连线直达（input_3）",
-    trgRoutesLabel: "路由（由信号线决定）",
-    badConnection: "连线被拒：琥珀信号线从触发器拖到带「信号」字的口；条件线连「成员/开始/中止/满足则开/满足则关」口。",
+    conditionSink3: "信号口：触发器信号线连到这里（触发器不直连输出）",
+    trgRoutesLabel: "信号覆盖条件（由信号线决定）",
+    trgLegacyLabel: "遗留触发器：全量评估（保存并连线后改为定向）",
+    badConnection: "连线被拒：琥珀信号线从触发器拖到条件的「信号」口；输出只有「满足则开/满足则关」两个口，由条件链决定。",
     portSignal: "信号",
     portOn: "满足则开",
     portOff: "满足则关",
@@ -194,7 +195,7 @@ const LANG = {
     outSwitch: "Switch output",
     outBinary: "Binary sensor",
     paletteHint: "Click to add nodes; drag from the right dot to a target input port.",
-    canvasHint: "⚡Triggers are signal sources: amber signal wires go to the bottom signal port of gates/outputs; blue wires build gates; click a node to edit it.",
+    canvasHint: "⚡Trigger signal wires (amber) land on a condition's signal port to start evaluation; results come from the condition chains (blue) alone; click a node to edit it.",
     inspectorEmpty: "Click a node on the canvas to edit it.",
     entity: "Entity",
     label: "Label",
@@ -253,9 +254,10 @@ const LANG = {
     debounceEntity: "Quiet entity",
     wiredStart: "Start (wired)",
     wiredAbort: "Abort (optional, wired)",
-    conditionSink3: "Signal port: direct trigger wires (input_3)",
-    trgRoutesLabel: "Routes (from signal wires)",
-    badConnection: "Wire rejected: amber signal wires go from a trigger to the port labelled signal; gate wires go to the ports labelled members/start/abort/met → on/met → off.",
+    conditionSink3: "Signal port: trigger wires land here (triggers do not wire to outputs)",
+    trgRoutesLabel: "Covered conditions (from signal wires)",
+    trgLegacyLabel: "Legacy trigger: full sweep (wire it up and save to go directed)",
+    badConnection: "Wire rejected: amber signal wires go from a trigger to a condition's signal port; outputs expose only met → on / met → off, driven by their condition chains.",
     portSignal: "signal",
     portOn: "met → on",
     portOff: "met → off",
@@ -782,6 +784,12 @@ class ScannerPanel extends HTMLElement {
       nodeToOut: new Map(),
       outToNode: new Map(),
       nodeToTrg: new Map(),
+      // triggers that loaded WITHOUT routes keep their legacy
+      // evaluate-everything semantics across canvas saves (WHA-F-070/071);
+      // triggers created this session are NOT in this set
+      legacyTrgIds: new Set((config.triggers || [])
+        .filter((x) => x.routes === undefined)
+        .map((x) => x.id)),
       selected: null,
       trial: null,
     };
@@ -882,7 +890,7 @@ class ScannerPanel extends HTMLElement {
 
   static _PORT_LABELS = {
     trigger: { output_1: "portSignal" },
-    output: { input_1: "portOn", input_2: "portOff", input_3: "portSignal" },
+    output: { input_1: "portOn", input_2: "portOff" },
     duration: { input_1: "portStart", input_2: "portAbort", input_3: "portSignal", output_1: "portOut" },
     group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
     leaf: { input_3: "portSignal", output_1: "portOut" },
@@ -1055,7 +1063,9 @@ class ScannerPanel extends HTMLElement {
 
   _addTriggerNode(type) {
     const ed = this._editor;
-    const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true };
+    // born directed: an empty coverage means "wake nothing until wired"
+    // (only loaded-as-legacy triggers keep the absent-routes semantics)
+    const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true, routes: { conditions: [] } };
     if (type === "time") t.every_seconds = 300;
     if (type === "sun") t.event = "sunrise";
     if (type === "state") t.entity_id = "";
@@ -1111,6 +1121,7 @@ class ScannerPanel extends HTMLElement {
   }
 
   _triggerInspectorHtml(t) {
+    const ed = this._editor;
     // numeric limits mirror schema.py (EVERY_SECONDS 10..86400, SUN_OFFSET ±86400)
     const NUM_LIMITS = {
       every_seconds: ' min="10" max="86400"',
@@ -1145,7 +1156,9 @@ class ScannerPanel extends HTMLElement {
     return `
       <label class="field field-inline"><input type="checkbox" data-trgsk="enabled" ${t.enabled !== false ? "checked" : ""}> ${esc(this.tr("enabledLabel"))}</label>
       ${fields}
-      <p class="wha-sub">${esc(this.tr("trgRoutesLabel"))}: ${(t.routes?.outputs || []).length} / ${(t.routes?.conditions || []).length}</p>
+      ${ed.legacyTrgIds.has(t.id)
+        ? `<p class="wha-sub">${esc(this.tr("trgLegacyLabel"))}</p>`
+        : `<p class="wha-sub">${esc(this.tr("trgRoutesLabel"))}: ${(t.routes?.conditions || []).length}</p>`}
       <p class="wha-sub">${esc(t.id)}</p>`;
   }
 
@@ -1173,11 +1186,13 @@ class ScannerPanel extends HTMLElement {
       }
       ed.dirty = true;
       this._styleConnections();
+      this._syncTrgRoutesFromWires();
     });
     df.on("connectionRemoved", () => {
       if (!ed.importing) {
         ed.dirty = true;
         this._styleConnections();
+        this._syncTrgRoutesFromWires();
       }
     });
     df.on("nodeRemoved", (nodeId) => {
@@ -1212,10 +1227,6 @@ class ScannerPanel extends HTMLElement {
         ed.nodeToOut.delete(n);
         ed.outToNode.delete(outId);
         ed.controller.outputs = ed.controller.outputs.filter((o) => o.entity_id !== outId);
-        for (const t of ed.controller.triggers || []) {
-          if (!t.routes) continue;
-          t.routes.outputs = (t.routes.outputs || []).filter((m) => m !== outId);
-        }
       }
       ed.dirty = true;
     });
@@ -1263,14 +1274,10 @@ class ScannerPanel extends HTMLElement {
         if (mid) df.addConnection(String(mid), String(oid), "output_1", "input_2");
       }
     }
-    // signal wires: trigger routes → output/condition signal ports
+    // signal wires: trigger routes → condition signal ports
     for (const trg of ed.controller.triggers || []) {
       const srcNode = trgNodeById.get(trg.id);
       if (srcNode === undefined) continue;
-      for (const oid of trg.routes?.outputs || []) {
-        const dst = ed.outToNode.get(oid);
-        if (dst) df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
-      }
       for (const cid of trg.routes?.conditions || []) {
         const dst = ed.condToNode.get(cid);
         if (dst) df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
@@ -1280,9 +1287,36 @@ class ScannerPanel extends HTMLElement {
     this._styleConnections();
   }
 
+  _syncTrgRoutesFromWires() {
+    // keep trigger routes in step with the wires while editing, so the
+    // inspector's coverage count is live rather than save-lagged
+    const ed = this._editor;
+    if (!ed.df || ed.importing) return;
+    const data = ed.df.export()?.drawflow?.Home?.data || {};
+    for (const trg of ed.controller.triggers || []) {
+      let srcNode = null;
+      for (const [nid, tid] of ed.nodeToTrg) {
+        if (tid === trg.id) {
+          srcNode = nid;
+          break;
+        }
+      }
+      if (trg.routes === undefined) continue; // legacy: stays absent until saved
+      const conns =
+        srcNode !== null
+          ? data[String(srcNode)]?.outputs?.output_1?.connections || []
+          : [];
+      trg.routes = {
+        conditions: conns
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean),
+      };
+    }
+  }
+
   _connectionAllowed(e) {
     // Wire legality: signal wires only from a trigger output into input_3
-    // of a gate/output; gate wires only from a condition into input_1/2.
+    // of a condition gate; gate wires only from a condition into input_1/2.
     const ed = this._editor;
     const srcIsTrg = ed.nodeToTrg.has(Number(e.output_id));
     const srcIsCond = ed.nodeToCond.has(Number(e.output_id));
@@ -1290,7 +1324,9 @@ class ScannerPanel extends HTMLElement {
     const dstIsCond = ed.nodeToCond.has(Number(e.input_id));
     const dstIsOut = ed.nodeToOut.has(Number(e.input_id));
     if (srcIsTrg) {
-      return !dstIsTrg && e.input_class === "input_3";
+      // 0.7.0: signals start evaluation through condition gates only —
+      // outputs expose just the on/off verdict ports, no signal input.
+      return dstIsCond && e.input_class === "input_3";
     }
     if (srcIsCond) {
       if (dstIsTrg) return false;
@@ -1402,7 +1438,7 @@ class ScannerPanel extends HTMLElement {
     const ed = this._editor;
     const nodeId = ed.df.addNode(
       "output",
-      3,
+      2,
       0,
       x,
       y,
@@ -1761,7 +1797,10 @@ class ScannerPanel extends HTMLElement {
       out.on_conditions = nid ? nodeRefs(nid, "input_1") : [];
       out.off_conditions = nid ? nodeRefs(nid, "input_2") : [];
     }
-    // trigger routes from signal wires leaving each trigger node
+    // trigger routes from signal wires leaving each trigger node. A legacy
+    // trigger (no routes key: evaluate-everything) that has no signal wires
+    // keeps its routes absent — saving the canvas must not silently demote
+    // it to "wake nothing" (WHA-F-070).
     for (const trg of ed.controller.triggers || []) {
       let srcNode = null;
       for (const [nid, tid] of ed.nodeToTrg) {
@@ -1770,17 +1809,24 @@ class ScannerPanel extends HTMLElement {
           break;
         }
       }
-      const routes = { outputs: [], conditions: [] };
-      if (srcNode !== null) {
-        const conns =
-          data[String(srcNode)]?.outputs?.output_1?.connections || [];
-        for (const c of conns) {
-          const dstId = Number(c.node);
-          if (ed.nodeToOut.has(dstId)) {
-            routes.outputs.push(ed.nodeToOut.get(dstId));
-          } else if (ed.nodeToCond.has(dstId)) {
-            routes.conditions.push(ed.nodeToCond.get(dstId));
-          }
+      const conns =
+        srcNode !== null
+          ? data[String(srcNode)]?.outputs?.output_1?.connections || []
+          : [];
+      if (
+        trg.routes === undefined &&
+        conns.length === 0 &&
+        ed.legacyTrgIds.has(trg.id)
+      ) {
+        // loaded as legacy (evaluate-everything), still unwired: keep the
+        // routes key absent so saving never demotes the semantics
+        continue;
+      }
+      const routes = { conditions: [] };
+      for (const c of conns) {
+        const dstId = Number(c.node);
+        if (ed.nodeToCond.has(dstId)) {
+          routes.conditions.push(ed.nodeToCond.get(dstId));
         }
       }
       trg.routes = routes;

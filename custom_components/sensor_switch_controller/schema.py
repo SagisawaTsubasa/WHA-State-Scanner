@@ -6,9 +6,11 @@ schema: sensors / conditions / outputs lists with ``cond_<hex>`` ids and
 ``triggers`` replaces the global ``scan_interval`` (old configs map their
 interval to a time trigger on load). Since 0.6.0 triggers carry optional
 ``routes`` (directed evaluation: absent → legacy evaluate-everything,
-present → exactly the listed outputs and conditions) and two new leaf
-conditions exist: ``duration`` (TON gate with start/abort inputs) and
-``debounce`` (true once the entity has been quiet for N seconds).
+present → the outputs reachable from the covered conditions) and two new
+leaf conditions exist: ``duration`` (TON gate with start/abort inputs)
+and ``debounce`` (true once the entity has been quiet for N seconds).
+Since 0.7.0 routes carry conditions only — triggers never wire outputs
+directly (an ``outputs`` key in routes is rejected).
 """
 
 from __future__ import annotations
@@ -201,8 +203,9 @@ def validate_trigger(trg) -> dict:
     A well-formed caller-supplied ``id`` is preserved so canvas wires
     (trigger routes) survive save/reload round-trips; only a missing or
     malformed id gets a fresh one. ``routes`` is optional: present means
-    directed routing (evaluate exactly the listed outputs + conditions),
-    absent means legacy behaviour (evaluate everything).
+    directed routing (evaluate the outputs reachable from the covered
+    conditions — routes carry conditions only), absent means legacy
+    behaviour (evaluate everything).
     """
     if not isinstance(trg, dict):
         _fail("触发器必须是对象")
@@ -227,6 +230,11 @@ def validate_trigger(trg) -> dict:
     if routes is not None:
         if not isinstance(routes, dict):
             _fail("触发器的 routes 必须是对象")
+        if "outputs" in routes:
+            _fail(
+                "触发器不再直连输出：信号线请连到条件，"
+                "输出只由条件链决定"
+            )
         result[CONF_ROUTES] = _validate_routes(routes)
 
     if ttype == TRG_STATE:
@@ -290,10 +298,10 @@ def validate_trigger(trg) -> dict:
 
 
 def _validate_routes(routes: dict) -> dict:
-    """Normalize trigger routes: {outputs: [out_id], conditions: [cond_id]}."""
+    """Normalize trigger routes: {conditions: [cond_id]} (0.7.0: triggers
+    start evaluation, they no longer wire straight to outputs)."""
     validated: dict[str, list[str]] = {}
     for key, pattern, name in (
-        ("outputs", _OUT_ID_RE, "输出"),
         ("conditions", _COND_ID_RE, "条件"),
     ):
         members = routes.get(key) or []
@@ -642,9 +650,6 @@ def _check_graph(
         if not routes:
             continue
         label = trg.get("label") or trg.get("id") or "?"
-        for member in routes.get("outputs", []):
-            if member not in seen_out:
-                _fail(f"触发器「{label}」的路由引用了不存在的输出：{member}")
         for member in routes.get("conditions", []):
             if member not in by_id:
                 _fail(f"触发器「{label}」的路由引用了不存在的条件：{member}")
