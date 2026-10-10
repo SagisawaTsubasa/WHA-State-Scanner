@@ -122,10 +122,10 @@ const LANG = {
     debounceEntity: "静默实体",
     wiredStart: "开始（由连线决定）",
     wiredAbort: "中止（可选，由连线决定）",
-    conditionSink3: "信号口：触发器信号线连到这里（触发器不直连输出）",
+    conditionSink3: "信号口：触发器信号线连到这里（仅普通条件有；组/持续/输出没有）",
     trgRoutesLabel: "信号覆盖条件（由信号线决定）",
     trgLegacyLabel: "遗留触发器：全量评估（保存并连线后改为定向）",
-    badConnection: "连线被拒：琥珀信号线从触发器拖到条件的「信号」口；输出只有「满足则开/满足则关」两个口，由条件链决定。",
+    badConnection: "连线被拒：琥珀信号线从触发器拖到具体条件（数值/状态/时间等）的「信号」口；AND/OR/NOT 与持续不是信号起点，输出只有「满足则开/满足则关」两口。",
     portSignal: "信号",
     portOn: "满足则开",
     portOff: "满足则关",
@@ -254,10 +254,10 @@ const LANG = {
     debounceEntity: "Quiet entity",
     wiredStart: "Start (wired)",
     wiredAbort: "Abort (optional, wired)",
-    conditionSink3: "Signal port: trigger wires land here (triggers do not wire to outputs)",
+    conditionSink3: "Signal port: trigger wires land here (plain conditions only; groups/duration/outputs have none)",
     trgRoutesLabel: "Covered conditions (from signal wires)",
     trgLegacyLabel: "Legacy trigger: full sweep (wire it up and save to go directed)",
-    badConnection: "Wire rejected: amber signal wires go from a trigger to a condition's signal port; outputs expose only met → on / met → off, driven by their condition chains.",
+    badConnection: "Wire rejected: amber signal wires go from a trigger to a plain condition's signal port (numeric/state/time/...); AND/OR/NOT and duration gates are not signal origins; outputs expose only met → on / met → off.",
     portSignal: "signal",
     portOn: "met → on",
     portOff: "met → off",
@@ -891,8 +891,8 @@ class ScannerPanel extends HTMLElement {
   static _PORT_LABELS = {
     trigger: { output_1: "portSignal" },
     output: { input_1: "portOn", input_2: "portOff" },
-    duration: { input_1: "portStart", input_2: "portAbort", input_3: "portSignal", output_1: "portOut" },
-    group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
+    duration: { input_1: "portStart", input_2: "portAbort", output_1: "portOut" },
+    group: { input_1: "portMembers", output_1: "portOut" },
     leaf: { input_3: "portSignal", output_1: "portOut" },
   };
 
@@ -1324,9 +1324,14 @@ class ScannerPanel extends HTMLElement {
     const dstIsCond = ed.nodeToCond.has(Number(e.input_id));
     const dstIsOut = ed.nodeToOut.has(Number(e.input_id));
     if (srcIsTrg) {
-      // 0.7.0: signals start evaluation through condition gates only —
-      // outputs expose just the on/off verdict ports, no signal input.
-      return dstIsCond && e.input_class === "input_3";
+      // 0.7.0: signals start evaluation through conditions only; 0.7.1:
+      // gates (and/or/not, duration) are not signal origins either — only
+      // plain leaves carry the signal port.
+      if (!dstIsCond || e.input_class !== "input_3") return false;
+      const dst = ed.controller.conditions.find(
+        (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
+      );
+      return !!dst && !isGroupType(dst.type) && dst.type !== "duration";
     }
     if (srcIsCond) {
       if (dstIsTrg) return false;
@@ -1413,15 +1418,16 @@ class ScannerPanel extends HTMLElement {
 
   _dfAddCondNode(cond, y) {
     const ed = this._editor;
-    // Port model (0.6.0): every gate carries input_1 (gate input; the abort
-    // input on duration), input_3 (signal port for trigger wires) and one
-    // output. input_2 exists only on duration (abort) — hidden by CSS on
-    // the rest. Duration sits in the leaf column like other leaves.
+    // Port model (0.7.1): only plain leaves carry the trigger signal port
+    // (input_3). Groups take just the members input; duration takes
+    // start (input_1) + abort (input_2). Gates are not signal origins.
+    const isGroup = isGroupType(cond.type);
+    const inputs = cond.type === "duration" ? 2 : isGroup ? 1 : 3;
     const nodeId = ed.df.addNode(
       cond.type,
-      3,
+      inputs,
       1,
-      isGroupType(cond.type) ? 560 : 280,
+      isGroup ? 560 : 280,
       y,
       `wha-node cond-node cond-${cond.type}`,
       { condId: cond.id },

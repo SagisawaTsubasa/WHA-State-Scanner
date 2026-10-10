@@ -348,13 +348,6 @@ details.wha-json pre {
 .parent-drawflow .drawflow .wha-node.cond-not .input_1 {
   background: #64748b;
 }
-/* groups keep input_1 (members) but their input_2 is a dead port too */
-.parent-drawflow .drawflow .wha-node.cond-and .input_2,
-.parent-drawflow .drawflow .wha-node.cond-or .input_2,
-.parent-drawflow .drawflow .wha-node.cond-not .input_2 {
-  display: none;
-}
-
 /* plain leaves have no gate-input semantics - hide the dead ports */
 .parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_1,
 .parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_2 {
