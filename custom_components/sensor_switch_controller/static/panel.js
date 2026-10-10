@@ -122,10 +122,10 @@ const LANG = {
     debounceEntity: "静默实体",
     wiredStart: "开始（由连线决定）",
     wiredAbort: "中止（可选，由连线决定）",
-    conditionSink3: "信号口：触发器信号线连到这里（仅普通条件有；组/持续/输出没有）",
+    conditionSink3: "信号口：触发器信号线连到这里（普通条件与逻辑组有；持续/输出没有；组上与成员口互斥）",
     trgRoutesLabel: "信号覆盖条件（由信号线决定）",
     trgLegacyLabel: "遗留触发器：全量评估（保存并连线后改为定向）",
-    badConnection: "连线被拒：琥珀信号线从触发器拖到具体条件（数值/状态/时间等）的「信号」口；AND/OR/NOT 与持续不是信号起点，输出只有「满足则开/满足则关」两口。",
+    badConnection: "连线被拒：琥珀信号线从触发器拖到条件或逻辑组的「信号」口；持续与输出没有信号口。",
     portSignal: "信号",
     portOn: "满足则开",
     portOff: "满足则关",
@@ -133,6 +133,11 @@ const LANG = {
     portAbort: "中止",
     portMembers: "成员",
     portOut: "出",
+    logicGroups: "逻辑组",
+    logicGroupHint: "把多条条件合并成一个判定；先搭成员，再接触发器信号直达（信号连上后成员口冻结）",
+    trgGateMutexMembers: "该组已被信号直达（冻结）：先删除信号线才能改成员",
+    trgGateNeedsMembers: "该组还没有成员：先从条件拉成员线到「成员」口，再接触发器信号",
+    emptyGroupCut: "信号直达已断开（组内成员被清空）：重新搭好成员后再接触发器信号。组:",
     weekdaysLabel: "星期几",
     byLabel: "触发来源",
     enabledLabel: "启用",
@@ -254,10 +259,10 @@ const LANG = {
     debounceEntity: "Quiet entity",
     wiredStart: "Start (wired)",
     wiredAbort: "Abort (optional, wired)",
-    conditionSink3: "Signal port: trigger wires land here (plain conditions only; groups/duration/outputs have none)",
+    conditionSink3: "Signal port: trigger wires land here (plain conditions and logic groups; not duration/outputs; exclusive with the members port on groups)",
     trgRoutesLabel: "Covered conditions (from signal wires)",
     trgLegacyLabel: "Legacy trigger: full sweep (wire it up and save to go directed)",
-    badConnection: "Wire rejected: amber signal wires go from a trigger to a plain condition's signal port (numeric/state/time/...); AND/OR/NOT and duration gates are not signal origins; outputs expose only met → on / met → off.",
+    badConnection: "Wire rejected: amber signal wires go from a trigger to the signal port of a condition or logic group; duration and outputs have no signal port.",
     portSignal: "signal",
     portOn: "met → on",
     portOff: "met → off",
@@ -265,6 +270,11 @@ const LANG = {
     portAbort: "abort",
     portMembers: "members",
     portOut: "out",
+    logicGroups: "Logic groups",
+    logicGroupHint: "Merge conditions into one verdict; wire members first, then attach the trigger signal (signal wiring freezes the members port)",
+    trgGateMutexMembers: "This group is signal-wired (frozen): remove the signal wire before editing members",
+    trgGateNeedsMembers: "This group has no members yet: wire conditions into its members port first, then attach the trigger signal",
+    emptyGroupCut: "Signal wiring cut (group members were emptied): rebuild members before re-attaching the trigger. Group:",
     weekdaysLabel: "Weekdays",
     byLabel: "By",
     enabledLabel: "Enabled",
@@ -784,6 +794,7 @@ class ScannerPanel extends HTMLElement {
       nodeToOut: new Map(),
       outToNode: new Map(),
       nodeToTrg: new Map(),
+      portWireCount: new Map(), // "nodeId:portClass" -> wire count
       // triggers that loaded WITHOUT routes keep their legacy
       // evaluate-everything semantics across canvas saves (WHA-F-070/071);
       // triggers created this session are NOT in this set
@@ -818,7 +829,12 @@ class ScannerPanel extends HTMLElement {
               .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "and", "or", "not"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce"]
+              .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
+              .join("")}
+            <h3>${esc(this.tr("logicGroups"))}</h3>
+            <p class="wha-sub" style="margin:0 0 6px">${esc(this.tr("logicGroupHint"))}</p>
+            ${["and", "or", "not"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addOutput"))}</h3>
@@ -892,7 +908,7 @@ class ScannerPanel extends HTMLElement {
     trigger: { output_1: "portSignal" },
     output: { input_1: "portOn", input_2: "portOff" },
     duration: { input_1: "portStart", input_2: "portAbort", output_1: "portOut" },
-    group: { input_1: "portMembers", output_1: "portOut" },
+    group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
     leaf: { input_3: "portSignal", output_1: "portOut" },
   };
 
@@ -917,6 +933,87 @@ class ScannerPanel extends HTMLElement {
       span.textContent = this.tr(key);
       portEl.appendChild(span);
     }
+  }
+
+  _rebuildPortWireCount() {
+    const ed = this._editor;
+    if (!ed.df) return;
+    ed.portWireCount = new Map();
+    const data = ed.df.export()?.drawflow?.Home?.data || {};
+    for (const node of Object.values(data)) {
+      const nid = Number(node?.id);
+      if (!Number.isFinite(nid)) continue;
+      for (const [port, def] of Object.entries(node.inputs || {})) {
+        for (const c of def?.connections || []) {
+          this._bumpPortCount(nid, port, 1);
+          void c;
+        }
+      }
+      for (const [port, def] of Object.entries(node.outputs || {})) {
+        for (const c of def?.connections || []) {
+          this._bumpPortCount(nid, port, 1);
+          void c;
+        }
+      }
+    }
+    for (const [nid] of ed.nodeToCond) {
+      this._updateGroupPortState(nid);
+    }
+  }
+
+  _bumpPortCount(nodeId, portClass, delta) {
+    const ed = this._editor;
+    if (!ed.portWireCount) ed.portWireCount = new Map();
+    const key = `${nodeId}:${portClass}`;
+    const next = (ed.portWireCount.get(key) || 0) + delta;
+    if (next > 0) ed.portWireCount.set(key, next);
+    else ed.portWireCount.delete(key);
+  }
+
+  _groupExclusiveWired(nodeId, portClass) {
+    // true when the OPPOSITE port of a group node already carries wires
+    const opposite = portClass === "input_3" ? "input_1" : "input_3";
+    const ed = this._editor;
+    return (ed.portWireCount?.get(`${nodeId}:${opposite}`) || 0) > 0;
+  }
+
+  _updateGroupPortState(nodeId) {
+    // Logic groups: "members first, signal freezes". Wiring the signal
+    // port hides (freezes) the members port until the signal wire goes
+    // away; a member-less group dims its signal port (still refused).
+    const ed = this._editor;
+    const condId = ed?.nodeToCond?.get(nodeId);
+    if (!condId) return;
+    const cond = ed.controller.conditions.find((c) => c.id === condId);
+    if (!cond || !isGroupType(cond.type)) return;
+    const el = ed.df?.container?.querySelector(`#node-${nodeId}`);
+    if (!el) return;
+    const signal = (ed.portWireCount?.get(`${nodeId}:input_3`) || 0) > 0;
+    const members = (ed.portWireCount?.get(`${nodeId}:input_1`) || 0) > 0;
+    el.classList.toggle("gate-has-signal", signal);
+    el.classList.toggle("gate-no-members", !members);
+  }
+
+  _rejectReason(e) {
+    const ed = this._editor;
+    const condId = ed?.nodeToCond?.get(Number(e.input_id));
+    if (!condId) return null;
+    const cond = ed.controller.conditions.find((c) => c.id === condId);
+    if (!cond || !isGroupType(cond.type)) return null;
+    if (e.input_class !== "input_3") return null; // wrong-port → generic copy
+    const hasMembers =
+      (ed.portWireCount?.get(`${Number(e.input_id)}:input_1`) || 0) > 0;
+    const signalWired =
+      (ed.portWireCount?.get(`${Number(e.input_id)}:input_3`) || 0) > 0;
+    if (ed.nodeToTrg.has(Number(e.output_id)) && !hasMembers) {
+      // trigger to a member-less group's signal port
+      return this.tr("trgGateNeedsMembers");
+    }
+    if (signalWired && !ed.nodeToTrg.has(Number(e.output_id))) {
+      // condition wire onto a signal-frozen group
+      return this.tr("trgGateMutexMembers");
+    }
+    return null;
   }
 
   async _getEntityPickerClass() {
@@ -1172,8 +1269,14 @@ class ScannerPanel extends HTMLElement {
     ed.importing = true;
     df.on("nodeSelected", (nodeId) => this._selectNode(Number(nodeId)));
     df.on("connectionCreated", (e) => {
+      this._bumpPortCount(Number(e.output_id), e.output_class, 1);
+      this._bumpPortCount(Number(e.input_id), e.input_class, 1);
+      this._updateGroupPortState(Number(e.input_id));
+      this._updateGroupPortState(Number(e.output_id));
       if (ed.importing) return;
       if (!this._connectionAllowed(e)) {
+        // removeSingleConnection re-fires connectionRemoved, which rolls
+        // the counters back
         try {
           df.removeSingleConnection(
             String(e.output_id), String(e.input_id), e.output_class, e.input_class
@@ -1181,18 +1284,23 @@ class ScannerPanel extends HTMLElement {
         } catch {
           /* already refused by the canvas */
         }
-        this.toast(this.tr("badConnection"), true);
+        this.toast(this._rejectReason(e) || this.tr("badConnection"), true);
         return;
       }
       ed.dirty = true;
       this._styleConnections();
-      this._syncTrgRoutesFromWires();
+      this._syncFromWires();
     });
-    df.on("connectionRemoved", () => {
+    df.on("connectionRemoved", (e) => {
+      this._bumpPortCount(Number(e.output_id), e.output_class, -1);
+      this._bumpPortCount(Number(e.input_id), e.input_class, -1);
+      this._updateGroupPortState(Number(e.input_id));
+      this._updateGroupPortState(Number(e.output_id));
       if (!ed.importing) {
         ed.dirty = true;
         this._styleConnections();
-        this._syncTrgRoutesFromWires();
+        this._syncFromWires();
+        this._cutEmptySignalGroups();
       }
     });
     df.on("nodeRemoved", (nodeId) => {
@@ -1228,6 +1336,11 @@ class ScannerPanel extends HTMLElement {
         ed.outToNode.delete(outId);
         ed.controller.outputs = ed.controller.outputs.filter((o) => o.entity_id !== outId);
       }
+      // vendor may not per-wire dispatch connectionRemoved on node removal
+      // — rebuild the counters from the drawflow data (WHA-F-087)
+      this._rebuildPortWireCount();
+      this._cutEmptySignalGroups();
+      this._syncFromWires();
       ed.dirty = true;
     });
 
@@ -1280,16 +1393,22 @@ class ScannerPanel extends HTMLElement {
       if (srcNode === undefined) continue;
       for (const cid of trg.routes?.conditions || []) {
         const dst = ed.condToNode.get(cid);
-        if (dst) df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
+        if (dst === undefined) continue;
+        const dstCond = ed.controller.conditions.find((c) => c.id === cid);
+        if (dstCond?.type === "duration") continue; // duration has no input_3
+        df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
       }
     }
     ed.importing = false;
+    for (const [nid] of ed.nodeToCond) {
+      this._updateGroupPortState(nid);
+    }
     this._styleConnections();
   }
 
-  _syncTrgRoutesFromWires() {
-    // keep trigger routes in step with the wires while editing, so the
-    // inspector's coverage count is live rather than save-lagged
+  _syncFromWires() {
+    // keep trigger routes AND group membership in step with the wires while
+    // editing, so inspector counts are live rather than save-lagged
     const ed = this._editor;
     if (!ed.df || ed.importing) return;
     const data = ed.df.export()?.drawflow?.Home?.data || {};
@@ -1312,6 +1431,45 @@ class ScannerPanel extends HTMLElement {
           .filter(Boolean),
       };
     }
+    for (const cond of ed.controller.conditions || []) {
+      if (!isGroupType(cond.type)) continue;
+      const nid = ed.condToNode.get(cond.id);
+      if (nid === undefined) continue;
+      cond.conditions = (data[String(nid)]?.inputs?.input_1?.connections || [])
+        .map((c) => ed.nodeToCond.get(Number(c.node)))
+        .filter(Boolean);
+      const head = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
+      if (head) head.textContent = conditionSummary(cond, (k) => this.tr(k));
+    }
+  }
+
+  _cutEmptySignalGroups() {
+    // deleting the last member node of a signal-wired group leaves an
+    // invalid empty group — cut its signal wires so the user re-anchors
+    // (the members port unlocks for re-wiring) instead of hitting a 400
+    const ed = this._editor;
+    if (!ed.df) return;
+    for (const cond of ed.controller.conditions || []) {
+      if (!isGroupType(cond.type)) continue;
+      if ((cond.conditions || []).length) continue;
+      const signalWired =
+        (ed.portWireCount?.get(`${ed.condToNode.get(cond.id)}:input_3`) || 0) > 0;
+      if (!signalWired) continue;
+      const gid = String(ed.condToNode.get(cond.id));
+      const conns =
+        ed.df.export()?.drawflow?.Home?.data?.[gid]?.inputs?.input_3?.connections || [];
+      for (const c of [...conns]) {
+        try {
+          ed.df.removeSingleConnection(c.node, gid, "output_1", "input_3");
+        } catch {
+          /* wire already gone */
+        }
+      }
+      this.toast(
+        `${this.tr("emptyGroupCut")} ${cond.label || cond.id}`,
+        true
+      );
+    }
   }
 
   _connectionAllowed(e) {
@@ -1324,14 +1482,22 @@ class ScannerPanel extends HTMLElement {
     const dstIsCond = ed.nodeToCond.has(Number(e.input_id));
     const dstIsOut = ed.nodeToOut.has(Number(e.input_id));
     if (srcIsTrg) {
-      // 0.7.0: signals start evaluation through conditions only; 0.7.1:
-      // gates (and/or/not, duration) are not signal origins either — only
-      // plain leaves carry the signal port.
+      // 0.7.0: signals start evaluation through conditions only; outputs
+      // expose just the on/off verdict ports. 0.7.2: groups carry a signal
+      // port again, mutually exclusive with their members port; duration
+      // stays a pure gate (start/abort, no signal).
       if (!dstIsCond || e.input_class !== "input_3") return false;
       const dst = ed.controller.conditions.find(
         (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
       );
-      return !!dst && !isGroupType(dst.type) && dst.type !== "duration";
+      if (!dst) return false;
+      if (dst.type === "duration") return false;
+      if (isGroupType(dst.type)) {
+        // members first: a group without member wires is an empty shell
+        // (schema would reject it) — signal needs members to exist
+        return (ed.portWireCount?.get(`${Number(e.input_id)}:input_1`) || 0) > 0;
+      }
+      return true;
     }
     if (srcIsCond) {
       if (dstIsTrg) return false;
@@ -1340,7 +1506,14 @@ class ScannerPanel extends HTMLElement {
         const dst = ed.controller.conditions.find(
           (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
         );
-        if (dst && isGroupType(dst.type)) return e.input_class === "input_1";
+        if (dst && isGroupType(dst.type)) {
+          if (e.input_class !== "input_1") return false;
+          // signal-frozen: a signal-wired group takes no more members
+          if (this._groupExclusiveWired(Number(e.input_id), "input_1")) {
+            return false;
+          }
+          return true;
+        }
         if (dst && dst.type === "duration") {
           // start/abort are single-value ports: a second wire into the same
           // input would be silently dropped on export (WHA-F-024)
@@ -1418,11 +1591,11 @@ class ScannerPanel extends HTMLElement {
 
   _dfAddCondNode(cond, y) {
     const ed = this._editor;
-    // Port model (0.7.1): only plain leaves carry the trigger signal port
-    // (input_3). Groups take just the members input; duration takes
-    // start (input_1) + abort (input_2). Gates are not signal origins.
+    // Port model (0.7.2): groups carry BOTH the members port (input_1)
+    // and the trigger signal port (input_3) — mutually exclusive once one
+    // side is wired (the other hides). Duration keeps start/abort only.
     const isGroup = isGroupType(cond.type);
-    const inputs = cond.type === "duration" ? 2 : isGroup ? 1 : 3;
+    const inputs = cond.type === "duration" ? 2 : 3;
     const nodeId = ed.df.addNode(
       cond.type,
       inputs,
@@ -1491,6 +1664,10 @@ class ScannerPanel extends HTMLElement {
     ed.controller.conditions.push(cond);
     const count = ed.controller.conditions.length;
     const nodeId = this._dfAddCondNode(cond, 20 + (count - 1) * 120);
+    if (type === "duration") {
+      void type; // duration keeps its own port set
+    }
+    this._updateGroupPortState(nodeId); // new groups start member-less (WHA-F-101)
     this._selectNode(nodeId);
     ed.dirty = true;
   }

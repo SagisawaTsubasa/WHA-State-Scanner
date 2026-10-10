@@ -348,6 +348,21 @@ details.wha-json pre {
 .parent-drawflow .drawflow .wha-node.cond-not .input_1 {
   background: #64748b;
 }
+/* logic groups: "members first, signal freezes" — signal wiring hides
+   (freezes) the members port; a member-less group dims its signal port */
+.parent-drawflow .drawflow .wha-node.gate-has-signal .input_1 {
+  display: none;
+}
+.parent-drawflow .drawflow .wha-node.gate-no-members .input_3 {
+  opacity: 0.35;
+}
+/* groups' input_2 slot is dead (members=input_1, signal=input_3) */
+.parent-drawflow .drawflow .wha-node.cond-and .input_2,
+.parent-drawflow .drawflow .wha-node.cond-or .input_2,
+.parent-drawflow .drawflow .wha-node.cond-not .input_2 {
+  display: none;
+}
+
 /* plain leaves have no gate-input semantics - hide the dead ports */
 .parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_1,
 .parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_2 {

@@ -10,9 +10,10 @@ present → the outputs reachable from the covered conditions) and two new
 leaf conditions exist: ``duration`` (TON gate with start/abort inputs)
 and ``debounce`` (true once the entity has been quiet for N seconds).
 Since 0.7.0 routes carry conditions only — triggers never wire outputs
-directly (an ``outputs`` key in routes is rejected). Since 0.7.1 the
-conditions named by routes must be plain leaves: and/or/not groups and
-duration gates are not signal origins (rejected at graph level).
+directly (an ``outputs`` key in routes is rejected). Since 0.7.2 and/or/not
+groups may carry the coverage again: on the canvas a group's signal port
+requires member wires first and freezes them once wired (a UI constraint,
+not a storage one).
 """
 
 from __future__ import annotations
@@ -642,7 +643,6 @@ def _check_graph(
                 if member not in by_id:
                     _fail(f"输出的 {key} 引用了不存在的条件：{member}")
 
-    signal_leaves = set(LEAF_TYPES) - {COND_DURATION}
     for trg in triggers or []:
         tid = trg.get("id")
         if tid and any(
@@ -656,12 +656,10 @@ def _check_graph(
         for member in routes.get("conditions", []):
             if member not in by_id:
                 _fail(f"触发器「{label}」的路由引用了不存在的条件：{member}")
-            ctype = by_id[member]["type"]
-            if ctype not in signal_leaves:
+            if by_id[member]["type"] == COND_DURATION:
                 _fail(
-                    f"触发器「{label}」的信号线连到了「{by_id[member].get('label') or member}」"
-                    f"（{ctype}）：AND/OR/NOT 组与持续门不能被信号直达，"
-                    "请连到具体条件的信号口"
+                    f"触发器「{label}」的信号线连到了持续门：持续不是信号起点，"
+                    "请连到具体条件或逻辑组"
                 )
 
 

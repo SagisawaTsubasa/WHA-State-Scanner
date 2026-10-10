@@ -107,36 +107,21 @@ def _migrate_controller_v4(cfg: dict) -> dict:
     return cfg
 
 
-def _expand_routes_to_leaves(cfg: dict) -> dict:
-    """v4→v5: signal coverage may only name plain leaf conditions.
-
-    Group (and/or/not) and duration ids in ``routes.conditions`` expand to
-    the leaf set their subtree reaches (group members recursively, duration
-    start/abort chains) — evaluation scope is unchanged, the carrier is.
-    """
-    conditions = cfg.get("conditions") or []
-    by_id = {
-        c.get("id"): c
-        for c in conditions
-        if isinstance(c, dict) and isinstance(c.get("id"), str)
-    }
-    gate_types = {"and", "or", "not", COND_DURATION}
-
-    def expand(cid: str, seen: set) -> None:
-        cond = by_id.get(cid)
-        if not cond or cid in seen:
-            return
-        seen.add(cid)
-        if cond.get("type") in gate_types:
-            for m in cond.get("conditions") or []:
-                if isinstance(m, str):
-                    expand(m, seen)
-            for key in ("start", "abort"):
-                if isinstance(cond.get(key), str):
-                    expand(cond[key], seen)
-
+def _strip_duration_coverage(cfg: dict) -> dict:
+    """v4/v5→5 cleanup for 0.7.0-era stores: duration ids in
+    routes.conditions were legal then but duration has no signal port now
+    — drop them (trigger falls back to its remaining coverage; empty
+    coverage = wired-to-nothing, which the user fixes on the canvas)."""
     triggers = cfg.get(CONF_TRIGGERS)
     if not isinstance(triggers, list):
+        return cfg
+    conditions = cfg.get("conditions") or []
+    dur_ids = {
+        c.get("id")
+        for c in conditions
+        if isinstance(c, dict) and c.get("type") == COND_DURATION
+    }
+    if not dur_ids:
         return cfg
     for trg in triggers:
         if not isinstance(trg, dict):
@@ -144,34 +129,9 @@ def _expand_routes_to_leaves(cfg: dict) -> dict:
         routes = trg.get(CONF_ROUTES)
         if not isinstance(routes, dict):
             continue
-        leaves: set[str] = set()
-        expanded_gate = False
-        for cid in routes.get("conditions") or []:
-            if not isinstance(cid, str):
-                continue
-            cond = by_id.get(cid)
-            if cond and cond.get("type") in gate_types:
-                expanded_gate = True
-                seen: set[str] = set()
-                expand(cid, seen)
-                for leaf in seen:
-                    cond2 = by_id.get(leaf)
-                    if cond2 and cond2.get("type") not in gate_types:
-                        leaves.add(leaf)
-            else:
-                leaves.add(cid)
-        if expanded_gate:
-            # v4 stores from the 0.7.0 canvas may name gates directly; for
-            # such coverage the leaf expansion can WIDEN the woken set when
-            # a covered leaf feeds other outputs too. Migrated-from-v3
-            # stores (full-coverage) are downward-closed and unaffected.
-            _LOGGER.warning(
-                "Controller %s: trigger routes named gate nodes "
-                "(and/or/not/duration); expanded to leaves — review the "
-                "signal wires on the canvas if scope changed",
-                cfg.get("name", "?"),
-            )
-        routes["conditions"] = sorted(leaves)
+        cov = routes.get("conditions")
+        if isinstance(cov, list) and any(c in dur_ids for c in cov):
+            routes["conditions"] = [c for c in cov if c not in dur_ids]
     return cfg
 
 
@@ -267,7 +227,7 @@ def _migrate_controller_v2(cfg: dict) -> dict:
 
 
 class _MigratingStore(Store):
-    """Store with the v2/v3/v4→v5 migrations wired in.
+    """Store with the v2/v3/v4→5 migrations wired in.
 
     ``Store`` has no ``migrate_func=`` constructor argument; a subclass
     overrides ``_async_migrate_func(old_major_version, old_data)`` and
@@ -280,9 +240,9 @@ class _MigratingStore(Store):
         raw = (old_data or {}).get(CONF_CONTROLLERS)
         if isinstance(raw, dict):
             steps = {
-                2: (_migrate_controller_v2, _migrate_controller_v4, _expand_routes_to_leaves),
-                3: (_migrate_controller_v4, _expand_routes_to_leaves),
-                4: (_expand_routes_to_leaves,),
+                2: (_migrate_controller_v2, _migrate_controller_v4, _strip_duration_coverage),
+                3: (_migrate_controller_v4, _strip_duration_coverage),
+                4: (_strip_duration_coverage,),
             }
             chain = steps.get(old_major_version, ())
             for cid, cfg in raw.items():
