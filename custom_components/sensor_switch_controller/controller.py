@@ -66,6 +66,27 @@ class ControllerManager:
         self.logging_enabled = config.get(CONF_LOGGING, False)
 
         self.engine = ConditionEngine(hass, self.conditions, manager=self)
+        # trigger-logic groups: groups named by any trigger's signal coverage.
+        # Coverage is topological (0.7.3 F-151 resolution, superseding the
+        # F-120 enabled filter): a disabled trigger never fires, so keeping
+        # its group pass-through harms nothing while enabling keeps anchors
+        # valid across disable/enable round-trips.
+        gate_types = {"and", "or", "not"}
+        self.engine.signal_group_ids = {
+            cid
+            for trg in self.triggers
+            if isinstance(trg, dict)
+            for cid in (trg.get(CONF_ROUTES) or {}).get("conditions") or []
+            if isinstance(cid, str)
+            and next(
+                (
+                    c
+                    for c in self.conditions
+                    if isinstance(c, dict) and c.get("id") == cid
+                ),
+                {},
+            ).get("type") in gate_types
+        }
         self.logger = DecisionLogger(
             hass, self.name, controller_id, enabled=self.logging_enabled
         )
@@ -242,7 +263,10 @@ class ControllerManager:
             trg_id = trg.get("id")
             routes = trg.get(CONF_ROUTES)
             if routes is None:
-                legacy = True
+                if trg.get("enabled", True):
+                    # a DISABLED route-less trigger never fires; it must not
+                    # degrade the enabled ones to full sweeps (WHA-F-137)
+                    legacy = True
                 continue
             # 0.7.0: signals flow through the condition graph only — a
             # trigger's targets are the outputs its covered conditions can
@@ -567,6 +591,74 @@ class ControllerManager:
 
         self._rearm_for_wakeup()
         return {"readings": readings, "outputs": outputs, "conditions": conditions}
+
+    async def async_observe_conditions(self) -> dict:
+        """Read-only evaluation for the panel's live status display.
+
+        Evaluates every condition reachable from the output chains (sharing
+        the eval lock and timer ledgers with real cycles — a duration stays
+        consistent), but applies nothing: no flips, no log, no last_flip.
+        """
+        async with self._eval_lock:
+            readings = self._async_read_sensors()
+            all_ids: list[str] = []
+            seen: set[str] = set()
+            stack: list[str] = []
+            for out in self.outputs:
+                if not isinstance(out, dict):
+                    continue
+                stack.extend(out.get("on_conditions") or [])
+                stack.extend(out.get("off_conditions") or [])
+            gate_keys = ("conditions", CONF_START, CONF_ABORT)
+            by_id = {
+                c["id"]: c
+                for c in self.conditions
+                if isinstance(c, dict) and c.get("id")
+            }
+            while stack:
+                cid = stack.pop()
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                all_ids.append(cid)
+                cond = by_id.get(cid)
+                if not cond:
+                    continue
+                for key in gate_keys:
+                    val = cond.get(key)
+                    if isinstance(val, list):
+                        stack.extend(val)
+                    elif isinstance(val, str):
+                        stack.append(val)
+            # cooldown needs the evaluating output's context; evaluate each
+            # condition once per output whose chain contains it and keep the
+            # best verdict (any output seeing it satisfied → satisfied)
+            results: dict[str, bool] = {}
+            for cid in all_ids:
+                verdict = False
+                outs = self._cond_to_outs.get(cid) or ()
+                try:
+                    if outs:
+                        for out_id in outs:
+                            _, det = await self.engine.evaluate_detailed([cid], out_id)
+                            if det.get(cid, False):
+                                verdict = True
+                                break
+                    else:
+                        # defensive: validated stores always carry entity_id
+                        # on outputs, so outs is never empty in practice
+                        _, det = await self.engine.evaluate_detailed([cid], None)
+                        verdict = det.get(cid, False)
+                except Exception:
+                    _LOGGER.exception(
+                        "Observe: error evaluating condition '%s'", cid
+                    )
+                results[cid] = verdict
+            # Deliberately NO _rearm_for_wakeup here: observe is read-only
+            # (WHA-F-130) — re-arming from a GET would let merely opening
+            # the editor derive a real evaluation (and actuation). Any
+            # trigger/real cycle re-arms anyway.
+            return {"readings": readings, "conditions": results}
 
     async def async_evaluate_output(self, out_id: str) -> None:
         """Evaluate only the output identified by its internal id (service API)."""

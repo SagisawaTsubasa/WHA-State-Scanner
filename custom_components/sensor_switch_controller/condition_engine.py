@@ -91,6 +91,9 @@ class ConditionEngine:
 
         self._for_timers: dict[str, datetime] = {}
         self._duration_timers: dict[str, datetime] = {}
+        # groups referenced by trigger signal coverage (0.7.3 trigger-logic
+        # mode): they evaluate as pass-through instead of their members
+        self.signal_group_ids: set[str] = set()
         self._template_cache: dict[str, Template] = {}
         self._sun_cache: dict[tuple[str, str], Any] = {}
 
@@ -404,10 +407,21 @@ class ConditionEngine:
 
         if ctype in GROUP_TYPES:
             members = cond.get("conditions") or []
+            cond_id = cond.get("id")
+            if cond_id and cond_id in self.signal_group_ids:
+                # trigger-logic mode (0.7.3): pass-through — the group's job
+                # is to merge trigger signals, not to gate the verdict
+                if trace is not None:
+                    trace[cond_id] = True
+                return True
             if not members:
                 # Deliberately stricter than HA (empty and/not → True there):
-                # the schema rejects empty groups anyway, so this branch only
-                # guards hand-edited stores against forcing outputs on.
+                # empty groups are legal when referenced (signal coverage,
+                # another group's membership, an output chain or duration
+                # input), but a signal-anchored group is PASS-THROUGH (handled
+                # above); reaching here with no members means a NON-signal-
+                # anchored empty group (any non-signal reference or no
+                # reference) — verdict False.
                 _LOGGER.debug("Empty '%s' group at %s evaluates to False", ctype, path)
                 return False
             results: list[bool] = []

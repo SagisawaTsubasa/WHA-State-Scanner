@@ -134,10 +134,12 @@ const LANG = {
     portMembers: "成员",
     portOut: "出",
     logicGroups: "逻辑组",
-    logicGroupHint: "把多条条件合并成一个判定；先搭成员，再接触发器信号直达（信号连上后成员口冻结）",
-    trgGateMutexMembers: "该组已被信号直达（冻结）：先删除信号线才能改成员",
-    trgGateNeedsMembers: "该组还没有成员：先从条件拉成员线到「成员」口，再接触发器信号",
-    emptyGroupCut: "信号直达已断开（组内成员被清空）：重新搭好成员后再接触发器信号。组:",
+    logicGroupHint: "统筹条件逻辑（连成员线）或触发逻辑（连信号线，可多条=任一触发放行）——二选一，先连先得；空组也可直接连信号",
+    trgGateMutexMembers: "该组是条件逻辑组（已连成员）：信号口已隐藏，不能再连信号",
+    trgGateMutexSignal: "该组是触发逻辑组（已连信号）：成员口已隐藏，不能再连成员",
+    passthrough: "触发合并 · 贯通",
+    observeUnavailable: "实时状态不可用（观察端点失败），请查看日志",
+    observeUnavailableShort: "观察不可用",
     weekdaysLabel: "星期几",
     byLabel: "触发来源",
     enabledLabel: "启用",
@@ -271,10 +273,12 @@ const LANG = {
     portMembers: "members",
     portOut: "out",
     logicGroups: "Logic groups",
-    logicGroupHint: "Merge conditions into one verdict; wire members first, then attach the trigger signal (signal wiring freezes the members port)",
-    trgGateMutexMembers: "This group is signal-wired (frozen): remove the signal wire before editing members",
-    trgGateNeedsMembers: "This group has no members yet: wire conditions into its members port first, then attach the trigger signal",
-    emptyGroupCut: "Signal wiring cut (group members were emptied): rebuild members before re-attaching the trigger. Group:",
+    logicGroupHint: "Coordinate condition logic (member wires) or trigger logic (signal wires, multiple allowed = any-trigger passes) — pick one, first wire wins; empty groups may take signals directly",
+    trgGateMutexMembers: "This is a condition-logic group (members wired): its signal port is hidden — no signal wires",
+    trgGateMutexSignal: "This is a trigger-logic group (signal wired): its members port is hidden — no member wires",
+    passthrough: "trigger merge · pass-through",
+    observeUnavailable: "Live status unavailable (observe endpoint failed) — check the log",
+    observeUnavailableShort: "observe unavailable",
     weekdaysLabel: "Weekdays",
     byLabel: "By",
     enabledLabel: "Enabled",
@@ -432,6 +436,7 @@ class ScannerPanel extends HTMLElement {
     this._toastTimer = null;
     this._pollTimer = null;
     this._renderQueued = false;
+    this._observeTimer = null;
     this._onHash = () => this._applyHash(true);
   }
 
@@ -469,6 +474,7 @@ class ScannerPanel extends HTMLElement {
     window.removeEventListener("hashchange", this._onHash);
     if (this._pollTimer) clearInterval(this._pollTimer);
     this._pollTimer = null;
+    this._stopObserveLoopImpl();
   }
 
   tr(key) {
@@ -492,22 +498,50 @@ class ScannerPanel extends HTMLElement {
     }
   }
 
-  async _api(method, path, body) {
+  async _api(method, path, body, timeoutMs) {
     const hass = this._hass;
     if (!hass?.fetchWithAuth) throw new Error(" hass 未就绪");
-    const res = await hass.fetchWithAuth(`${API}${path}`, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    let data = {};
+    const controller = timeoutMs ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
-      data = await res.json();
-    } catch {
-      /* empty body */
+      const res = await hass.fetchWithAuth(`${API}${path}`, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller?.signal,
+      });
+      // the guard covers the body read too - a stalled body would otherwise
+      // keep _observeBusy latched forever (WHA-F-140)
+      // any parse failure propagates: the caller's catch distinguishes
+      // transient (AbortError) from persistent episodes (WHA-F-210/211).
+      // There is NO empty-body fallback: parse errors always throw, so
+      // callers never see a fabricated {} (WHA-F-236)
+      let data;
+      try {
+        data = await res.json();
+      } catch (err) {
+        // an aborted body read stays transient regardless of res.ok
+        // (WHA-F-241) — wrapping it into a status error would make the
+        // observe matcher treat a timeout as a persistent episode
+        if (err?.name === "AbortError") throw err;
+        // a non-JSON error body (proxy/框架层) must keep its HTTP status
+        // for the observe transient matcher (WHA-F-222)
+        if (!res.ok) {
+          const oerr = new Error(`${res.status} ${res.statusText}`);
+          oerr.status = res.status;
+          throw oerr;
+        }
+        throw err;
+      }
+      if (!res.ok) {
+        const err = new Error(data.error || `${res.status} ${res.statusText}`);
+        err.status = res.status; // semantic matching (WHA-F-204)
+        throw err;
+      }
+      return data;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
-    return data;
   }
 
   async _poll() {
@@ -551,6 +585,7 @@ class ScannerPanel extends HTMLElement {
     } else {
       this._view = "overview";
     }
+    if (this._view !== "editor") this._stopObserveLoopImpl();
     if (rerender) this._render();
   }
 
@@ -586,7 +621,6 @@ class ScannerPanel extends HTMLElement {
           <button class="wha-btn" data-action="refresh">${esc(this.tr("refresh"))}</button>
         </header>
         <main class="wha-main" data-main></main>
-        <div data-toast-slot></div>
       `;
       app.querySelectorAll("[data-nav]").forEach((btn) => {
         btn.addEventListener("click", () => {
@@ -783,7 +817,7 @@ class ScannerPanel extends HTMLElement {
       config = JSON.parse(JSON.stringify(this._controllerConfig(cid)));
       config.triggers = config.triggers || [];
     }
-    this._editor = {
+    const ed = {
       cid: isNew ? null : cid,
       isNew,
       controller: config,
@@ -795,6 +829,7 @@ class ScannerPanel extends HTMLElement {
       outToNode: new Map(),
       nodeToTrg: new Map(),
       portWireCount: new Map(), // "nodeId:portClass" -> wire count
+      // (the observe cache resets below — verdicts are per-controller)
       // triggers that loaded WITHOUT routes keep their legacy
       // evaluate-everything semantics across canvas saves (WHA-F-070/071);
       // triggers created this session are NOT in this set
@@ -804,6 +839,7 @@ class ScannerPanel extends HTMLElement {
       selected: null,
       trial: null,
     };
+    this._editor = ed;
 
     main.innerHTML = `
       <div class="wha-editor">
@@ -873,13 +909,22 @@ class ScannerPanel extends HTMLElement {
 
     // palette
     main.querySelectorAll("[data-add-trg]").forEach((btn) =>
-      btn.addEventListener("click", () => this._addTriggerNode(btn.dataset.addTrg))
+      btn.addEventListener("click", () => {
+        if (!this._editor?.df) return; // vendor script not loaded yet (WHA-F-244)
+        this._addTriggerNode(btn.dataset.addTrg);
+      })
     );
     main.querySelectorAll("[data-add-cond]").forEach((btn) =>
-      btn.addEventListener("click", () => this._addConditionNode(btn.dataset.addCond))
+      btn.addEventListener("click", () => {
+        if (!this._editor?.df) return; // vendor script not loaded yet (WHA-F-244)
+        this._addConditionNode(btn.dataset.addCond);
+      })
     );
     main.querySelectorAll("[data-add-out]").forEach((btn) =>
-      btn.addEventListener("click", () => this._addOutputNode(btn.dataset.addOut))
+      btn.addEventListener("click", () => {
+        if (!this._editor?.df) return; // vendor script not loaded yet (WHA-F-244)
+        this._addOutputNode(btn.dataset.addOut);
+      })
     );
     main.querySelector('[data-act="save"]')?.addEventListener("click", () => this._saveEditor());
     main.querySelector('[data-act="trial"]')?.addEventListener("click", () => this._trialRun());
@@ -901,7 +946,245 @@ class ScannerPanel extends HTMLElement {
       this.toast(String(err.message || err), true);
       return;
     }
+    if (this._editor !== ed || !main.isConnected) {
+      return; // user navigated away while the vendor script loaded
+    }
     this._initCanvas(main.querySelector("#wha-drawflow"));
+    this._lastObserve = null; // verdicts are per-controller (WHA-F-145)
+    this._lastObservedIds = null; // mirror reset (WHA-F-248)
+    this._startObserveLoop();
+  }
+
+  _startObserveLoop() {
+    // live condition status: poll the read-only observe endpoint while the
+    // editor is open and the tab visible
+    this._stopObserveLoopImpl();
+    this._observeWarned = false; // per-editor session (WHA-F-176)
+    this._observeHealthy = null;
+    const tick = async () => {
+      if (this._observeBusy) return; // previous round still in flight
+      if (document.hidden || !this.isConnected || this._view !== "editor") {
+        return;
+      }
+      const cid = this._editor?.cid;
+      if (!cid) return;
+      if (this._data?.controllers?.[cid]?.enabled === false) {
+        // disabled controller: observe would 409 forever — remove the stale
+        // status lines entirely instead of borrowing the failure sentinel
+        // (a disabled controller is not "observe failing", WHA-F-228)
+        this._lastObserve = null;
+        this._lastObservedIds = null;
+        this._observeHealthy = null;
+        this._observeWarned = false; // reset the episode so re-enabling
+        // doesn't leave a persistently-failing observe permanently silent
+        this._clearStaleVerdicts();
+        this._editor?.df?.container
+          ?.querySelectorAll("[data-observe]")
+          .forEach((el) => el.remove());
+        // trial artifacts too, symmetric with the success path (WHA-F-232)
+        if (this._editor?.trial) {
+          this._editor.trial = null;
+          this.shadowRoot
+            ?.querySelector("[data-inspector] details.wha-json")
+            ?.remove();
+          for (const nodeId of this._editor.outToNode.values()) {
+            const badge = this._editor.df?.container?.querySelector(
+              `#node-${nodeId} [data-badge]`
+            );
+            if (badge) badge.style.display = "none";
+          }
+        }
+        return;
+      }
+      const ed = this._editor;
+      this._observeBusy = true;
+      try {
+        const r = await this._api("GET", `/controllers/${cid}/observe`, undefined, 8000);
+        if (this._editor !== ed || !ed.df?.container) {
+          return; // user switched editors mid-await (WHA-F-184)
+        }
+
+        this._observeWarned = false;
+        if (ed.trial) {
+          ed.trial = null; // fresh round supersedes trial (WHA-F-182)
+          // drop the stale trial artifacts: the details box AND the output
+          // decision badges (WHA-F-189 — the other half of the mixed state)
+          this.shadowRoot
+            ?.querySelector("[data-inspector] details.wha-json")
+            ?.remove();
+          for (const nodeId of ed.outToNode.values()) {
+            const badge = ed.df.container
+              ?.querySelector(`#node-${nodeId} [data-badge]`);
+            if (badge) badge.style.display = "none";
+          }
+        }
+        this._applyObserve(r);
+      } catch (err) {
+        if (this._editor !== ed) return; // stale round on a foreign view (WHA-F-196)
+        if (ed.trial) return; // trial coloring wins (WHA-F-217)
+        // transient: no status (browser-level fetch rejection, e.g. HA
+        // restarting — WHA-F-239), 409 reload/disabled, 503 during reload,
+        // or a slow-observe timeout. Only a real 5xx from observe itself
+        // counts as a failure episode.
+        const status = err?.status;
+        if (
+          status === undefined ||
+          status === 409 ||
+          status === 503 ||
+          status < 500 ||
+          err?.name === "AbortError"
+        ) {
+          return;
+        }
+        // persistent failures (500 etc) must not be fully silent
+        if (!this._observeWarned) {
+          this._observeWarned = true;
+          console.debug("[wha] observe unavailable:", String(err.message || err));
+          // mark the live status as stale instead of leaving old verdicts
+          // looking current (WHA-F-191); also drop the cached response so
+          // redraws cannot replay it (WHA-F-195)
+          this._lastObserve = null;
+          if (ed.df?.container) {
+            this._observeHealthy = false; // redraws must keep the ⚠ mark (WHA-F-224)
+            this._clearStaleVerdicts();
+            this._stampObserveUnavailable(ed.df.container);
+            // _lastObserve is cleared unconditionally at :1046 (before the
+            // container check); _lastObservedIds is KEPT for the whole
+            // episode so redraws re-stamp with the same filter (WHA-F-250)
+            // one visible hint per failure episode (WHA-F-193/198)
+            this.toast(this.tr("observeUnavailable"), true);
+          }
+        }
+      } finally {
+        this._observeBusy = false;
+      }
+    };
+    tick();
+    this._observeTimer = setInterval(tick, 5000);
+  }
+
+  _stopObserveLoopImpl() {
+    if (this._observeTimer) {
+      clearInterval(this._observeTimer);
+      this._observeTimer = null;
+    }
+  }
+
+  _clearStaleVerdicts() {
+    this._editor?.df?.container
+      ?.querySelectorAll(".wha-node.met, .wha-node.unmet")
+      .forEach((el) => el.classList.remove("met", "unmet"));
+  }
+
+  _stampObserveUnavailable(container) {
+    // ensure-then-write: redraws wipe [data-nbody] textContent and take the
+    // .wha-observe line with them, so every redraw point during a failure
+    // episode must CREATE the line when missing, not just restyle (WHA-F-226).
+    // Nodes whose condition had a verdict in the last successful observe get
+    // the ⚠, mirroring the success path's coverage (WHA-F-243). Cold start
+    // (no successful observe yet, _lastObservedIds===null) stamps ALL nodes:
+    // the whole live-status feature is unavailable, which is the honest
+    // signal (WHA-F-252).
+    const covered = this._lastObservedIds || null;
+    for (const [condId, nodeId] of this._editor?.condToNode || []) {
+      const node = container.querySelector(`#node-${nodeId}`);
+      if (!node) continue;
+      let line = node.querySelector(".wha-observe");
+      if (covered && !covered.has(condId)) {
+        // was never observed (not chain-reachable): no status line at all,
+        // mirroring the success path (WHA-F-243)
+        line?.remove();
+        continue;
+      }
+      if (!line) {
+        line = document.createElement("div");
+        line.className = "wha-observe";
+        line.setAttribute("data-observe", "");
+        node.querySelector(".wha-node-body")?.appendChild(line);
+      }
+      line.textContent = `⚠ ${this.tr("observeUnavailableShort")}`;
+      line.classList.remove("ok", "bad");
+    }
+  }
+
+  _refreshPassthroughBadges() {
+    // pass-through badges are PURELY topological (trigger coverage + empty
+    // group) — they must survive observe failures and trials (WHA-F-229)
+    const ed = this._editor;
+    for (const [condId, nodeId] of ed.condToNode) {
+      const cond = ed.controller.conditions.find((c) => c.id === condId);
+      if (!cond || !isGroupType(cond.type)) continue;
+      const covered = (ed.controller.triggers || []).some((trg) =>
+        (trg.routes?.conditions || []).includes(condId)
+      );
+      const empty = !(cond.conditions || []).length;
+      const el = ed.df.container?.querySelector(`#node-${nodeId}`);
+      if (!el) continue;
+      let badge = el.querySelector("[data-passthrough]");
+      if (covered && empty) {
+        if (!badge) {
+          badge = document.createElement("div");
+          badge.className = "wha-passthrough";
+          badge.setAttribute("data-passthrough", "");
+          el.querySelector(".wha-node-body")?.appendChild(badge);
+        }
+        badge.textContent = this.tr("passthrough");
+      } else if (badge) {
+        badge.remove();
+      }
+    }
+  }
+
+  _applyObserve(r) {
+    // color condition nodes by their live verdict and append a status line
+    if (this._editor?.trial) return; // trial coloring wins until next tick (WHA-F-213)
+    this._observeHealthy = true;
+    this._lastObserve = r; // body redraws re-apply this (status line survives)
+    // snapshot the observed condition-id set for the failure path's ⚠ filter
+    // (WHA-F-243: failure stamps must mirror the success path's coverage)
+    this._lastObservedIds = new Set(Object.keys(r.conditions || {}));
+    const ed = this._editor;
+    if (!ed?.df?.container) return;
+    for (const [condId, nodeId] of ed.condToNode) {
+      const met = r.conditions?.[condId];
+      const el = ed.df.container.querySelector(`#node-${nodeId}`);
+      if (!el) continue;
+      if (met === undefined) {
+        // no longer on any output chain: clear the stale verdict (WHA-F-180)
+        el.classList.remove("met", "unmet");
+        el.querySelector("[data-observe]")?.remove();
+        continue;
+      }
+      el.classList.toggle("met", met === true);
+      el.classList.toggle("unmet", met === false);
+      let status = el.querySelector("[data-observe]");
+      if (!status) {
+        status = document.createElement("div");
+        status.className = "wha-observe";
+        status.setAttribute("data-observe", "");
+        el.querySelector(".wha-node-body")?.appendChild(status);
+      }
+      // entity id from the SAVED config snapshot (F-199: the editor object
+      // may hold unsaved edits that would mismatch the observed verdict);
+      // the value prefers the observe readings and falls back to hass.states
+      // for entities outside the sensor pool (WHA-F-200)
+      const savedCond = this._data?.controllers?.[ed.cid]?.conditions?.find(
+        (c) => c.id === condId
+      );
+      const eid = savedCond?.entity_id;
+      let st = eid ? r.readings?.[eid] : undefined;
+      if (st === undefined && eid) {
+        st = this._hass?.states?.[eid]?.state;
+      }
+      const live =
+        eid && st !== undefined && st !== null
+          ? ` · ${String(st).slice(0, 24)}`
+          : "";
+      status.textContent = `${met ? "✓" : "✗"}${live}`;
+      status.classList.toggle("ok", met === true);
+      status.classList.toggle("bad", met === false);
+    }
+    this._refreshPassthroughBadges();
   }
 
   static _PORT_LABELS = {
@@ -978,9 +1261,10 @@ class ScannerPanel extends HTMLElement {
   }
 
   _updateGroupPortState(nodeId) {
-    // Logic groups: "members first, signal freezes". Wiring the signal
-    // port hides (freezes) the members port until the signal wire goes
-    // away; a member-less group dims its signal port (still refused).
+    // Logic groups: strict symmetric mutual exclusion (0.7.3). Wiring the
+    // members port = condition-logic mode (signal port hides); wiring the
+    // signal port = trigger-logic mode (members port hides - trigger mode
+    // groups carry no member wires, so display:none is endpoint-safe).
     const ed = this._editor;
     const condId = ed?.nodeToCond?.get(nodeId);
     if (!condId) return;
@@ -990,8 +1274,10 @@ class ScannerPanel extends HTMLElement {
     if (!el) return;
     const signal = (ed.portWireCount?.get(`${nodeId}:input_3`) || 0) > 0;
     const members = (ed.portWireCount?.get(`${nodeId}:input_1`) || 0) > 0;
-    el.classList.toggle("gate-has-signal", signal);
-    el.classList.toggle("gate-no-members", !members);
+    // deterministic priority when an API-constructed store has both wired:
+    // members win (condition-logic), the signal port stays hidden
+    el.classList.toggle("gate-has-members", members);
+    el.classList.toggle("gate-has-signal", signal && !members);
   }
 
   _rejectReason(e) {
@@ -1000,18 +1286,31 @@ class ScannerPanel extends HTMLElement {
     if (!condId) return null;
     const cond = ed.controller.conditions.find((c) => c.id === condId);
     if (!cond || !isGroupType(cond.type)) return null;
-    if (e.input_class !== "input_3") return null; // wrong-port → generic copy
-    const hasMembers =
-      (ed.portWireCount?.get(`${Number(e.input_id)}:input_1`) || 0) > 0;
-    const signalWired =
-      (ed.portWireCount?.get(`${Number(e.input_id)}:input_3`) || 0) > 0;
-    if (ed.nodeToTrg.has(Number(e.output_id)) && !hasMembers) {
-      // trigger to a member-less group's signal port
-      return this.tr("trgGateNeedsMembers");
-    }
-    if (signalWired && !ed.nodeToTrg.has(Number(e.output_id))) {
-      // condition wire onto a signal-frozen group
+    // Judge the group's PRE-EXISTING wiring from the live drawflow data,
+    // excluding the attempted wire itself — immune to vendor rollback
+    // timing (WHA-F-144/148)
+    const data = ed.df?.export()?.drawflow?.Home?.data || {};
+    const countOther = (portClass) =>
+      // drawflow data keys are the BARE node id — "node-<id>" exists only on
+      // DOM ids (the exact WHA-F-014 trap, do not repeat it here)
+      (data[String(Number(e.input_id))]?.inputs?.[portClass]?.connections || [])
+        .filter(
+          (c) =>
+            !(
+              Number(c.node) === Number(e.output_id) &&
+              e.output_class === "output_1"
+            )
+        )
+        .length;
+    const membersWired = countOther("input_1") > 0;
+    const signalWired = countOther("input_3") > 0;
+    if (ed.nodeToTrg.has(Number(e.output_id)) && membersWired) {
+      // trigger wire onto a condition-logic group
       return this.tr("trgGateMutexMembers");
+    }
+    if (!ed.nodeToTrg.has(Number(e.output_id)) && signalWired) {
+      // condition wire onto a trigger-logic group
+      return this.tr("trgGateMutexSignal");
     }
     return null;
   }
@@ -1300,7 +1599,6 @@ class ScannerPanel extends HTMLElement {
         ed.dirty = true;
         this._styleConnections();
         this._syncFromWires();
-        this._cutEmptySignalGroups();
       }
     });
     df.on("nodeRemoved", (nodeId) => {
@@ -1339,7 +1637,6 @@ class ScannerPanel extends HTMLElement {
       // vendor may not per-wire dispatch connectionRemoved on node removal
       // — rebuild the counters from the drawflow data (WHA-F-087)
       this._rebuildPortWireCount();
-      this._cutEmptySignalGroups();
       this._syncFromWires();
       ed.dirty = true;
     });
@@ -1387,7 +1684,10 @@ class ScannerPanel extends HTMLElement {
         if (mid) df.addConnection(String(mid), String(oid), "output_1", "input_2");
       }
     }
-    // signal wires: trigger routes → condition signal ports
+    // signal wires: trigger routes → condition signal ports. Coverage is
+    // topological (0.7.3 F-155 resolution, superseding F-135): disabled
+    // triggers keep drawing their wires — the trg-off class dims the node —
+    // so the canvas, schema and engine all agree on what is wired.
     for (const trg of ed.controller.triggers || []) {
       const srcNode = trgNodeById.get(trg.id);
       if (srcNode === undefined) continue;
@@ -1400,9 +1700,10 @@ class ScannerPanel extends HTMLElement {
       }
     }
     ed.importing = false;
-    for (const [nid] of ed.nodeToCond) {
-      this._updateGroupPortState(nid);
-    }
+    // rebuild counters from the drawflow data instead of trusting vendor
+    // connectionCreated dispatch during import (R12 待确认项的消解)
+    this._rebuildPortWireCount(); // also refreshes every group's port state
+    this._refreshPassthroughBadges();
     this._styleConnections();
   }
 
@@ -1432,6 +1733,22 @@ class ScannerPanel extends HTMLElement {
       };
     }
     for (const cond of ed.controller.conditions || []) {
+      if (cond.type === "duration") {
+        // live sync for duration start/abort too (WHA-F-214): single-value
+        // ports, first wire wins
+        const nid = ed.condToNode.get(cond.id);
+        if (nid === undefined) continue;
+        const inputs = data[String(nid)]?.inputs || {};
+        cond.start =
+          (inputs.input_1?.connections || [])
+            .map((c) => ed.nodeToCond.get(Number(c.node)))
+            .find(Boolean) || null;
+        cond.abort =
+          (inputs.input_2?.connections || [])
+            .map((c) => ed.nodeToCond.get(Number(c.node)))
+            .find(Boolean) || null;
+        continue;
+      }
       if (!isGroupType(cond.type)) continue;
       const nid = ed.condToNode.get(cond.id);
       if (nid === undefined) continue;
@@ -1441,35 +1758,27 @@ class ScannerPanel extends HTMLElement {
       const head = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
       if (head) head.textContent = conditionSummary(cond, (k) => this.tr(k));
     }
-  }
-
-  _cutEmptySignalGroups() {
-    // deleting the last member node of a signal-wired group leaves an
-    // invalid empty group — cut its signal wires so the user re-anchors
-    // (the members port unlocks for re-wiring) instead of hitting a 400
-    const ed = this._editor;
-    if (!ed.df) return;
-    for (const cond of ed.controller.conditions || []) {
-      if (!isGroupType(cond.type)) continue;
-      if ((cond.conditions || []).length) continue;
-      const signalWired =
-        (ed.portWireCount?.get(`${ed.condToNode.get(cond.id)}:input_3`) || 0) > 0;
-      if (!signalWired) continue;
-      const gid = String(ed.condToNode.get(cond.id));
-      const conns =
-        ed.df.export()?.drawflow?.Home?.data?.[gid]?.inputs?.input_3?.connections || [];
-      for (const c of [...conns]) {
-        try {
-          ed.df.removeSingleConnection(c.node, gid, "output_1", "input_3");
-        } catch {
-          /* wire already gone */
-        }
-      }
-      this.toast(
-        `${this.tr("emptyGroupCut")} ${cond.label || cond.id}`,
-        true
+    // keep an open duration inspector's start/abort indicators live (WHA-F-218)
+    if (ed.selected?.condId) {
+      const selCond = ed.controller.conditions.find(
+        (c) => c.id === ed.selected.condId
       );
+      if (selCond?.type === "duration") this._renderInspector();
     }
+    if (this._editor?.trial) {
+      // trial active: its coloring wins — no ⚠ stamping, no observe replay
+      // (WHA-F-245: the guard must precede the stamp block)
+      this._refreshPassthroughBadges();
+      return;
+    }
+    if (this._observeHealthy === false) {
+      // observe failing: rebuild the ⚠ lines a redraw just wiped (WHA-F-226)
+      this._clearStaleVerdicts();
+      this._stampObserveUnavailable(ed.df?.container);
+    } else if (this._lastObserve) {
+      this._applyObserve(this._lastObserve);
+    }
+    this._refreshPassthroughBadges(); // topological — survives all states
   }
 
   _connectionAllowed(e) {
@@ -1483,9 +1792,9 @@ class ScannerPanel extends HTMLElement {
     const dstIsOut = ed.nodeToOut.has(Number(e.input_id));
     if (srcIsTrg) {
       // 0.7.0: signals start evaluation through conditions only; outputs
-      // expose just the on/off verdict ports. 0.7.2: groups carry a signal
-      // port again, mutually exclusive with their members port; duration
-      // stays a pure gate (start/abort, no signal).
+      // expose just the on/off verdict ports. 0.7.3: groups carry a signal
+      // port too (dual mode, symmetric exclusion); duration stays a pure
+      // gate (start/abort, no signal).
       if (!dstIsCond || e.input_class !== "input_3") return false;
       const dst = ed.controller.conditions.find(
         (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
@@ -1493,9 +1802,9 @@ class ScannerPanel extends HTMLElement {
       if (!dst) return false;
       if (dst.type === "duration") return false;
       if (isGroupType(dst.type)) {
-        // members first: a group without member wires is an empty shell
-        // (schema would reject it) — signal needs members to exist
-        return (ed.portWireCount?.get(`${Number(e.input_id)}:input_1`) || 0) > 0;
+        // dual mode (0.7.3): trigger wires make the group a trigger-logic
+        // merger; symmetric exclusion hides the members port instead
+        return !this._groupExclusiveWired(Number(e.input_id), "input_3");
       }
       return true;
     }
@@ -1591,9 +1900,10 @@ class ScannerPanel extends HTMLElement {
 
   _dfAddCondNode(cond, y) {
     const ed = this._editor;
-    // Port model (0.7.2): groups carry BOTH the members port (input_1)
-    // and the trigger signal port (input_3) — mutually exclusive once one
-    // side is wired (the other hides). Duration keeps start/abort only.
+    // Port model (0.7.3): groups carry BOTH the members port (input_1)
+    // and the trigger signal port (input_3) — dual mode, symmetric mutual
+    // exclusion, empty groups may take signals directly. Duration keeps
+    // start/abort only.
     const isGroup = isGroupType(cond.type);
     const inputs = cond.type === "duration" ? 2 : 3;
     const nodeId = ed.df.addNode(
@@ -1664,9 +1974,6 @@ class ScannerPanel extends HTMLElement {
     ed.controller.conditions.push(cond);
     const count = ed.controller.conditions.length;
     const nodeId = this._dfAddCondNode(cond, 20 + (count - 1) * 120);
-    if (type === "duration") {
-      void type; // duration keeps its own port set
-    }
     this._updateGroupPortState(nodeId); // new groups start member-less (WHA-F-101)
     this._selectNode(nodeId);
     ed.dirty = true;
@@ -1731,6 +2038,20 @@ class ScannerPanel extends HTMLElement {
       if (trgId === undefined) return;
       this._refreshTriggerNode(nodeId);
     }
+    // a body redraw wipes the live status line — re-apply the last verdict
+    if (this._editor?.trial) {
+      // trial active: its coloring wins, stamp nothing (WHA-F-245)
+      this._refreshPassthroughBadges();
+      return;
+    }
+    if (this._observeHealthy === false) {
+      // observe failing: rebuild the ⚠ lines a redraw just wiped (WHA-F-226)
+      this._clearStaleVerdicts();
+      this._stampObserveUnavailable(ed.df?.container);
+    } else if (this._lastObserve) {
+      this._applyObserve(this._lastObserve);
+    }
+    this._refreshPassthroughBadges(); // topological — survives all states
   }
 
   /* ----- inspector ----- */
@@ -2048,8 +2369,14 @@ class ScannerPanel extends HTMLElement {
       return;
     }
     if (ed.dirty && !confirm(this.tr("trialNeedSave"))) return;
+    let r;
     try {
-      const r = await this._api("POST", `/controllers/${ed.cid}/evaluate`);
+      r = await this._api("POST", `/controllers/${ed.cid}/evaluate`);
+      // trial supersedes observe this cycle: drop the live status lines so
+      // trial coloring isn't mixed with observe ✓/✗ rows (WHA-F-242)
+      ed.df?.container
+        ?.querySelectorAll("[data-observe]")
+        .forEach((el) => el.remove());
       ed.trial = r;
       // color condition nodes by met/unmet
       for (const [condId, nodeId] of ed.condToNode) {
@@ -2073,6 +2400,18 @@ class ScannerPanel extends HTMLElement {
       this._renderInspector();
       this.toast(this.tr("evalDone"));
     } catch (err) {
+      // trial failure: drop the stale artifacts too (WHA-F-234) — a stale
+      // snapshot next to a failure toast contradicts itself
+      ed.trial = null;
+      this.shadowRoot
+        ?.querySelector("[data-inspector] details.wha-json")
+        ?.remove();
+      for (const nodeId of ed.outToNode.values()) {
+        const badge = ed.df?.container?.querySelector(
+          `#node-${nodeId} [data-badge]`
+        );
+        if (badge) badge.style.display = "none";
+      }
       this.toast(String(err.message || err), true);
     }
   }

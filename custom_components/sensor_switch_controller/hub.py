@@ -108,7 +108,7 @@ def _migrate_controller_v4(cfg: dict) -> dict:
 
 
 def _strip_duration_coverage(cfg: dict) -> dict:
-    """v4/v5→5 cleanup for 0.7.0-era stores: duration ids in
+    """v4/v5→6 cleanup for 0.7.0-era stores: duration ids in
     routes.conditions were legal then but duration has no signal port now
     — drop them (trigger falls back to its remaining coverage; empty
     coverage = wired-to-nothing, which the user fixes on the canvas)."""
@@ -132,6 +132,75 @@ def _strip_duration_coverage(cfg: dict) -> dict:
         cov = routes.get("conditions")
         if isinstance(cov, list) and any(c in dur_ids for c in cov):
             routes["conditions"] = [c for c in cov if c not in dur_ids]
+    return cfg
+
+
+def _flatten_group_coverage(cfg: dict) -> dict:
+    """v4/v5→6 finalizer for 0.7.3: routes.conditions may only name EMPTY
+    groups (trigger-logic anchors) or plain leaves/duration-free leaves.
+    Group ids WITH members expand to their subtree leaves; members-less
+    group ids stay (legal anchors). Duration ids are already stripped.
+    This guarantees migrated stores pass validate_controller (WHA-F-119).
+    """
+    conditions = cfg.get("conditions") or []
+    by_id = {
+        c.get("id"): c
+        for c in conditions
+        if isinstance(c, dict) and isinstance(c.get("id"), str)
+    }
+    triggers = cfg.get(CONF_TRIGGERS)
+    if not isinstance(triggers, list):
+        return cfg
+    for trg in triggers:
+        if not isinstance(trg, dict):
+            continue
+        routes = trg.get(CONF_ROUTES)
+        if not isinstance(routes, dict):
+            continue
+        cov = routes.get("conditions")
+        if not isinstance(cov, list):
+            continue
+        out: list[str] = []
+        for cid in cov:
+            cond = by_id.get(cid)
+            if (
+                isinstance(cond, dict)
+                and cond.get("type") in ("and", "or", "not")
+                and cond.get("conditions")
+            ):
+                # member-carrying group: expand to subtree leaves. If the
+                # subtree holds no legal leaf (all duration), the coverage
+                # becomes EMPTY - "wired to nothing" is the only state that
+                # passes the members+coverage exclusivity backstop (F-115);
+                # keeping the member-carrying group id here would invalidate
+                # the whole controller (WHA-F-133).
+                stack = [cid]
+                subtree: list[str] = []
+                seen_local: set[str] = set()
+                while stack:
+                    cur = stack.pop()
+                    c = by_id.get(cur)
+                    if not c or cur in seen_local:
+                        continue
+                    seen_local.add(cur)
+                    if c.get("type") in ("and", "or", "not"):
+                        stack.extend(c.get("conditions") or [])
+                    elif c.get("type") != COND_DURATION:
+                        # duration is not a legal signal origin (WHA-F-126)
+                        subtree.append(cur)
+                if subtree:
+                    out.extend(subtree)
+                else:
+                    _LOGGER.warning(
+                        "Controller %s: trigger coverage pointed at group "
+                        "%s whose members are all duration gates - the "
+                        "trigger is now unwired; re-anchor it on the canvas",
+                        cfg.get("name", "?"),
+                        cid,
+                    )
+            else:
+                out.append(cid)
+        routes["conditions"] = list(dict.fromkeys(out))
     return cfg
 
 
@@ -227,22 +296,34 @@ def _migrate_controller_v2(cfg: dict) -> dict:
 
 
 class _MigratingStore(Store):
-    """Store with the v2/v3/v4→5 migrations wired in.
+    """Store with the v2/v3/v4/v5→6 migrations wired in.
 
     ``Store`` has no ``migrate_func=`` constructor argument; a subclass
-    overrides ``_async_migrate_func(old_major_version, old_data)`` and
-    returns the migrated payload (HA saves it back automatically).
+    overrides ``_async_migrate_func(old_major_version, old_minor_version,
+    old_data)`` and returns the migrated payload (HA saves it back
+    automatically).
     """
 
-    async def _async_migrate_func(self, old_major_version, old_data):
+    async def _async_migrate_func(
+        self, old_major_version, old_minor_version, old_data
+    ):
+        # three-parameter form: HA's baseline dispatch path (the two-parameter
+        # form is also supported via inspect-parameter-count detection, but
+        # three parameters remove all doubt — F-128)
         if old_major_version >= STORE_VERSION:
             return old_data
         raw = (old_data or {}).get(CONF_CONTROLLERS)
         if isinstance(raw, dict):
             steps = {
-                2: (_migrate_controller_v2, _migrate_controller_v4, _strip_duration_coverage),
-                3: (_migrate_controller_v4, _strip_duration_coverage),
-                4: (_strip_duration_coverage,),
+                2: (
+                    _migrate_controller_v2,
+                    _migrate_controller_v4,
+                    _strip_duration_coverage,
+                    _flatten_group_coverage,
+                ),
+                3: (_migrate_controller_v4, _strip_duration_coverage, _flatten_group_coverage),
+                4: (_strip_duration_coverage, _flatten_group_coverage),
+                5: (_strip_duration_coverage, _flatten_group_coverage),
             }
             chain = steps.get(old_major_version, ())
             for cid, cfg in raw.items():

@@ -348,13 +348,30 @@ details.wha-json pre {
 .parent-drawflow .drawflow .wha-node.cond-not .input_1 {
   background: #64748b;
 }
-/* logic groups: "members first, signal freezes" — signal wiring hides
-   (freezes) the members port; a member-less group dims its signal port */
+/* logic groups: symmetric mutual exclusion. Wiring the members port
+   hides the (unwired) signal port; wiring the signal port hides the
+   members port (trigger-logic groups carry no member wires, so the
+   hidden port is always unwired — endpoint-safe) */
+.parent-drawflow .drawflow .wha-node.gate-has-members .input_3 {
+  display: none;
+}
 .parent-drawflow .drawflow .wha-node.gate-has-signal .input_1 {
   display: none;
 }
-.parent-drawflow .drawflow .wha-node.gate-no-members .input_3 {
-  opacity: 0.35;
+/* live condition status (observe loop) */
+.parent-drawflow .drawflow .wha-node .wha-observe {
+  margin-top: 3px;
+  padding-top: 3px;
+  border-top: 1px dashed var(--wha-line, #e0e0e0);
+  font-size: 11px;
+  font-weight: 600;
+}
+.parent-drawflow .drawflow .wha-node .wha-observe.ok { color: var(--wha-ok, #43a047); }
+.parent-drawflow .drawflow .wha-node .wha-observe.bad { color: var(--wha-bad, #db4437); }
+.parent-drawflow .drawflow .wha-node .wha-passthrough {
+  margin-top: 3px;
+  font-size: 10px;
+  color: #d97706;
 }
 /* groups' input_2 slot is dead (members=input_1, signal=input_3) */
 .parent-drawflow .drawflow .wha-node.cond-and .input_2,

@@ -192,6 +192,41 @@ class EvaluateView(HomeAssistantView):
         return self.json({"ok": True, **result})
 
 
+class ObserveView(HomeAssistantView):
+    """GET /api/sensor_switch_controller/controllers/{id}/observe.
+
+    Read-only evaluation for the editor's live condition status: shares the
+    evaluation lock (timer ledgers stay consistent) but applies nothing.
+    """
+
+    url = API_BASE + "/controllers/{controller_id}/observe"
+    name = "api:sensor_switch_controller:observe"
+    requires_auth = True
+
+    @require_admin
+    async def get(self, request: web.Request, controller_id: str) -> web.Response:
+        hass = request.app["hass"]
+        hub = get_hub(hass)
+        if hub is None:
+            return self.json({"ok": False, "error": "集成未加载"}, status_code=503)
+        cid = controller_id
+        manager = hub.managers.get(cid)
+        if manager is None:
+            if cid in hub.controllers:
+                return self.json(
+                    {"ok": False, "error": "控制器已停用"}, status_code=409
+                )
+            return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
+        try:
+            result = await manager.async_observe_conditions()
+        except Exception:
+            _LOGGER.exception("Observe failed for %s", cid)
+            return self.json(
+                {"ok": False, "error": "观察失败，详见日志"}, status_code=500
+            )
+        return self.json({"ok": True, **result})
+
+
 class LogsView(HomeAssistantView):
     """GET /api/sensor_switch_controller/logs?controller_id=&date=&decision=&limit="""
 
@@ -260,6 +295,7 @@ async def async_setup_web(hass: HomeAssistant) -> None:
         hass.http.register_view(ControllersView())
         hass.http.register_view(ControllerDetailView())
         hass.http.register_view(EvaluateView())
+        hass.http.register_view(ObserveView())
         hass.http.register_view(LogsView())
         flags["views"] = True
 

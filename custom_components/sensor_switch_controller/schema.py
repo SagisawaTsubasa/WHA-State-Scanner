@@ -10,10 +10,11 @@ present → the outputs reachable from the covered conditions) and two new
 leaf conditions exist: ``duration`` (TON gate with start/abort inputs)
 and ``debounce`` (true once the entity has been quiet for N seconds).
 Since 0.7.0 routes carry conditions only — triggers never wire outputs
-directly (an ``outputs`` key in routes is rejected). Since 0.7.2 and/or/not
-groups may carry the coverage again: on the canvas a group's signal port
-requires member wires first and freezes them once wired (a UI constraint,
-not a storage one).
+directly (an ``outputs`` key in routes is rejected). Since 0.7.3 the
+logic groups are dual-mode: wiring their signal port makes them trigger
+mergers (pass-through, members may be empty while signal-covered), wiring
+their members port makes them plain and/or/not gates — the two modes are
+mutually exclusive on the canvas.
 """
 
 from __future__ import annotations
@@ -530,9 +531,12 @@ def _validate_condition(cond) -> dict:
         result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "防抖实体")
 
     else:  # and / or / not
-        members = cond.get("conditions")
-        if not isinstance(members, list) or not members:
-            _fail(f"{ctype} 组条件必须至少引用一个成员条件")
+        members = cond.get("conditions") or []
+        # an EMPTY group is provisionally allowed here: trigger-logic mode
+        # (0.7.3) uses member-less groups as signal anchors. The final
+        # verdict lives in _check_graph, which knows the trigger coverage.
+        if not isinstance(members, list):
+            _fail(f"{ctype} 组条件的成员必须是列表")
         if not all(isinstance(m, str) for m in members):
             _fail("组条件的成员必须是条件 id 字符串")
         if len(set(members)) != len(members):
@@ -642,6 +646,63 @@ def _check_graph(
             for member in out[key]:
                 if member not in by_id:
                     _fail(f"输出的 {key} 引用了不存在的条件：{member}")
+
+    # Trigger-logic groups (0.7.3): a group with NO members is legal when a
+    # trigger's signal coverage names it — it is a trigger-merge anchor
+    # (pass-through). An unreferenced empty group stays rejected.
+    # Coverage is TOPOLOGICAL — it does not depend on trigger.enabled
+    # (0.7.3 F-151 resolution, superseding the F-120 filter): a disabled
+    # trigger never fires, so its coverage keeps the anchor valid without
+    # ever acting; filtering by enabled made "disable → save" a dead end.
+    signal_covered = {
+        member
+        for trg in triggers or []
+        for member in (trg.get(CONF_ROUTES) or {}).get("conditions") or []
+    }
+    # topological references (WHA-F-167/F-170): membership in another
+    # group, an output chain, or a duration start/abort — all keep an empty
+    # group alive on the canvas
+    member_referenced = {
+        m
+        for cond in conditions
+        if isinstance(cond, dict)
+        for m in (
+            (cond.get("conditions") or [])
+            + ([cond.get("start")] if cond.get("start") else [])
+            + ([cond.get("abort")] if cond.get("abort") else [])
+        )
+        if isinstance(m, str)
+    }
+    member_referenced |= {
+        m
+        for out in outputs
+        if isinstance(out, dict)
+        for m in (out.get("on_conditions") or []) + (out.get("off_conditions") or [])
+    }
+    for cond in conditions:
+        if cond["type"] not in GROUP_TYPES:
+            continue
+        has_members = bool(cond["conditions"])
+        # two distinct notions (WHA-F-168): referenced = kept alive by any
+        # wire (trigger coverage OR membership in another group); signal-
+        # covered = a trigger wires it directly. Only the latter conflicts
+        # with having members (the pass-through engine would ignore them).
+        referenced = cond["id"] in signal_covered or cond["id"] in member_referenced
+        label = cond.get("label") or cond["id"]
+        if not has_members and not referenced:
+            _fail(
+                f"逻辑组「{label}」没有任何成员：把条件连到它的成员口，"
+                "或让触发器信号直达它（触发逻辑模式）"
+            )
+        if has_members and cond["id"] in signal_covered:
+            # canvas exclusivity backstop: a group is EITHER a condition
+            # gate (members) OR a trigger-merger anchor (signal-covered),
+            # never both — members of a signal-covered group would be
+            # silently ignored by the pass-through engine (WHA-F-115)
+            _fail(
+                f"逻辑组「{label}」同时有成员和触发器信号覆盖（二选一）："
+                "删除信号覆盖或清空成员"
+            )
 
     for trg in triggers or []:
         tid = trg.get("id")
