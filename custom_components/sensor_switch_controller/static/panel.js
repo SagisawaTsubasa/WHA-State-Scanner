@@ -576,8 +576,31 @@ class ScannerPanel extends HTMLElement {
 
   /* ---------------- routing ---------------- */
 
+  // True when this element is mounted inside the FumihaHub shell (the page
+  // host lives in the hub's shadow root). Standalone mounts sit in the
+  // document, so the root check discriminates cleanly.
+  _inShell() {
+    const root = this.getRootNode();
+    return (
+      root instanceof ShadowRoot &&
+      root.host instanceof HTMLElement &&
+      root.host.tagName === "FUMIHA-HUB-PANEL"
+    );
+  }
+
   _applyHash(rerender) {
-    const hash = location.hash || "";
+    if (this._inShell()) {
+      // The shell owns location.hash with its own single route (#pn=…) and
+      // normalizes anything else away (WHA-F-253): our #/editor sub-route
+      // would be rewritten and the view reset. In-shell navigation is
+      // memory-state only (see _nav); deep links/refresh persistence of
+      // sub-views remain a standalone-mode capability.
+      return;
+    }
+    this._applyRoute(location.hash || "", rerender);
+  }
+
+  _applyRoute(hash, rerender) {
     const m = hash.match(/^#\/(editor|logs)\/?([A-Za-z0-9_]*)/);
     if (m) {
       this._view = m[1];
@@ -590,6 +613,12 @@ class ScannerPanel extends HTMLElement {
   }
 
   _nav(hash) {
+    if (this._inShell()) {
+      // Never write location.hash in-shell (WHA-F-253) — switch the view
+      // from the requested route string directly.
+      this._applyRoute(String(hash), true);
+      return;
+    }
     if (location.hash === hash) this._applyHash(true);
     else location.hash = hash;
   }
@@ -1887,12 +1916,12 @@ class ScannerPanel extends HTMLElement {
     return `
       <div class="wha-node-body-wrap">
         <div class="wha-node-head">
-          <span>${out.type === "switch" ? "⏻" : "◉"}</span>
+          <span data-nicon>${out.type === "switch" ? "⏻" : "◉"}</span>
           <span data-nhead>${esc(out.name)}</span>
-          <span class="wha-node-tag">${esc(out.type)}</span>
+          <span class="wha-node-tag" data-ntag>${esc(out.type)}</span>
         </div>
         <div class="wha-node-body" data-nbody>
-          ${out.manual_override ? "✋ " : ""}${esc(out.entity_id)}
+          ${out.type === "switch" && out.manual_override ? "✋ " : ""}${esc(out.entity_id)}
         </div>
         <span class="decision-badge" data-badge style="display:none"></span>
       </div>`;
@@ -2032,7 +2061,13 @@ class ScannerPanel extends HTMLElement {
       const out = ed.controller.outputs.find((o) => o.entity_id === outId);
       if (!out) return;
       if (head) head.textContent = out.name;
-      if (body) body.innerHTML = `${out.manual_override ? "✋ " : ""}${esc(out.entity_id)}`;
+      // head icon/type tag must follow a type switch too (WHA-F-265)
+      const nicon = el.querySelector("[data-nicon]");
+      if (nicon) nicon.textContent = out.type === "switch" ? "⏻" : "◉";
+      const ntag = el.querySelector("[data-ntag]");
+      if (ntag) ntag.textContent = out.type;
+      if (body)
+        body.innerHTML = `${out.type === "switch" && out.manual_override ? "✋ " : ""}${esc(out.entity_id)}`;
     } else {
       const trgId = ed.nodeToTrg.get(nodeId);
       if (trgId === undefined) return;
@@ -2118,14 +2153,24 @@ class ScannerPanel extends HTMLElement {
             <option value="binary_sensor" ${out.type === "binary_sensor" ? "selected" : ""}>${esc(this.tr("outBinary"))}</option>
           </select>
         </label>
-        <label class="field field-inline"><input type="checkbox" data-insk="manual_override" ${out.manual_override ? "checked" : ""}> ${esc(this.tr("manualOverride"))}</label>
         <p class="wha-sub">${esc(out.entity_id)}</p>
+        ${out.type === "switch"
+          ? `<label class="field field-inline"><input type="checkbox" data-insk="manual_override" ${out.manual_override ? "checked" : ""}> ${esc(this.tr("manualOverride"))}</label>`
+          : ""}
+        ${/* manual override is a switch-only capability (README; the binary_sensor entity has no control surface to lock, WHA-F-262) */ ""}
         ${this._trialHtml()}`;
       box.querySelectorAll("[data-insk]").forEach((input) =>
         input.addEventListener("change", () => {
           const k = input.dataset.insk;
           out[k] = input.type === "checkbox" ? input.checked : input.value;
           ed.dirty = true;
+          if (k === "type") {
+            // The type gates the inspector's manual-override checkbox and the
+            // node head icon/tag — rebuild the inspector so the gate is
+            // re-evaluated (WHA-F-264) instead of leaving a stale checkbox
+            // that can still write the flag on the new type.
+            this._renderInspector();
+          }
           this._refreshNodeBody(sel.nodeId);
         })
       );
@@ -2356,7 +2401,13 @@ class ScannerPanel extends HTMLElement {
       ed.dirty = false;
       this.toast(this.tr("savedOk"));
       this._setData(await this._api("GET", "/config"));
-      if (location.hash !== `#/editor/${ed.cid}`) this._nav(`#/editor/${ed.cid}`);
+      // Memory-state comparison (WHA-F-259): location.hash is shell-owned
+      // (#pn=…) so a hash comparison would re-render — and reset the canvas
+      // layout — on every in-shell save; standalone already skips when the
+      // view is already on this controller's editor.
+      if (this._view !== "editor" || this._cid !== ed.cid) {
+        this._nav(`#/editor/${ed.cid}`);
+      }
     } catch (err) {
       this.toast(String(err.message || err), true);
     }
@@ -2498,4 +2549,14 @@ class ScannerPanel extends HTMLElement {
   }
 }
 
-customElements.define(TAG, ScannerPanel);
+// Guarded define: a re-import under a new ?ver= (deploy while the tab is
+// open) must not throw "already defined" — the shell detects version drift
+// itself and asks for a refresh.
+if (!customElements.get(TAG)) {
+  customElements.define(TAG, ScannerPanel);
+} else {
+  console.warn(
+    `[${TAG}] already defined — skipping re-register (module re-import under a new ?ver=; ` +
+      "the shell shows its own refresh card on version drift)"
+  );
+}

@@ -1,0 +1,57 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  hassfest:
+    name: Hassfest validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Hassfest
+        uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: HACS Action
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  pytest:
+    name: Tests (stubbed HA) + import under real HA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test deps
+        run: pip install -r requirements-dev.txt
+      - name: Run pytest (stub-backed, clean process)
+        run: python -m pytest tests/ -q
+      - name: Run smoke (zero-dependency script)
+        run: python tests/smoke.py
+      - name: Import under real HA
+        run: |
+          pip install homeassistant==2026.1.3
+          python - <<'EOF'
+          import custom_components.sensor_switch_controller
+          import custom_components.sensor_switch_controller.switch
+          import custom_components.sensor_switch_controller.binary_sensor
+          import custom_components.sensor_switch_controller.config_flow
+          import custom_components.sensor_switch_controller.web
+          print("all sensor_switch_controller modules import cleanly under real HA")
+          EOF

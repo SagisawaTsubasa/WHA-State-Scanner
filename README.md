@@ -67,6 +67,8 @@
 
 ## Web 管理页 / Web Panel
 
+安装文羽面板壳（FumihaHub）后，本面板自动并入壳的页签栏（不再重复出现在侧边栏）；未装壳或壳被移除时（条目重载后）回落独立侧边栏面板，两种形态自动切换。壳内编辑器/日志视图为页内内存态导航，独立模式下才支持 `#/editor/<id>` 深链接与刷新保持。
+
 | 视图 / View | 内容 / Content |
 |-------------|----------------|
 | **总览 / Overview** | 控制器卡片（输出实时状态、立即评估、启停、删除）+ 全局传感器池视图 / Controller cards with live output states + global sensor pool view |
@@ -194,6 +196,13 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.8.0 — 接入文羽面板壳（FumihaHub）
+- **壳集成在场时面板自动注册为壳内页签**（`sensorswitch.main`，排序 40），卸载/删除壳后（条目重载后）自动回落为独立侧边栏面板（`wha-scanner`）——无需改任何配置；HA 启动时序竞态由 `homeassistant_started` 事件重判兜底
+- 模式切换（壳出现/消失）时对称拆除旧注册；壳内页内导航为内存态（壳独占 `location.hash`，`#/editor/<id>` 深链接/刷新保持仅独立模式支持）；移动端只读由 CSS 视口断点驱动，两种模式一致
+- panel.js 自定义元素注册改守卫式，模块重复加载（升级时页签已开）不再抛"已定义"错误
+- 「手动覆盖」限定为开关输出专属：二进制传感器输出不再显示该勾选与 ✋ 标记（实体侧本无控制面可锁）；试运行徽章现可正确显示 ✓（已写入）/ ✋（手动覆盖拦截）
+- 工程面：tests/ 解禁入仓（smoke.py 零依赖冒烟 + web 层 pytest 用例），新增 `.github/workflows/validate.yml`（hassfest + HACS + pytest/真机 import 三 job），`pyproject.toml`/`requirements-dev.txt` 入仓
 
 ### 0.7.3 — 逻辑组双模式 + 条件节点实时状态
 

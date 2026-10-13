@@ -12,13 +12,16 @@ venv/
 coverage.xml
 htmlcov/
 
+# Local review-fix snapshots
+.backup-pre-*/
+
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 
-# ---- 2026-10-09 仓库整理：测试源码移 project-tests ----
-tests/
+# ---- 2026-10-09 仓库整理 ----
+# tests/ 已于 2026-10-14 解禁入仓（smoke.py + web 层 pytest 用例 + CI）
 dev/
 /*.png

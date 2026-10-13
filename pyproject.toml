@@ -1,0 +1,18 @@
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+exclude = [".git", ".venv", "__pycache__", ".backup-pre-*"]
+
+[tool.ruff.lint]
+# 与 Stockroom 基准仓一致取 ruff 默认规则面（E4/E7/E9/F；不含 I，
+# isort 类配置在无 I 规则时永不生效，故不设——WHA-F-255）；
+# tests/smoke.py 是零依赖线性冒烟脚本，中段 import 属设计（先装桩
+# 再快照迁移输入），仅豁免 E402。
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/smoke.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

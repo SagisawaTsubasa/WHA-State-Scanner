@@ -540,6 +540,11 @@ class ControllerManager:
             "off_met": off_met,
             "on_conditions": on_details or {},
             "off_conditions": off_details or {},
+            # applied/override feed the trial-run badge suffixes (✓ / ✋) —
+            # without them the panel could never show a manual-override
+            # interception (WHA-F-266; mirrors last_results above).
+            "applied": applied,
+            "override": overridden,
         }
 
     def runtime_snapshot(self) -> dict:
