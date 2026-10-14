@@ -42,7 +42,6 @@ const LANG = {
     confirmTitle: "确认操作",
     confirmOk: "确定",
     confirmCancel: "取消",
-    toggling: "切换中…",
     trialDirtyConfirm: "有未保存的修改。试运行将按已保存的配置执行，未保存的修改不会生效。继续？",
     evaluateConfirmBody: "的输出将按当前条件立即动作。确定执行？",
     logsEmpty: "该日无决策记录",
@@ -190,7 +189,6 @@ const LANG = {
     confirmTitle: "Confirm",
     confirmOk: "OK",
     confirmCancel: "Cancel",
-    toggling: "Switching…",
     trialDirtyConfirm: "You have unsaved changes. The trial runs the SAVED config — unsaved changes will not apply. Continue?",
     evaluateConfirmBody: " will act on current conditions immediately. Run it now?",
     logsEmpty: "No decision records for this day",
@@ -806,6 +804,7 @@ class ScannerPanel extends HTMLElement {
           this.tr("confirmTitle"),
           '"' + cfg.name + '"' + this.tr("evaluateConfirmBody"),
           async () => {
+            if (this._toggleBusy === cid) return; // WHA-IMP-15: 入口守卫
             this._toggleBusy = cid; // 与 toggle 共用控制器级忙碌面
             try {
               await this._api("POST", `/controllers/${cid}/evaluate`);
@@ -817,7 +816,8 @@ class ScannerPanel extends HTMLElement {
               if (this._toggleBusy === cid) {
                 this._toggleBusy = null;
               }
-              this._render();
+              // WHA-IMP-16: 用户可能已切到编辑器/日志——只有仍在总览才重渲染
+              if (this._view === "overview") this._render();
             }
           }
         );
@@ -826,6 +826,7 @@ class ScannerPanel extends HTMLElement {
       if (act === "toggle") {
         // WHA-UX-03+WHA-IMP-03: 忙碌态记在控制器级——5s 轮询重渲染会重建
         // 整卡 DOM，仅禁当次 DOM 会被抹掉，造成二次 PUT 翻转竞态。
+        if (this._toggleBusy === cid) return; // WHA-IMP-15: 首渲染前的入口守卫
         this._toggleBusy = cid;
         try {
           const config = this._controllerConfig(cid);
@@ -837,7 +838,8 @@ class ScannerPanel extends HTMLElement {
         } finally {
           if (this._toggleBusy === cid) {
             this._toggleBusy = null;
-            this._render();
+            // WHA-IMP-16: 仅总览视图重渲染（编辑器未保存修改/日志结果保护）
+            if (this._view === "overview") this._render();
           }
         }
         return;
