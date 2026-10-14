@@ -39,6 +39,14 @@ const LANG = {
     disable: "停用",
     delete: "删除",
     confirmDelete: "删除控制器？其输出实体将一并移除。",
+    confirmTitle: "确认操作",
+    confirmOk: "确定",
+    confirmCancel: "取消",
+    toggling: "切换中…",
+    trialDirtyConfirm: "有未保存的修改。试运行将按已保存的配置执行，未保存的修改不会生效。继续？",
+    logsEmpty: "该日无决策记录",
+    logsTruncated: "已达单次上限 500 条，可缩小日期范围",
+    noControllers: "尚无控制器 — 点「新建控制器」开始",
     outputs: "输出",
     lastEval: "上次评估",
     never: "从未",
@@ -178,6 +186,14 @@ const LANG = {
     disable: "Disable",
     delete: "Delete",
     confirmDelete: "Delete controller? Its output entities will be removed too.",
+    confirmTitle: "Confirm",
+    confirmOk: "OK",
+    confirmCancel: "Cancel",
+    toggling: "Switching…",
+    trialDirtyConfirm: "You have unsaved changes. The trial runs the SAVED config — unsaved changes will not apply. Continue?",
+    logsEmpty: "No decision records for this day",
+    logsTruncated: "Reached the 500-record limit — narrow the date range",
+    noControllers: "No controllers yet — create one to start",
     outputs: "Outputs",
     lastEval: "Last evaluation",
     never: "never",
@@ -781,24 +797,58 @@ class ScannerPanel extends HTMLElement {
         return;
       }
       if (act === "eval") {
-        await this._api("POST", `/controllers/${cid}/evaluate`);
-        this.toast(this.tr("evalDone"));
-        this._setData(await this._api("GET", "/config"));
-        this._render();
+        // UX-M-03: 真实应用输出（与 FL-UX-03 同判据）——确认 + 忙碌态
+        const cfg = this._controllerConfig(cid);
+        this._openConfirm(
+          this.tr("confirmTitle"),
+          `${this.tr("evaluateNow")}：${cfg.name}？输出将按当前条件立即动作。`,
+          async () => {
+            const card = this.shadowRoot.querySelector(`[data-cid="${cid}"]`);
+            card?.querySelectorAll("button").forEach((b) => (b.disabled = true));
+            try {
+              await this._api("POST", `/controllers/${cid}/evaluate`);
+              this.toast(this.tr("evalDone"));
+              this._setData(await this._api("GET", "/config"));
+              this._render();
+            } catch (err) {
+              this.toast(String(err.message || err), true);
+              card?.querySelectorAll("button").forEach((b) => (b.disabled = false));
+            }
+          }
+        );
         return;
       }
       if (act === "toggle") {
-        const config = this._controllerConfig(cid);
-        config.enabled = !config.enabled;
-        await this._api("PUT", `/controllers/${cid}`, config);
-        await this._sleepReload();
+        // WHA-UX-03: 重载窗口内禁用本卡按钮，防重复 PUT
+        const card = this.shadowRoot.querySelector(`[data-cid="${cid}"]`);
+        const btn = card?.querySelector('[data-act="toggle"]');
+        const label = btn?.textContent;
+        card?.querySelectorAll("button").forEach((b) => (b.disabled = true));
+        if (btn) btn.textContent = this.tr("toggling");
+        try {
+          const config = this._controllerConfig(cid);
+          config.enabled = !config.enabled;
+          await this._api("PUT", `/controllers/${cid}`, config);
+          await this._sleepReload();
+        } catch (err) {
+          this.toast(String(err.message || err), true);
+          card?.querySelectorAll("button").forEach((b) => (b.disabled = false));
+          if (btn) btn.textContent = label;
+        }
         return;
       }
       if (act === "del") {
-        if (!confirm(this.tr("confirmDelete"))) return;
-        await this._api("DELETE", `/controllers/${cid}`);
-        this.toast(this.tr("deleteOk"));
-        await this._sleepReload();
+        this._openConfirm(this.tr("confirmTitle"), this.tr("confirmDelete"), async () => {
+          try {
+            await this._api("DELETE", `/controllers/${cid}`);
+            this.toast(this.tr("deleteOk"));
+            this._setData(await this._api("GET", "/config"));
+            this._render();
+          } catch (err) {
+            this.toast(String(err.message || err), true);
+          }
+        });
+        return;
       }
     } catch (err) {
       this.toast(String(err.message || err), true);
@@ -2416,10 +2466,22 @@ class ScannerPanel extends HTMLElement {
   async _trialRun() {
     const ed = this._editor;
     if (ed.isNew) {
+      // 从未保存过：阻断（WHA-UX-02——与 dirty 确认拆键）
       this.toast(this.tr("trialNeedSave"), true);
       return;
     }
-    if (ed.dirty && !confirm(this.tr("trialNeedSave"))) return;
+    if (ed.dirty) {
+      // 有未保存修改：明示"按已保存配置执行"，自绘确认（WHA-UX-01）
+      this._openConfirm(this.tr("confirmTitle"), this.tr("trialDirtyConfirm"), () => {
+        this._runTrial();
+      });
+      return;
+    }
+    await this._runTrial();
+  }
+
+  async _runTrial() {
+    const ed = this._editor;
     let r;
     try {
       r = await this._api("POST", `/controllers/${ed.cid}/evaluate`);
@@ -2509,11 +2571,44 @@ class ScannerPanel extends HTMLElement {
         this._logs = await this._api("GET", `/logs?${params}`);
         this._renderLogTable(box);
       } catch (err) {
-        box.innerHTML = `<p class="wha-sub">${esc(String(err.message || err))}</p>`;
+        // UX-M-04: 失败与"该日无记录"分态展示
+        box.innerHTML = `<p class="wha-sub" style="color:#c62828">${esc(
+          String(err.message || err)
+        )}（可点「查询」重试）</p>`;
       }
     };
     main.querySelector('[data-lact="query"]').addEventListener("click", query);
     query();
+  }
+
+  // 自绘确认对话框（WHA-UX-01）：原生 confirm 在壳内/移动端观感突兀且按钮
+  // 序不可控；仅此一处组件，删除控制器与试运行 dirty 确认共用。
+  _openConfirm(title, text, onOk) {
+    const root = this.shadowRoot;
+    root.querySelector(".wha-confirm")?.remove();
+    const wrap = document.createElement("div");
+    wrap.className = "wha-confirm";
+    wrap.style.cssText =
+      "position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:60;";
+    const box = document.createElement("div");
+    box.className = "wha-card";
+    box.style.cssText = "max-width:420px;margin:16px;padding:16px;";
+    box.innerHTML = `
+      <h2 style="margin:0 0 8px">${esc(title)}</h2>
+      <p class="wha-sub" style="margin:0 0 12px">${esc(text)}</p>
+      <div class="wha-row" style="justify-content:flex-end;gap:8px">
+        <button class="wha-btn" data-wc="cancel">${esc(this.tr("confirmCancel"))}</button>
+        <button class="wha-btn danger" data-wc="ok">${esc(this.tr("confirmOk"))}</button>
+      </div>`;
+    wrap.appendChild(box);
+    wrap.addEventListener("click", (ev) => {
+      const c = ev.target?.dataset?.wc;
+      if (c || ev.target === wrap) {
+        wrap.remove();
+        if (c === "ok") onOk();
+      }
+    });
+    root.appendChild(wrap);
   }
 
   _renderLogTable(box) {
@@ -2539,13 +2634,13 @@ class ScannerPanel extends HTMLElement {
       })
       .join("");
     box.innerHTML = `
-      ${logs.truncated ? `<p class="wha-sub">⚠ limit</p>` : ""}
+      ${logs.truncated ? `<p class="wha-sub">${esc(this.tr("logsTruncated"))}</p>` : ""}
       ${rows
         ? `<table class="wha-table"><thead><tr>
             <th>${esc(this.tr("time"))}</th><th>${esc(this.tr("outputs"))}</th><th>${esc(this.tr("decision"))}</th>
             <th>on_met</th><th>off_met</th><th>applied</th><th>${esc(this.tr("byLabel"))}</th><th>${esc(this.tr("readouts"))}</th>
           </tr></thead><tbody>${rows}</tbody></table>`
-        : `<p class="wha-sub">—</p>`}`;
+        : `<p class="wha-sub">${esc(this.tr("logsEmpty"))}</p>`}`;
   }
 }
 
