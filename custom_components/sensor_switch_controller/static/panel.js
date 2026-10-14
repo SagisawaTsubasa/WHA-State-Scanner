@@ -850,7 +850,8 @@ class ScannerPanel extends HTMLElement {
             await this._api("DELETE", `/controllers/${cid}`);
             this.toast(this.tr("deleteOk"));
             this._setData(await this._api("GET", "/config"));
-            this._render();
+            // WHA-IMP-21: 与 IMP-20 同判据——仅总览视图收尾渲染
+            if (this._view === "overview") this._render();
           } catch (err) {
             this.toast(String(err.message || err), true);
           }
@@ -866,7 +867,9 @@ class ScannerPanel extends HTMLElement {
     this.toast(this.tr("saved"));
     await new Promise((r) => setTimeout(r, 1200));
     this._setData(await this._api("GET", "/config"));
-    this._render();
+    // WHA-IMP-20: 等待窗口内用户可能已切到编辑器（未保存修改会被以已保存
+    // 配置重建）或日志（查询结果会被重置）——只在总览视图收尾渲染。
+    if (this._view === "overview") this._render();
   }
 
   async _createController() {
