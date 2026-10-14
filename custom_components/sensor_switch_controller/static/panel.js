@@ -44,8 +44,9 @@ const LANG = {
     confirmCancel: "取消",
     toggling: "切换中…",
     trialDirtyConfirm: "有未保存的修改。试运行将按已保存的配置执行，未保存的修改不会生效。继续？",
+    evaluateConfirmBody: "的输出将按当前条件立即动作。确定执行？",
     logsEmpty: "该日无决策记录",
-    logsTruncated: "已达单次上限 500 条，可缩小日期范围",
+    logsTruncated: "已达单次查询上限，可缩小日期范围或调大条数",
     noControllers: "尚无控制器 — 点「新建控制器」开始",
     outputs: "输出",
     lastEval: "上次评估",
@@ -191,8 +192,9 @@ const LANG = {
     confirmCancel: "Cancel",
     toggling: "Switching…",
     trialDirtyConfirm: "You have unsaved changes. The trial runs the SAVED config — unsaved changes will not apply. Continue?",
+    evaluateConfirmBody: " will act on current conditions immediately. Run it now?",
     logsEmpty: "No decision records for this day",
-    logsTruncated: "Reached the 500-record limit — narrow the date range",
+    logsTruncated: "Query limit reached — narrow the date range or raise the limit",
     noControllers: "No controllers yet — create one to start",
     outputs: "Outputs",
     lastEval: "Last evaluation",
@@ -719,6 +721,7 @@ class ScannerPanel extends HTMLElement {
             <p class="wha-sub" style="margin-top:8px">${esc(this.tr("invalidStoredLead"))}${esc(c.invalid_error || "")}${esc(this.tr("invalidStoredTail"))}</p>
           </div>`;
         }
+        const busyAttr = this._toggleBusy === cid ? "disabled" : "";
         const outputs = (c.outputs || [])
           .map((o) => {
             const rt = c.runtime?.outputs?.[o.entity_id];
@@ -737,11 +740,11 @@ class ScannerPanel extends HTMLElement {
               <span class="badge meta">${esc(this.tr("triggersTitle"))} ${c.triggers ? c.triggers.length : 0}${c.triggers && c.triggers.length === 0 ? " ⚠" : ""}</span>
               ${c.runtime?.trigger_errors ? `<span class="badge off">${esc(this.tr("triggerErrorBadge"))} ${c.runtime.trigger_errors}</span>` : ""}
               <span class="spacer" style="flex:1"></span>
-              <button class="wha-btn" data-act="edit">${esc(this.tr("edit"))}</button>
-              <button class="wha-btn" data-act="logs">${esc(this.tr("logs"))}</button>
-              <button class="wha-btn" data-act="eval">${esc(this.tr("evaluateNow"))}</button>
-              <button class="wha-btn" data-act="toggle">${c.enabled ? esc(this.tr("disable")) : esc(this.tr("enable"))}</button>
-              <button class="wha-btn danger" data-act="del">${esc(this.tr("delete"))}</button>
+              <button class="wha-btn" data-act="edit" ${busyAttr}>${esc(this.tr("edit"))}</button>
+              <button class="wha-btn" data-act="logs" ${busyAttr}>${esc(this.tr("logs"))}</button>
+              <button class="wha-btn" data-act="eval" ${busyAttr}>${esc(this.tr("evaluateNow"))}</button>
+              <button class="wha-btn" data-act="toggle" ${busyAttr}>${c.enabled ? esc(this.tr("disable")) : esc(this.tr("enable"))}</button>
+              <button class="wha-btn danger" data-act="del" ${busyAttr}>${esc(this.tr("delete"))}</button>
             </div>
             <div class="wha-row" style="margin-top:8px">${outputs || `<span class="wha-sub">—</span>`}</div>
             <p class="wha-sub">${esc(this.tr("lastEval"))}: ${esc(c.runtime?.last_cycle || this.tr("never"))}</p>
@@ -801,30 +804,29 @@ class ScannerPanel extends HTMLElement {
         const cfg = this._controllerConfig(cid);
         this._openConfirm(
           this.tr("confirmTitle"),
-          `${this.tr("evaluateNow")}：${cfg.name}？输出将按当前条件立即动作。`,
+          '"' + cfg.name + '"' + this.tr("evaluateConfirmBody"),
           async () => {
-            const card = this.shadowRoot.querySelector(`[data-cid="${cid}"]`);
-            card?.querySelectorAll("button").forEach((b) => (b.disabled = true));
+            this._toggleBusy = cid; // 与 toggle 共用控制器级忙碌面
             try {
               await this._api("POST", `/controllers/${cid}/evaluate`);
               this.toast(this.tr("evalDone"));
               this._setData(await this._api("GET", "/config"));
-              this._render();
             } catch (err) {
               this.toast(String(err.message || err), true);
-              card?.querySelectorAll("button").forEach((b) => (b.disabled = false));
+            } finally {
+              if (this._toggleBusy === cid) {
+                this._toggleBusy = null;
+              }
+              this._render();
             }
           }
         );
         return;
       }
       if (act === "toggle") {
-        // WHA-UX-03: 重载窗口内禁用本卡按钮，防重复 PUT
-        const card = this.shadowRoot.querySelector(`[data-cid="${cid}"]`);
-        const btn = card?.querySelector('[data-act="toggle"]');
-        const label = btn?.textContent;
-        card?.querySelectorAll("button").forEach((b) => (b.disabled = true));
-        if (btn) btn.textContent = this.tr("toggling");
+        // WHA-UX-03+WHA-IMP-03: 忙碌态记在控制器级——5s 轮询重渲染会重建
+        // 整卡 DOM，仅禁当次 DOM 会被抹掉，造成二次 PUT 翻转竞态。
+        this._toggleBusy = cid;
         try {
           const config = this._controllerConfig(cid);
           config.enabled = !config.enabled;
@@ -832,8 +834,11 @@ class ScannerPanel extends HTMLElement {
           await this._sleepReload();
         } catch (err) {
           this.toast(String(err.message || err), true);
-          card?.querySelectorAll("button").forEach((b) => (b.disabled = false));
-          if (btn) btn.textContent = label;
+        } finally {
+          if (this._toggleBusy === cid) {
+            this._toggleBusy = null;
+            this._render();
+          }
         }
         return;
       }
@@ -2610,6 +2615,8 @@ class ScannerPanel extends HTMLElement {
     });
     root.appendChild(wrap);
   }
+
+  _toggleBusy = null; // 正在启停/评估的控制器 id（WHA-IMP-03：跨重渲染保持禁用）
 
   _renderLogTable(box) {
     const logs = this._logs || { records: [], truncated: false };
