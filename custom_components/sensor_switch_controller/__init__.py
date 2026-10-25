@@ -33,14 +33,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hub = ScannerHub(hass)
         hass.data[DOMAIN] = hub
         await hub.async_load()
+        await hub.async_load_flag_states()
     hub.set_entry(entry.entry_id)
 
     hub.build_managers()
-    entry.async_on_unload(hub.teardown_managers)
     await async_setup_web(hass)
     _register_services(hass)
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        # setup failed: the entry never becomes loaded, so the unload
+        # callbacks below will NOT run — tear the managers down ourselves
+        # or their trigger listeners keep firing with no entities (体检 #16)
+        hub.teardown_managers()
+        raise
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
@@ -53,6 +60,15 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     also makes the config flow's already-configured guard cover it; the
     version bump stops this hook from re-running every start.
     """
+    if entry.version > 2:
+        # future version = integration was downgraded; loading would rewrite
+        # newer data with an older schema — refuse per the HA contract
+        _LOGGER.error(
+            "sensor_switch_controller entry version %s is newer than this "
+            "integration supports (2); upgrade the integration to load it",
+            entry.version,
+        )
+        return False
     updates: dict = {}
     if entry.unique_id is None and _domain_unique_id_free(hass):
         updates["unique_id"] = DOMAIN

@@ -161,6 +161,17 @@ ha.helpers.config_validation = _mod("homeassistant.helpers.config_validation")
 ha.helpers.config_validation.entity_id = lambda v: v
 ha.helpers.entity = _mod("homeassistant.helpers.entity")
 ha.helpers.entity.DeviceInfo = MagicMock
+
+
+class _RestoreEntity:
+    """Stub mixin: async_get_last_state yields no previous state."""
+
+    async def async_get_last_state(self):
+        return None
+
+
+ha.helpers.restore_state = _mod("homeassistant.helpers.restore_state")
+ha.helpers.restore_state.RestoreEntity = _RestoreEntity
 ha.helpers.start = _mod("homeassistant.helpers.start")
 ha.helpers.start.async_at_started = lambda hass, cb: (lambda: None)
 ha.helpers.entity_component = _mod("homeassistant.helpers.entity_component")
@@ -173,8 +184,15 @@ class _EntityRegistry:
         return types.SimpleNamespace(async_remove=lambda eid: None)
 
 
+def _entries_for_config_entry(registry, config_entry_id):
+    return []
+
+
 ha.helpers.entity_registry = _mod("homeassistant.helpers.entity_registry")
 ha.helpers.entity_registry.async_get = lambda hass: _EntityRegistry()
+ha.helpers.entity_registry.async_entries_for_config_entry = (
+    _entries_for_config_entry
+)
 ha.loader = _mod("homeassistant.loader")
 ha.loader.async_get_loaded_integration = lambda hass, domain: types.SimpleNamespace(
     version="test"
@@ -1080,6 +1098,105 @@ async def main():
     assert mgr_obs.last_flip_at(out_a) is None
     mgr_obs.async_unload()
     print("[PASS] observe: read-only, no flips, no log, no rearm")
+
+    # ------------------------------------------------------------------
+    # 0.9.0 flag (latch): schema rules, per-cycle stepping, reset-wins,
+    # initial hold, disabled freeze, evaluate returns the latched verdict
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.schema import (
+        ControllerValidationError as _CVE,
+        validate_controller as _vc,
+    )
+
+    set_leaf = {"id": "cond_" + "1" * 32, "type": "state",
+                "entity_id": "switch.c", "state": "on"}
+    rst_leaf = {"id": "cond_" + "2" * 32, "type": "state",
+                "entity_id": "switch.c", "state": "off"}
+    dis_leaf = {"id": "cond_" + "3" * 32, "type": "state",
+                "entity_id": "switch.c", "state": "on", "enabled": False}
+    flag_a = "cond_" + "a" * 32   # set only
+    flag_b = "cond_" + "b" * 32   # set + disabled(reset→always true): reset wins
+    flag_c = "cond_" + "c" * 32   # initial=True, reset only (never met): holds
+    flag_d = "cond_" + "d" * 32   # disabled flag: frozen
+    flag_cfg = {
+        "name": "flag-smoke", "enabled": True, "logging_enabled": False,
+        "triggers": [],
+        "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            set_leaf, rst_leaf, dis_leaf,
+            {"id": flag_a, "type": "flag",
+             "set_conditions": [set_leaf["id"]],
+             "reset_conditions": [rst_leaf["id"]]},
+            {"id": flag_b, "type": "flag",
+             "set_conditions": [set_leaf["id"]],
+             "reset_conditions": [dis_leaf["id"]]},
+            {"id": flag_c, "type": "flag", "initial": True,
+             "set_conditions": [],
+             "reset_conditions": [rst_leaf["id"]]},
+            {"id": flag_d, "type": "flag",
+             "set_conditions": [set_leaf["id"]],
+             "reset_conditions": [], "enabled": False},
+        ],
+        "outputs": [
+            {"name": "out-a", "type": "binary_sensor", "entity_id": "ssc_" + "1" * 32,
+             "on_conditions": [flag_a], "off_conditions": []},
+            {"name": "out-b", "type": "binary_sensor", "entity_id": "ssc_" + "2" * 32,
+             "on_conditions": [flag_b], "off_conditions": []},
+        ],
+    }
+    _vc(json.loads(json.dumps(flag_cfg)))  # valid flag config passes
+
+    bad = json.loads(json.dumps(flag_cfg))
+    bad["conditions"][3]["reset_conditions"] = [flag_b]  # flag→flag cascade
+    try:
+        _vc(bad)
+        raise AssertionError("flag cascade must be rejected")
+    except _CVE:
+        pass
+    empty = json.loads(json.dumps(flag_cfg))
+    empty["conditions"][3]["set_conditions"] = []
+    empty["conditions"][3]["reset_conditions"] = []
+    try:
+        _vc(empty)
+        raise AssertionError("flag with no set AND no reset must be rejected")
+    except _CVE:
+        pass
+    routes_bad = json.loads(json.dumps(flag_cfg))
+    routes_bad["triggers"] = [{
+        "id": "trg_" + "9" * 32, "type": "homeassistant", "enabled": True,
+        "routes": {"conditions": [flag_a]},
+    }]
+    try:
+        _vc(routes_bad)
+        raise AssertionError("trigger route to a flag must be rejected")
+    except _CVE:
+        pass
+
+    mgr_f = ControllerManager(_Hass(), "ctrl_smoke05", _vc(json.loads(json.dumps(flag_cfg))))
+    await mgr_f.async_setup()
+    ent_fa = _Entity("binary_sensor.fa")
+    ent_fb = _Entity("binary_sensor.fb")
+    mgr_f.register_entity("ssc_" + "1" * 32, ent_fa)
+    mgr_f.register_entity("ssc_" + "2" * 32, ent_fb)
+    eng_f = mgr_f.engine
+    assert eng_f.flag_states() == {}, "flags start unstepped"
+
+    flipped = await eng_f.step_flags()
+    assert flipped == [flag_a], flipped  # flag_b: reset wins over set → stays off, no flip
+    assert await eng_f.evaluate_any([flag_a]) is True, "set met → latch on"
+    assert await eng_f.evaluate_any([flag_b]) is False, "reset (disabled member=always true) wins over set"
+    assert await eng_f.evaluate_any([flag_c]) is True, "initial holds while reset unmet"
+    assert await eng_f.step_flags() == [], "steady state → no flips"
+    assert eng_f.flag_states() == {flag_a: True, flag_b: False, flag_c: True}, eng_f.flag_states()
+    # flag_d (disabled) stays absent: frozen, never stepped
+    assert flag_d not in eng_f.flag_states()
+
+    # end-to-end: one evaluation cycle steps flags then applies outputs
+    await mgr_f.async_evaluate_with_details()
+    assert ent_fa.is_on is True, "output driven by latched flag_a"
+    assert ent_fb.is_on is False, "output driven by latched flag_b"
+    mgr_f.async_unload()
+    print("[PASS] flag latch: stepping, reset-wins, initial, disabled freeze, cascade rules")
 
 asyncio.run(main())
 print("SMOKE OK")

@@ -120,7 +120,7 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 
 ```
 Config Entry（单一条目 / single entry）
-├── Store                → 全部控制器配置（hub.SannerHub, storage.Store）
+├── Store                → 全部控制器配置（hub.ScannerHub, storage.Store）
 ├── ControllerManager    → 每控制器一个：触发调度 + 评估 + 实体注册（controller.py）
 ├── Condition Engine     → 九类叶子（含 duration/debounce 计时门）+ AND/OR/NOT 嵌套 + 逐条件追踪（condition_engine.py）
 ├── Output Platforms     → switch / binary_sensor（每控制器一个设备）
@@ -196,6 +196,28 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.9.0（2026-10-26）— 旗标节点 + 暗病修复 + 面板死触发防线
+
+**新功能**
+- **旗标/锁存节点（flag）**：控制器内置虚拟布尔——任一置位条件满足→开、任一复位条件满足→关（同周期复位优先），其余锁存保持；每评估周期开始统一步进，输出与逻辑组可直接引用。锁存状态持久化（条目重载保持、HA 重启后从 `sensor_switch_controller_flags` 存储恢复），补齐 level 引擎缺失的"记忆"表达力（此前"洗完澡"类锁存语义只能留在控制层）
+- 画布新增 🚩 旗标节点：置位/复位两口均可多线；inspector 可设初始值；校验拒绝旗标级联（set/reset 引用另一旗标）与触发器信号直连旗标
+
+**修复（集成体检 2026-10-25，报告见仓 temp 记录）**
+- **P2 输出实体接入 RestoreEntity**：重启/重载后恢复上次状态，`hold` 不再落到错误的 off 基线
+- **P2 删除控制器的实体注册表清扫**：按 unique_id 前缀扫描（含"先停用再删除"与未入 hass 实体），不再残留永久幽灵实体
+- **P2 存储保存失败回滚**：save 抛异常时内存状态回滚+补排重载，消除"内存已删/磁盘还在"的分裂（DELETE 路径重启僵尸复活的根因）
+- **P2 新建控制器 id 同时查 invalid 空间**：撞号不再被 invalid 轮转静默顶掉
+- P3：迁移失败后果注释化（数据不丢进 invalid）；v4→v6 coverage 清空加 warning；PUT 并发竞态回 404；**面板连续保存合并重载（1s 窗口）**——每次重载清零 FOR/duration 计时的问题消除；决策日志目录被删后自愈重建；invalid 条目快照保留原 name；config entry version>2 拒绝加载（防降级改写）；平台转发失败时回收触发器监听；面板 noControllers 重复键清理
+
+**面板（M4 死触发防线）**
+- **触发器三态徽章**：节点角标直接显示「全量」（遗留评估，琥珀）/「→N」（定向 N 条件）/「死」（定向但零覆盖，红色描边）——死触发此前在画布上完全不可见
+- **保存防线**：已启用的定向触发器零覆盖时保存弹确认（拦截"连线再删线"的静默降级路径）
+- **面板新建触发器改为遗留语义**（routes 键缺省）：与 REST 创建对齐，新触发器不再默认"死"
+
+**工程**
+- `dev/test_routing.py` 解禁入仓（panel.js 唯一回归防线此前被 gitignore）；CI 新增 `node --check` 语法门
+- 修复 0.8.1 后 3 个未入账提交（IMP-01~03/14~16/20~21，全部 panel.js）的 changelog 缺口；修正架构图 `SannerHub` 拼写
 
 ### 0.8.1（2026-10-14）— 可操作性迭代
 

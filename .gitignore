@@ -23,5 +23,8 @@ Thumbs.db
 
 # ---- 2026-10-09 仓库整理 ----
 # tests/ 已于 2026-10-14 解禁入仓（smoke.py + web 层 pytest 用例 + CI）
-dev/
+# dev/test_routing.py 已于 0.9.0 解禁入仓（panel.js 唯一回归防线，体检 A6）；
+# dev/ 其余本地工具仍不入库
+dev/*
+!dev/test_routing.py
 /*.png

@@ -53,9 +53,16 @@ COND_COOLDOWN = "cooldown"
 COND_CALENDAR = "calendar"
 COND_DURATION = "duration"
 COND_DEBOUNCE = "debounce"
+COND_FLAG = "flag"
 COND_AND = "and"
 COND_OR = "or"
 COND_NOT = "not"
+
+# Flag (latch) condition fields: set/reset reference condition ids, the
+# verdict is a latched virtual boolean stepped once per evaluation cycle.
+CONF_SET_CONDITIONS = "set_conditions"
+CONF_RESET_CONDITIONS = "reset_conditions"
+CONF_INITIAL = "initial"
 
 # Trigger types
 TRG_STATE = "state"

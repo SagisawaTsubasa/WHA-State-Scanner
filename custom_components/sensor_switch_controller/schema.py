@@ -14,7 +14,11 @@ directly (an ``outputs`` key in routes is rejected). Since 0.7.3 the
 logic groups are dual-mode: wiring their signal port makes them trigger
 mergers (pass-through, members may be empty while signal-covered), wiring
 their members port makes them plain and/or/not gates — the two modes are
-mutually exclusive on the canvas.
+mutually exclusive on the canvas. Since 0.9.0 there is a ``flag`` node: a
+latched virtual boolean with set/reset condition references; its verdict
+is stepped once per evaluation cycle (reset wins over set), it carries no
+``for``, and it may be referenced by outputs and groups but not by
+triggers' routes nor by another flag's set/reset.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from .const import (
     COND_COOLDOWN,
     COND_DEBOUNCE,
     COND_DURATION,
+    COND_FLAG,
     COND_NOT,
     COND_NUMERIC_STATE,
     COND_OR,
@@ -44,10 +49,13 @@ from .const import (
     CONF_AT,
     CONF_EVERY_SECONDS,
     CONF_HOURS,
+    CONF_INITIAL,
     CONF_OFFSET,
+    CONF_RESET_CONDITIONS,
     CONF_ROUTES,
     CONF_SCAN_INTERVAL,
     CONF_SECONDS,
+    CONF_SET_CONDITIONS,
     CONF_START,
     CONF_TRIGGERS,
     CONF_WEEKDAYS,
@@ -362,7 +370,7 @@ def _validate_condition(cond) -> dict:
     if not isinstance(cond, dict):
         _fail("条件必须是对象")
     ctype = cond.get("type")
-    if ctype not in LEAF_TYPES + GROUP_TYPES:
+    if ctype not in LEAF_TYPES + GROUP_TYPES + (COND_FLAG,):
         _fail(f"未知条件类型：{ctype!r}")
 
     cid = cond.get("id")
@@ -530,6 +538,27 @@ def _validate_condition(cond) -> dict:
         result[CONF_SECONDS] = seconds
         result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "防抖实体")
 
+    elif ctype == COND_FLAG:
+        # Latched virtual boolean: `set_conditions` (any → on) and
+        # `reset_conditions` (any → off, reset wins) reference plain
+        # condition ids; the verdict is stepped once per evaluation cycle
+        # and persists across restarts. No `for` (timing gates below).
+        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+            members = cond.get(key) or []
+            if not isinstance(members, list) or not all(
+                isinstance(m, str) for m in members
+            ):
+                _fail(f"旗标条件的 {key} 必须是条件 id 字符串列表")
+            if len(set(members)) != len(members):
+                _fail(f"旗标条件的 {key} 成员不能重复")
+            result[key] = list(dict.fromkeys(members))
+        if not result[CONF_SET_CONDITIONS] and not result[CONF_RESET_CONDITIONS]:
+            _fail("旗标条件必须提供 set_conditions 或 reset_conditions")
+        initial = cond.get(CONF_INITIAL, False)
+        if not isinstance(initial, bool):
+            _fail("旗标条件的 initial 必须是布尔值")
+        result[CONF_INITIAL] = initial
+
     else:  # and / or / not
         members = cond.get("conditions") or []
         # an EMPTY group is provisionally allowed here: trigger-logic mode
@@ -584,12 +613,16 @@ def _validate_output(out) -> dict:
 
 def _condition_neighbors(cond: dict) -> list[str]:
     """Referenced condition ids of one condition (group members, duration
-    start/abort) — the edge set for graph checks."""
+    start/abort, flag set/reset) — the edge set for graph checks."""
     edges = list(cond.get("conditions") or [])
     for key in (CONF_START, CONF_ABORT):
         ref = cond.get(key)
         if isinstance(ref, str):
             edges.append(ref)
+    for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+        val = cond.get(key)
+        if isinstance(val, list):
+            edges.extend(m for m in val if isinstance(m, str))
     return edges
 
 
@@ -609,6 +642,15 @@ def _check_graph(
             if member not in by_id:
                 label = cond.get("label") or cond["id"]
                 _fail(f"条件「{label}」引用了不存在的成员：{member}")
+
+    for cond in conditions:
+        if cond["type"] != COND_FLAG:
+            continue
+        label = cond.get("label") or cond["id"]
+        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+            for member in cond[key]:
+                if by_id[member]["type"] == COND_FLAG:
+                    _fail(f"旗标「{label}」的 {key} 引用了另一个旗标：旗标不能级联")
 
     # Cycle detection over group references and duration start/abort edges
     # (iterative DFS with colors).
@@ -717,10 +759,10 @@ def _check_graph(
         for member in routes.get("conditions", []):
             if member not in by_id:
                 _fail(f"触发器「{label}」的路由引用了不存在的条件：{member}")
-            if by_id[member]["type"] == COND_DURATION:
+            if by_id[member]["type"] in (COND_DURATION, COND_FLAG):
                 _fail(
-                    f"触发器「{label}」的信号线连到了持续门：持续不是信号起点，"
-                    "请连到具体条件或逻辑组"
+                    f"触发器「{label}」的信号线连到了持续门或旗标：两者都不是"
+                    "信号起点，请连到具体条件或逻辑组"
                 )
 
 

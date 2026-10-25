@@ -6,8 +6,10 @@ import logging
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN, OUTPUT_SWITCH
 from .controller import ControllerManager
@@ -32,8 +34,13 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class SensorSwitch(SwitchEntity):
-    """Logic switch driven by controller."""
+class SensorSwitch(SwitchEntity, RestoreEntity):
+    """Logic switch driven by controller.
+
+    Restores its previous state on (re)add so a ``hold`` verdict keeps the
+    pre-restart baseline instead of snapping to the hardcoded ``False``
+    (体检 P2-1).
+    """
 
     _attr_should_poll = False
     _attr_icon = "mdi:toggle-switch"
@@ -65,8 +72,11 @@ class SensorSwitch(SwitchEntity):
         )
 
     async def async_added_to_hass(self) -> None:
-        """Notify the manager so the first evaluation can be triggered."""
+        """Restore last state, then notify the manager for the first eval."""
         await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state in (STATE_ON, STATE_OFF):
+            self._attr_is_on = last_state.state == STATE_ON
         self._manager.async_entity_added(self._out_id)
 
     async def async_will_remove_from_hass(self) -> None:

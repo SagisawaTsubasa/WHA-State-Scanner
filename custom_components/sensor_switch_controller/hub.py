@@ -131,7 +131,16 @@ def _strip_duration_coverage(cfg: dict) -> dict:
             continue
         cov = routes.get("conditions")
         if isinstance(cov, list) and any(c in dur_ids for c in cov):
-            routes["conditions"] = [c for c in cov if c not in dur_ids]
+            kept = [c for c in cov if c not in dur_ids]
+            routes["conditions"] = kept
+            if not kept:
+                _LOGGER.warning(
+                    "Controller %s: trigger %s coverage emptied by migration "
+                    "(it only pointed at duration gates) — the trigger is now "
+                    "unwired and evaluates nothing; re-anchor it on the canvas",
+                    cfg.get("name", "?"),
+                    trg.get("id", "?"),
+                )
     return cfg
 
 
@@ -335,7 +344,13 @@ class _MigratingStore(Store):
                         migrated = step(migrated)
                     raw[cid] = migrated
                 except Exception:
-                    # keep the ORIGINAL untouched object, as advertised
+                    # keep the ORIGINAL untouched object, as advertised. Note
+                    # the whole payload is still saved back as version 6, so
+                    # the automatic migration will not re-run for this
+                    # controller; the legacy config then fails validate and
+                    # lands in `invalid` (visible + round-tripped, no data
+                    # loss). Accepted: fixing this would need aborting the
+                    # whole store migration instead (体检 P3-5).
                     _LOGGER.exception(
                         "Failed migrating controller %s; kept as-is", cid
                     )
@@ -353,6 +368,11 @@ class ScannerHub:
         self.invalid: dict[str, dict] = {}
         self.managers: dict[str, ControllerManager] = {}
         self.entry_id: str | None = None
+        # Flag (latch) runtime states: {controller_id: {flag_cond_id: bool}}.
+        # Runtime-only (not part of the controller config): the hub object
+        # survives entry reloads, the store below survives HA restarts.
+        self.flag_states: dict[str, dict[str, bool]] = {}
+        self._flag_store = Store(hass, 1, STORE_KEY + "_flags")
 
     # ------------------------------------------------------------------
     # Storage
@@ -398,6 +418,17 @@ class ScannerHub:
             payload[cid] = item["config"]
         await self.store.async_save({CONF_CONTROLLERS: payload})
 
+    async def async_load_flag_states(self) -> None:
+        """Load flag runtime states (latches survive HA restarts)."""
+        data = await self._flag_store.async_load()
+        raw = (data or {}).get("flags")
+        self.flag_states = raw if isinstance(raw, dict) else {}
+
+    async def async_save_flag_states(self, cid: str, states: dict) -> None:
+        """Persist one controller's flag states (called on flag flips)."""
+        self.flag_states[cid] = dict(states)
+        await self._flag_store.async_save({"flags": self.flag_states})
+
     # ------------------------------------------------------------------
     # Controllers CRUD (web API; caller schedules the entry reload)
     # ------------------------------------------------------------------
@@ -420,24 +451,42 @@ class ScannerHub:
         self.controllers[cid] = config
 
     def remove_controller(self, cid: str) -> None:
-        """Delete a controller and its entity-registry entries."""
+        """Delete a controller and ALL of its entity-registry entries."""
         manager = self.managers.pop(cid, None)
+        registry = er.async_get(self.hass)
+        removed: set[str] = set()
         if manager:
-            registry = er.async_get(self.hass)
             # registry.async_remove() runs the entity removal chain inline
             # (eager task), which pops from manager.entities — snapshot first.
             for entity in list(manager.entities.values()):
                 entity_id = getattr(entity, "entity_id", None)
                 if entity_id:
                     registry.async_remove(entity_id)
+                    removed.add(entity_id)
             manager.async_unload()
+        # Sweep registry entries the live-entity pass above cannot see:
+        # a disable-before-delete controller has no manager at all, and
+        # entities that never finished adding to hass carry entity_id None.
+        # Registry entries outlive their entities, so without this sweep
+        # they linger forever as ghost "no longer provided" entries (体检 P2-2).
+        if self.entry_id:
+            prefix = f"{cid}_"
+            for entry in er.async_entries_for_config_entry(registry, self.entry_id):
+                if entry.entity_id in removed:
+                    continue
+                if entry.unique_id.startswith(prefix):
+                    registry.async_remove(entry.entity_id)
+        self.flag_states.pop(cid, None)
         self.controllers.pop(cid, None)
         self.invalid.pop(cid, None)
 
     def _fresh_id(self) -> str:
         while True:
             cid = f"{CTRL_ID_PREFIX}{uuid.uuid4().hex[:8]}"
-            if cid not in self.controllers:
+            # invalid keys share the ctrl_<8hex> space; a collision would let
+            # the invalid round-trip silently overwrite the new controller on
+            # the next save (体检 P2-4)
+            if cid not in self.controllers and cid not in self.invalid:
                 return cid
 
     # ------------------------------------------------------------------
@@ -498,10 +547,15 @@ class ScannerHub:
                 "runtime": manager.runtime_snapshot() if manager else {},
             }
         for cid, item in self.invalid.items():
+            raw_name = (
+                item["config"].get("name")
+                if isinstance(item.get("config"), dict)
+                else None
+            )
             controllers[cid] = {
                 "_invalid": True,
                 "invalid_error": item["error"],
-                "name": cid,
+                "name": raw_name or cid,
                 "enabled": False,
                 "triggers": [],
                 "sensors": [],

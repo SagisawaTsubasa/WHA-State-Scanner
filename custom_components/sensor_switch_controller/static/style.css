@@ -481,3 +481,19 @@ details.wha-json pre {
   .wha-topbar h1 { display: none; }
   .wha-btn { padding: 10px 8px; font-size: 12px; }
 }
+
+/* Trigger mode badges (0.9.0 M4): legacy-all (amber) / directed-n (gray) /
+   directed-empty "dead" (red outline) — visible on the node itself. */
+.trg-mode-badge {
+  margin-left: auto;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: #546e7a;
+  color: #fff;
+  white-space: nowrap;
+}
+.trg-legacy .trg-mode-badge { background: #ef6c00; }
+.trg-dead .trg-mode-badge { background: #c62828; }
+.trg-dead.wha-node { box-shadow: inset 0 0 0 2px #c62828; }

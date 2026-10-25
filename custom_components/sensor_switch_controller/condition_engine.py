@@ -32,9 +32,13 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_ABORT,
     CONF_HOURS,
+    CONF_INITIAL,
+    CONF_RESET_CONDITIONS,
     CONF_SECONDS,
+    CONF_SET_CONDITIONS,
     CONF_START,
     CONF_WEEKDAYS,
+    COND_FLAG,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,12 +74,16 @@ class ConditionEngine:
         hass: HomeAssistant,
         conditions: list[dict] | None,
         manager: Any = None,
+        flag_states: dict[str, bool] | None = None,
     ) -> None:
         """Initialize."""
         self.hass = hass
         # Weak coupling: the cooldown leaf reads the manager's flip history.
         # Duck-typed to avoid an import cycle (manager ↔ engine).
         self._manager = manager
+        # Latched flag verdicts, seeded from the hub's persisted states so a
+        # latch survives entry reloads and HA restarts (0.9.0).
+        self._flag_states: dict[str, bool] = dict(flag_states or {})
         self._conditions: dict[str, dict] = {}
         for cond in conditions or []:
             if not isinstance(cond, dict):
@@ -132,6 +140,46 @@ class ConditionEngine:
                 _LOGGER.exception("Unexpected error evaluating condition '%s'", cid)
                 results[cid] = False
         return met, results
+
+    def flag_states(self) -> dict[str, bool]:
+        """Current latched flag verdicts (for hub persistence)."""
+        return dict(self._flag_states)
+
+    async def step_flags(self) -> list[str]:
+        """Advance every flag's set/reset gate once; returns flipped ids.
+
+        Called once at the start of each evaluation cycle, BEFORE outputs
+        are evaluated, so every output in the cycle sees the same flag
+        snapshot. Within one cycle reset wins over set (safe side, mirrors
+        the off-first output verdict); otherwise set turns it on; otherwise
+        the latch holds. Disabled flags are skipped (state frozen).
+        """
+        flipped: list[str] = []
+        for cid, cond in self._conditions.items():
+            if not isinstance(cond, dict) or cond.get("type") != COND_FLAG:
+                continue
+            if cond.get("enabled") is False:
+                continue
+            initial = bool(cond.get(CONF_INITIAL, False))
+            old = self._flag_states.get(cid, initial)
+            reset_met = False
+            for member in cond.get(CONF_RESET_CONDITIONS) or []:
+                if await self._evaluate_id(member, set()):
+                    reset_met = True
+                    break
+            if reset_met:
+                new = False
+            else:
+                new = old
+                if not new:
+                    for member in cond.get(CONF_SET_CONDITIONS) or []:
+                        if await self._evaluate_id(member, set()):
+                            new = True
+                            break
+            self._flag_states[cid] = new
+            if new != old:
+                flipped.append(cid)
+        return flipped
 
     def next_wakeup(
         self, reverse: dict[str, set[str]]
@@ -451,6 +499,13 @@ class ConditionEngine:
             # not (HA semantics): passes only when NO member is true.
             return not any(results)  # not
 
+        if ctype == COND_FLAG:
+            # latched verdict from the per-cycle step (step_flags); no live
+            # evaluation — the flag's set/reset members are NOT re-evaluated
+            # here (that happens once per cycle, before outputs)
+            return self._flag_states.get(
+                cond.get("id"), bool(cond.get(CONF_INITIAL, False))
+            )
         if ctype == "duration":
             return await self._evaluate_duration(cond, path, visited, trace, out_id)
         if ctype == "debounce":

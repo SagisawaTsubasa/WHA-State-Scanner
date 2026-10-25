@@ -31,7 +31,6 @@ const LANG = {
     refresh: "刷新",
     controllerPool: "传感器池总览",
     controllerPoolHint: "哪些传感器在喂养哪些控制器；蓝色行表示同一传感器被多个控制器共用。",
-    noControllers: "还没有控制器。点「新建控制器」开始构建你的第一个中间层。",
     edit: "编辑",
     logs: "日志",
     evaluateNow: "立即评估",
@@ -47,6 +46,16 @@ const LANG = {
     logsEmpty: "该日无决策记录",
     logsTruncated: "已达单次查询上限，可缩小日期范围或调大条数",
     noControllers: "尚无控制器 — 点「新建控制器」开始",
+    condFlag: "旗标",
+    flagHint: "旗标=锁存记忆：任一置位条件满足→开；任一复位条件满足→关（复位优先）；其余保持。置位/复位口可接多根线，评估周期开始时统一步进。",
+    flagInitial: "初始为开（无存档时）",
+    summaryFlagIdle: "未配置置位/复位",
+    portSet: "置位",
+    portReset: "复位",
+    trgBadgeLegacy: "全量",
+    trgBadgeDead: "死",
+    trgBadgeDeadHint: "该触发器已定向但未连任何条件：它不会评估任何输出。连上条件，或保持遗留全量（删掉它的定向状态）。",
+    trgDeadConfirm: "有已启用但未连任何条件的定向触发器（保存后不会评估任何输出）。仍要保存吗？\n确定=保存；取消=返回修改。",
     outputs: "输出",
     lastEval: "上次评估",
     never: "从未",
@@ -178,7 +187,6 @@ const LANG = {
     refresh: "Refresh",
     controllerPool: "Sensor pool overview",
     controllerPoolHint: "Which sensors feed which controllers; blue rows share sensors across controllers.",
-    noControllers: "No controllers yet. Click \"New controller\" to build your first middle layer.",
     edit: "Edit",
     logs: "Logs",
     evaluateNow: "Evaluate now",
@@ -194,6 +202,16 @@ const LANG = {
     logsEmpty: "No decision records for this day",
     logsTruncated: "Query limit reached — narrow the date range or raise the limit",
     noControllers: "No controllers yet — create one to start",
+    condFlag: "Flag",
+    flagHint: "A latch: any set condition → on; any reset condition → off (reset wins); otherwise it holds. Set/reset ports accept multiple wires; flags step once per evaluation cycle.",
+    flagInitial: "Initial value is on (when nothing saved)",
+    summaryFlagIdle: "no set/reset wired",
+    portSet: "set",
+    portReset: "reset",
+    trgBadgeLegacy: "ALL",
+    trgBadgeDead: "DEAD",
+    trgBadgeDeadHint: "This directed trigger has no conditions wired: it evaluates nothing. Wire a condition, or keep it legacy (clear its directed state).",
+    trgDeadConfirm: "An enabled directed trigger has no conditions wired (it will evaluate nothing). Save anyway?\nOK = save; Cancel = go back.",
     outputs: "Outputs",
     lastEval: "Last evaluation",
     never: "never",
@@ -343,6 +361,7 @@ const TYPE_LABEL_KEY = {
   calendar: "condCalendar",
   duration: "condDuration",
   debounce: "condDebounce",
+  flag: "condFlag",
   and: "condAnd",
   or: "condOr",
   not: "condNot",
@@ -358,6 +377,7 @@ const TYPE_ICON = {
   calendar: "📅",
   duration: "⏳",
   debounce: "🕯",
+  flag: "🚩",
   and: "⊕",
   or: "⊗",
   not: "¬",
@@ -404,6 +424,15 @@ function conditionSummary(cond, tr) {
     case "calendar":
       text = `${cond.entity_id} ${trk("summaryCalendarLead")} ${cond.hours}${trk("summaryCalendarTail")}`;
       break;
+    case "flag": {
+      const s = (cond.set_conditions || []).length;
+      const r = (cond.reset_conditions || []).length;
+      const parts = [];
+      if (s) parts.push(`set×${s}`);
+      if (r) parts.push(`reset×${r}`);
+      text = `🚩 ${parts.join(" / ") || trk("summaryFlagIdle")}`;
+      break;
+    }
     default:
       text = `${(cond.conditions || []).length}${trk("summaryMembers")}`;
   }
@@ -927,6 +956,7 @@ class ScannerPanel extends HTMLElement {
         .map((x) => x.id)),
       selected: null,
       trial: null,
+      deadTrgConfirmed: false,
     };
     this._editor = ed;
 
@@ -954,7 +984,7 @@ class ScannerPanel extends HTMLElement {
               .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("logicGroups"))}</h3>
@@ -1280,6 +1310,7 @@ class ScannerPanel extends HTMLElement {
     trigger: { output_1: "portSignal" },
     output: { input_1: "portOn", input_2: "portOff" },
     duration: { input_1: "portStart", input_2: "portAbort", output_1: "portOut" },
+    flag: { input_1: "portSet", input_2: "portReset", output_1: "portOut" },
     group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
     leaf: { input_3: "portSignal", output_1: "portOut" },
   };
@@ -1548,9 +1579,11 @@ class ScannerPanel extends HTMLElement {
 
   _addTriggerNode(type) {
     const ed = this._editor;
-    // born directed: an empty coverage means "wake nothing until wired"
-    // (only loaded-as-legacy triggers keep the absent-routes semantics)
-    const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true, routes: { conditions: [] } };
+    // born legacy (0.9.0 M4): routes key ABSENT = evaluate-everything,
+    // matching REST-created triggers and the legacy badge. Panel-created
+    // empty-coverage triggers used to be dead on arrival (routes: []).
+    const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true };
+    ed.legacyTrgIds.add(t.id);
     if (type === "time") t.every_seconds = 300;
     if (type === "sun") t.event = "sunrise";
     if (type === "state") t.entity_id = "";
@@ -1603,6 +1636,43 @@ class ScannerPanel extends HTMLElement {
     if (head) head.textContent = this.tr(TRIGGER_LABEL_KEY[t.type] || t.type);
     if (body) body.textContent = this._triggerSummary(t);
     el.classList.toggle("trg-off", t.enabled === false);
+    this._refreshTriggerBadges();
+  }
+
+  _refreshTriggerBadges() {
+    // M4 (0.9.0): three trigger modes must be visible on the node itself —
+    // legacy (routes absent = evaluate-everything, amber), directed-n, and
+    // directed-empty ("dead": wakes nothing, red). Until now only the
+    // inspector hinted at the mode, and panel-created triggers defaulted to
+    // the dead state invisibly.
+    const ed = this._editor;
+    if (!ed.df?.container) return;
+    for (const [nid, tid] of ed.nodeToTrg) {
+      const t = (ed.controller.triggers || []).find((x) => x.id === tid);
+      const el = ed.df.container.querySelector(`#node-${nid}`);
+      if (!el || !t) continue;
+      const legacy = ed.legacyTrgIds.has(t.id);
+      const dead =
+        !legacy && t.routes !== undefined && !(t.routes?.conditions || []).length;
+      el.classList.toggle("trg-legacy", legacy);
+      el.classList.toggle("trg-dead", dead);
+      let badge = el.querySelector(".trg-mode-badge");
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "trg-mode-badge";
+        el.querySelector(".wha-node-head")?.appendChild(badge);
+      }
+      if (legacy) {
+        badge.textContent = this.tr("trgBadgeLegacy");
+        badge.title = this.tr("trgLegacyLabel");
+      } else if (dead) {
+        badge.textContent = this.tr("trgBadgeDead");
+        badge.title = this.tr("trgBadgeDeadHint");
+      } else {
+        badge.textContent = `→${(t.routes?.conditions || []).length}`;
+        badge.title = this.tr("trgRoutesLabel");
+      }
+    }
   }
 
   _triggerInspectorHtml(t) {
@@ -1643,6 +1713,8 @@ class ScannerPanel extends HTMLElement {
       ${fields}
       ${ed.legacyTrgIds.has(t.id)
         ? `<p class="wha-sub">${esc(this.tr("trgLegacyLabel"))}</p>`
+        : t.routes !== undefined && !(t.routes?.conditions || []).length
+        ? `<p class="wha-sub" style="color:#c62828">⚠ ${esc(this.tr("trgBadgeDeadHint"))}</p>`
         : `<p class="wha-sub">${esc(this.tr("trgRoutesLabel"))}: ${(t.routes?.conditions || []).length}</p>`}
       <p class="wha-sub">${esc(t.id)}</p>`;
   }
@@ -1761,6 +1833,16 @@ class ScannerPanel extends HTMLElement {
       const aid = cond.abort ? ed.condToNode.get(cond.abort) : null;
       if (did && aid) df.addConnection(String(aid), String(did), "output_1", "input_2");
     }
+    for (const cond of conds) {
+      if (cond.type !== "flag") continue;
+      const fid = ed.condToNode.get(cond.id);
+      for (const [key, port] of [["set_conditions", "input_1"], ["reset_conditions", "input_2"]]) {
+        for (const m of cond[key] || []) {
+          const mid = ed.condToNode.get(m);
+          if (mid && fid) df.addConnection(String(mid), String(fid), "output_1", port);
+        }
+      }
+    }
     for (const out of ed.controller.outputs) {
       const oid = ed.outToNode.get(out.entity_id);
       if (!oid) continue;
@@ -1784,7 +1866,7 @@ class ScannerPanel extends HTMLElement {
         const dst = ed.condToNode.get(cid);
         if (dst === undefined) continue;
         const dstCond = ed.controller.conditions.find((c) => c.id === cid);
-        if (dstCond?.type === "duration") continue; // duration has no input_3
+        if (dstCond?.type === "duration" || dstCond?.type === "flag") continue; // neither has input_3
         df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
       }
     }
@@ -1793,6 +1875,7 @@ class ScannerPanel extends HTMLElement {
     // connectionCreated dispatch during import (R12 待确认项的消解)
     this._rebuildPortWireCount(); // also refreshes every group's port state
     this._refreshPassthroughBadges();
+    this._refreshTriggerBadges();
     this._styleConnections();
   }
 
@@ -1838,6 +1921,20 @@ class ScannerPanel extends HTMLElement {
             .find(Boolean) || null;
         continue;
       }
+      if (cond.type === "flag") {
+        const nid = ed.condToNode.get(cond.id);
+        if (nid === undefined) continue;
+        const inputs = data[String(nid)]?.inputs || {};
+        cond.set_conditions = (inputs.input_1?.connections || [])
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean);
+        cond.reset_conditions = (inputs.input_2?.connections || [])
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean);
+        const fbody = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
+        if (fbody) fbody.textContent = conditionSummary(cond, (k) => this.tr(k));
+        continue;
+      }
       if (!isGroupType(cond.type)) continue;
       const nid = ed.condToNode.get(cond.id);
       if (nid === undefined) continue;
@@ -1868,6 +1965,7 @@ class ScannerPanel extends HTMLElement {
       this._applyObserve(this._lastObserve);
     }
     this._refreshPassthroughBadges(); // topological — survives all states
+    this._refreshTriggerBadges();
   }
 
   _connectionAllowed(e) {
@@ -1889,7 +1987,7 @@ class ScannerPanel extends HTMLElement {
         (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
       );
       if (!dst) return false;
-      if (dst.type === "duration") return false;
+      if (dst.type === "duration" || dst.type === "flag") return false;
       if (isGroupType(dst.type)) {
         // dual mode (0.7.3): trigger wires make the group a trigger-logic
         // merger; symmetric exclusion hides the members port instead
@@ -1911,6 +2009,10 @@ class ScannerPanel extends HTMLElement {
             return false;
           }
           return true;
+        }
+        if (dst && dst.type === "flag") {
+          // flag set/reset ports: multiple wires, each side evaluated as OR
+          return e.input_class === "input_1" || e.input_class === "input_2";
         }
         if (dst && dst.type === "duration") {
           // start/abort are single-value ports: a second wire into the same
@@ -1994,7 +2096,8 @@ class ScannerPanel extends HTMLElement {
     // exclusion, empty groups may take signals directly. Duration keeps
     // start/abort only.
     const isGroup = isGroupType(cond.type);
-    const inputs = cond.type === "duration" ? 2 : 3;
+    const isFlag = cond.type === "flag";
+    const inputs = cond.type === "duration" || isFlag ? 2 : 3;
     const nodeId = ed.df.addNode(
       cond.type,
       inputs,
@@ -2007,7 +2110,7 @@ class ScannerPanel extends HTMLElement {
     );
     ed.nodeToCond.set(nodeId, cond.id);
     ed.condToNode.set(cond.id, nodeId);
-    const kind = cond.type === "duration" ? "duration" : isGroupType(cond.type) ? "group" : "leaf";
+    const kind = cond.type === "duration" ? "duration" : isFlag ? "flag" : isGroupType(cond.type) ? "group" : "leaf";
     this._labelNodePorts(nodeId, kind);
     return nodeId;
   }
@@ -2057,6 +2160,10 @@ class ScannerPanel extends HTMLElement {
     } else if (type === "calendar") {
       cond.entity_id = "";
       cond.hours = 24;
+    } else if (type === "flag") {
+      cond.set_conditions = [];
+      cond.reset_conditions = [];
+      cond.initial = false;
     } else {
       cond.conditions = [];
     }
@@ -2353,6 +2460,10 @@ class ScannerPanel extends HTMLElement {
       case "template":
         return `
           <label class="field"><span>${esc(trk("template"))}</span><textarea class="wha-input" rows="3" data-insk="value_template">${esc(cond.value_template || "")}</textarea></label>`;
+      case "flag":
+        return `
+          <p class="wha-sub">${esc(trk("flagHint"))}</p>
+          <label class="field field-inline"><input type="checkbox" data-insk="initial" ${cond.initial ? "checked" : ""}> ${esc(trk("flagInitial"))}</label>`;
       default:
         return "";
     }
@@ -2394,6 +2505,9 @@ class ScannerPanel extends HTMLElement {
       if (!nid) continue;
       if (isGroupType(cond.type)) {
         cond.conditions = nodeRefs(nid, "input_1");
+      } else if (cond.type === "flag") {
+        cond.set_conditions = nodeRefs(nid, "input_1");
+        cond.reset_conditions = nodeRefs(nid, "input_2");
       } else if (cond.type === "duration") {
         cond.start = singleRef(nid, "input_1");
         const abort = singleRef(nid, "input_2");
@@ -2448,6 +2562,20 @@ class ScannerPanel extends HTMLElement {
     if (!ed.controller.name?.trim()) {
       this.toast(this.tr("controllerName"), true);
       return;
+    }
+    // M4 (0.9.0): an enabled directed trigger with empty coverage wakes
+    // nothing — usually a wire that was drawn and then deleted. Block the
+    // silent demotion once per editor session; legacy (routes absent) and
+    // disabled triggers are exempt.
+    const deadTrg = (ed.controller.triggers || []).filter(
+      (t) =>
+        t.enabled !== false &&
+        t.routes !== undefined &&
+        !(t.routes?.conditions || []).length
+    );
+    if (deadTrg.length && !ed.deadTrgConfirmed) {
+      if (!window.confirm(this.tr("trgDeadConfirm"))) return;
+      ed.deadTrgConfirmed = true;
     }
     const payload = JSON.parse(JSON.stringify(ed.controller));
     try {

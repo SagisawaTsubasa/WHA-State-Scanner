@@ -186,6 +186,16 @@ if _INSTALL_STUBS:
         config_entry_only_config_schema=lambda domain: lambda config: config,
     )
     ha.helpers.entity = _module("homeassistant.helpers.entity", DeviceInfo=MagicMock)
+
+    class _RestoreEntity:
+        """Stub mixin: async_get_last_state yields no previous state."""
+
+        async def async_get_last_state(self):
+            return None
+
+    ha.helpers.restore_state = _module(
+        "homeassistant.helpers.restore_state", RestoreEntity=_RestoreEntity
+    )
     ha.helpers.start = _module(
         "homeassistant.helpers.start", async_at_started=lambda hass, cb: lambda: None
     )
@@ -194,6 +204,7 @@ if _INSTALL_STUBS:
         async_get=lambda hass: types.SimpleNamespace(
             async_remove=lambda entity_id: None
         ),
+        async_entries_for_config_entry=lambda registry, entry_id: [],
     )
     ha.loader = _module(
         "homeassistant.loader",

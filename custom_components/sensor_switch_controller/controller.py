@@ -34,10 +34,13 @@ from .const import (
     CONF_CONDITIONS,
     CONF_LOGGING,
     CONF_OUTPUTS,
+    CONF_RESET_CONDITIONS,
     CONF_ROUTES,
     CONF_SENSORS,
+    CONF_SET_CONDITIONS,
     CONF_START,
     CONF_TRIGGERS,
+    DOMAIN,
     EVAL_DEBOUNCE_SECONDS,
 )
 from .decision_log import DecisionLogger
@@ -65,7 +68,13 @@ class ControllerManager:
         self.outputs = config.get(CONF_OUTPUTS, [])
         self.logging_enabled = config.get(CONF_LOGGING, False)
 
-        self.engine = ConditionEngine(hass, self.conditions, manager=self)
+        hub = hass.data.get(DOMAIN)
+        saved_flags = (
+            hub.flag_states.get(controller_id, {}) if hub is not None else {}
+        )
+        self.engine = ConditionEngine(
+            hass, self.conditions, manager=self, flag_states=saved_flags
+        )
         # trigger-logic groups: groups named by any trigger's signal coverage.
         # Coverage is topological (0.7.3 F-151 resolution, superseding the
         # F-120 enabled filter): a disabled trigger never fires, so keeping
@@ -246,6 +255,10 @@ class ControllerManager:
                     stack.append(cond[CONF_START])
                 if cond.get(CONF_ABORT):
                     stack.append(cond[CONF_ABORT])
+                for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+                    for member in cond.get(key) or []:
+                        if isinstance(member, str):
+                            stack.append(member)
 
         for out in self.outputs:
             if not isinstance(out, dict) or not out.get("entity_id"):
@@ -430,6 +443,9 @@ class ControllerManager:
     ) -> None:
         self._first_eval_pending = False
         readings = self._async_read_sensors()
+        flipped = await self.engine.step_flags()
+        if flipped:
+            await self._persist_flag_states()
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -454,6 +470,23 @@ class ControllerManager:
 
         if self.logging_enabled and records:
             await self.logger.log_cycle(records)
+
+    async def _persist_flag_states(self) -> None:
+        """Persist flag verdicts via the hub (survives reloads/restarts)."""
+        hub = self.hass.data.get(DOMAIN)
+        if hub is None:
+            return
+        try:
+            await hub.async_save_flag_states(
+                self.controller_id, self.engine.flag_states()
+            )
+        except Exception:
+            # a failed flag save must never break the evaluation cycle; the
+            # in-memory verdict is already applied and stays authoritative
+            # until the next flip retries the write
+            _LOGGER.exception(
+                "Failed persisting flag states for %s", self.controller_id
+            )
 
     async def _async_evaluate_output(
         self, out_cfg: dict, readings: dict[str, Any], detailed: bool = False
@@ -569,6 +602,9 @@ class ControllerManager:
 
     async def _async_evaluate_with_details_locked(self) -> dict:
         readings = self._async_read_sensors()
+        flipped = await self.engine.step_flags()
+        if flipped:
+            await self._persist_flag_states()
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
         records: list[dict] = []
@@ -614,7 +650,13 @@ class ControllerManager:
                     continue
                 stack.extend(out.get("on_conditions") or [])
                 stack.extend(out.get("off_conditions") or [])
-            gate_keys = ("conditions", CONF_START, CONF_ABORT)
+            gate_keys = (
+                "conditions",
+                CONF_START,
+                CONF_ABORT,
+                CONF_SET_CONDITIONS,
+                CONF_RESET_CONDITIONS,
+            )
             by_id = {
                 c["id"]: c
                 for c in self.conditions

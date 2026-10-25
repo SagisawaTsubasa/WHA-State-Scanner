@@ -44,6 +44,8 @@ jobs:
         run: python -m pytest tests/ -q
       - name: Run smoke (zero-dependency script)
         run: python tests/smoke.py
+      - name: Syntax-check panel.js (no build step, node --check)
+        run: node --check custom_components/sensor_switch_controller/static/panel.js
       - name: Import under real HA
         run: |
           pip install homeassistant==2026.1.3

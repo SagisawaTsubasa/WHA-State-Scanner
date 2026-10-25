@@ -65,6 +65,9 @@ class DecisionLogger:
             with open(filepath, "a", encoding="utf-8") as fh:
                 fh.writelines(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
         except OSError as err:
+            # dir may have been removed between writes (manual cleanup) —
+            # retry makedirs on the next cycle instead of erroring forever
+            self._dir_ready = False
             _LOGGER.error("Failed to write decision log: %s", err)
 
     async def log_cycle(self, records: list[dict]) -> None:

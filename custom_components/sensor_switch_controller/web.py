@@ -20,6 +20,7 @@ from homeassistant.components.http import (
 )
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.loader import async_get_loaded_integration
 
 from .const import (
@@ -107,8 +108,9 @@ class ControllersView(HomeAssistantView):
         except _WebError as err:
             return _error_response(self, err)
 
+        before = (dict(hub.controllers), dict(hub.invalid))
         cid = hub.create_controller(config)
-        await hub.async_save()
+        await _save_or_rollback(hass, hub, before)
         _schedule_reload(hass, hub)
         _LOGGER.info("Created controller %s (%s) via web", cid, config["name"])
         return self.json({"ok": True, "id": cid})
@@ -140,12 +142,17 @@ class ControllerDetailView(HomeAssistantView):
         except _WebError as err:
             return _error_response(self, err)
 
-        if repairing:
-            hub.repair_controller(cid, config)
-        else:
-            # Honor the id the client saved under (URL wins over body).
-            hub.update_controller(cid, config)
-        await hub.async_save()
+        before = (dict(hub.controllers), dict(hub.invalid))
+        try:
+            if repairing:
+                hub.repair_controller(cid, config)
+            else:
+                # Honor the id the client saved under (URL wins over body).
+                hub.update_controller(cid, config)
+        except KeyError:
+            # check-then-act raced a concurrent DELETE across the await above
+            return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
+        await _save_or_rollback(hass, hub, before)
         _schedule_reload(hass, hub)
         _LOGGER.info("Updated controller %s (%s) via web", cid, config["name"])
         return self.json({"ok": True, "id": cid})
@@ -160,8 +167,9 @@ class ControllerDetailView(HomeAssistantView):
         cid = controller_id
         if cid not in hub.controllers and cid not in hub.invalid:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
+        before = (dict(hub.controllers), dict(hub.invalid))
         hub.remove_controller(cid)
-        await hub.async_save()
+        await _save_or_rollback(hass, hub, before)
         _schedule_reload(hass, hub)
         _LOGGER.info("Deleted controller %s via web", cid)
         return self.json({"ok": True})
@@ -276,19 +284,55 @@ def _valid_date(value: str) -> bool:
     return year.isdigit() and month.isdigit() and day.isdigit()
 
 
+async def _save_or_rollback(
+    hass: HomeAssistant, hub: ScannerHub, before: tuple
+) -> None:
+    """Persist the store; on failure restore the pre-mutation in-memory
+    state and schedule a reload so runtime matches the rolled-back store.
+
+    Without this a failed save leaves memory new / disk old — worst on
+    DELETE, where the manager is already unloaded and a restart would
+    resurrect the "deleted" controller from disk (体检 P2-3). Re-raises so
+    the HTTP layer still answers 500.
+    """
+    try:
+        await hub.async_save()
+    except Exception:
+        hub.controllers, hub.invalid = before
+        _LOGGER.exception(
+            "Controller store save failed; in-memory state rolled back"
+        )
+        _schedule_reload(hass, hub)
+        raise
+
+
 @callback
 def _schedule_reload(hass: HomeAssistant, hub: ScannerHub) -> None:
-    """Reload the config entry after a store mutation.
+    """Reload the config entry after a store mutation (coalesced).
 
     ``async_schedule_reload`` is a @callback that schedules the reload task
-    itself — it must be called directly, never wrapped in a task.
+    itself — it must be called directly, never wrapped in a task. Burst
+    CRUD within the 1s window shares one reload: every reload tears down
+    and rebuilds all managers, zeroing FOR/duration timers and flapping
+    outputs (体检 P3-9).
     """
     if not hub.entry_id:
         return
     if hass.config_entries.async_get_entry(hub.entry_id) is None:
         # Entry was removed; keep the store write but nothing to reload.
         return
-    hass.config_entries.async_schedule_reload(hub.entry_id)
+    pending_key = WEB_DATA_KEY + "_reload_pending"
+    if hass.data.get(pending_key):
+        return  # a reload is already queued inside the coalescing window
+    hass.data[pending_key] = True
+
+    @callback
+    def _go(_now) -> None:
+        hass.data[pending_key] = None
+        if hub.entry_id and hass.config_entries.async_get_entry(hub.entry_id):
+            hass.config_entries.async_schedule_reload(hub.entry_id)
+
+    async_call_later(hass, 1.0, _go)
 
 
 def _manifest_version(hass: HomeAssistant) -> str:
