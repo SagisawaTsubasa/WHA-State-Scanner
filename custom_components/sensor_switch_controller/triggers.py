@@ -219,8 +219,12 @@ class TriggerManager:
         @callback
         def _fire_and_rearm(now: datetime) -> None:
             holder.clear()  # fired handle is done
-            fire_cb(now)
-            _rearm()
+            try:
+                fire_cb(now)
+            finally:
+                # re-arm even if the callback raised, or the daily trigger
+                # would silently stop forever (审查 R1-12)
+                _rearm()
 
         def _rearm() -> None:
             now = dt_util.now()

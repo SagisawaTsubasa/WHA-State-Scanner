@@ -170,6 +170,7 @@ class ControllerDetailView(HomeAssistantView):
         before = (dict(hub.controllers), dict(hub.invalid))
         hub.remove_controller(cid)
         await _save_or_rollback(hass, hub, before)
+        await hub.async_drop_flag_states(cid)
         _schedule_reload(hass, hub)
         _LOGGER.info("Deleted controller %s via web", cid)
         return self.json({"ok": True})

@@ -343,6 +343,13 @@ details.wha-json pre {
 .parent-drawflow .drawflow .wha-node.cond-duration .input_2 {
   background: var(--wha-bad, #db4437);
 }
+/* flag set/reset ports: green = latch on path, red = latch off path */
+.parent-drawflow .drawflow .wha-node.cond-flag .input_1 {
+  background: var(--wha-good, #7da35a);
+}
+.parent-drawflow .drawflow .wha-node.cond-flag .input_2 {
+  background: var(--wha-bad, #db4437);
+}
 .parent-drawflow .drawflow .wha-node.cond-and .input_1,
 .parent-drawflow .drawflow .wha-node.cond-or .input_1,
 .parent-drawflow .drawflow .wha-node.cond-not .input_1 {
@@ -380,9 +387,10 @@ details.wha-json pre {
   display: none;
 }
 
-/* plain leaves have no gate-input semantics - hide the dead ports */
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_1,
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not) .input_2 {
+/* plain leaves have no gate-input semantics - hide the dead ports
+   (flag is exempt: its input_1/2 are the live set/reset ports, 审查 WHA-FIX R1-1) */
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag) .input_1,
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag) .input_2 {
   display: none;
 }
 

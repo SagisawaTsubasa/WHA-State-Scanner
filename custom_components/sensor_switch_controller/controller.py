@@ -146,6 +146,8 @@ class ControllerManager:
 
         # Precise FOR-expiry wakeup (cancelled/re-armed after every cycle).
         self._for_wakeup_unsub = None
+        # One-shot fallback for the init gate (see async_setup).
+        self._init_fallback_unsub = None
 
         # Last applied flip (utc) per output id — feeds cooldown conditions.
         self._last_flip: dict[str, Any] = {}
@@ -166,6 +168,31 @@ class ControllerManager:
         ]
         self.trigger_manager.async_setup(pool_ids)
         self.hass.async_create_task(self.logger.async_cleanup())
+        # Fallback for the init gate: async_entity_added fires per output,
+        # but HA swallows per-entity add failures — one broken output would
+        # otherwise hold the first evaluation forever. Force it after 30s.
+        self._init_fallback_unsub = async_call_later(
+            self.hass, 30, self._async_init_fallback
+        )
+
+    @callback
+    def _async_init_fallback(self, _now) -> None:
+        """Force the first evaluation even if some outputs never added."""
+        self._init_fallback_unsub = None
+        if not self._first_eval_pending:
+            return
+        missing = self._expected_out_ids - self._added_out_ids
+        if missing:
+            _LOGGER.warning(
+                "Controller %s: outputs %s never registered; forcing the "
+                "first evaluation without them",
+                self.controller_id,
+                sorted(missing),
+            )
+        self._first_eval_pending = False
+        self.hass.async_create_background_task(
+            self._async_evaluate(None, ["init-fallback"]), f"{self.controller_id}-init"
+        )
 
     def async_unload(self) -> None:
         """Stop all triggers, timers and entity references."""
@@ -173,6 +200,9 @@ class ControllerManager:
         if self._debounce_unsub:
             self._debounce_unsub()
             self._debounce_unsub = None
+        if self._init_fallback_unsub:
+            self._init_fallback_unsub()
+            self._init_fallback_unsub = None
         self._cancel_for_wakeup()
         self._entities.clear()
         self._added_out_ids.clear()
@@ -446,6 +476,13 @@ class ControllerManager:
         flipped = await self.engine.step_flags()
         if flipped:
             await self._persist_flag_states()
+            # A flag flip can reach outputs outside this trigger's coverage
+            # (flags are global latches): widen the directed scope so their
+            # chains are re-evaluated this same cycle, or they would sit
+            # stale until some unrelated trigger happens to fire (审查 R1-2).
+            if targets is not None:
+                for fid in flipped:
+                    targets |= self._cond_to_outs.get(fid) or set()
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -722,6 +759,9 @@ class ControllerManager:
             return
         readings = self._async_read_sensors()
         async with self._eval_lock:
+            flipped = await self.engine.step_flags()
+            if flipped:
+                await self._persist_flag_states()
             try:
                 record, _details = await self._async_evaluate_output(out_cfg, readings)
             except Exception:

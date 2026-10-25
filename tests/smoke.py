@@ -178,18 +178,34 @@ ha.helpers.entity_component = _mod("homeassistant.helpers.entity_component")
 ha.helpers.entity_component.DATA_INSTANCES = "entity_components"
 
 
-class _EntityRegistry:
-    @staticmethod
-    def async_get(hass):
-        return types.SimpleNamespace(async_remove=lambda eid: None)
+class _FakeRegistry:
+    """Injectable entity-registry stub: records removals, holds entries."""
+
+    def __init__(self):
+        self.removed: list[str] = []
+        self.entries: list[types.SimpleNamespace] = []
+
+    def add(self, entity_id, unique_id):
+        self.entries.append(
+            types.SimpleNamespace(entity_id=entity_id, unique_id=unique_id)
+        )
+
+    def async_remove(self, entity_id):
+        self.removed.append(entity_id)
+
+    def entries_for(self, config_entry_id):
+        return list(self.entries)
+
+
+_FAKE_REGISTRY = _FakeRegistry()
+ha.helpers.entity_registry = _mod("homeassistant.helpers.entity_registry")
+ha.helpers.entity_registry.async_get = lambda hass: _FAKE_REGISTRY
 
 
 def _entries_for_config_entry(registry, config_entry_id):
-    return []
+    return registry.entries_for(config_entry_id)
 
 
-ha.helpers.entity_registry = _mod("homeassistant.helpers.entity_registry")
-ha.helpers.entity_registry.async_get = lambda hass: _EntityRegistry()
 ha.helpers.entity_registry.async_entries_for_config_entry = (
     _entries_for_config_entry
 )
@@ -1197,6 +1213,74 @@ async def main():
     assert ent_fb.is_on is False, "output driven by latched flag_b"
     mgr_f.async_unload()
     print("[PASS] flag latch: stepping, reset-wins, initial, disabled freeze, cascade rules")
+
+    # ------------------------------------------------------------------
+    # 0.9.0 review R1-2: a directed evaluation must widen its targets with
+    # the outputs reachable from flipped flags, or those outputs sit stale.
+    # ------------------------------------------------------------------
+    x_id = "cond_" + "e" * 32
+    dir_flag = "cond_" + "f" * 32
+    dir_cfg = {
+        "name": "flag-directed", "enabled": True, "logging_enabled": False,
+        "triggers": [{
+            "id": "trg_" + "1" * 32, "type": "homeassistant", "enabled": True,
+            "routes": {"conditions": [x_id]},
+        }],
+        "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": x_id, "type": "state", "entity_id": "switch.c", "state": "on"},
+            {"id": dir_flag, "type": "flag",
+             "set_conditions": [x_id], "reset_conditions": []},
+        ],
+        "outputs": [
+            {"name": "out-x", "type": "binary_sensor", "entity_id": "ssc_" + "a" * 32,
+             "on_conditions": [x_id], "off_conditions": []},
+            {"name": "out-flag", "type": "binary_sensor", "entity_id": "ssc_" + "b" * 32,
+             "on_conditions": [dir_flag], "off_conditions": []},
+        ],
+    }
+    mgr_d = ControllerManager(_Hass(), "ctrl_smoke06", _vc(json.loads(json.dumps(dir_cfg))))
+    await mgr_d.async_setup()
+    ent_x = _Entity("binary_sensor.dx")
+    ent_g = _Entity("binary_sensor.dg")
+    mgr_d.register_entity("ssc_" + "a" * 32, ent_x)
+    mgr_d.register_entity("ssc_" + "b" * 32, ent_g)
+    # Directed scope covers only out-x; the flag flips during this cycle and
+    # must drag out-flag into the same evaluation (switch.c is "on" in the
+    # stub states, so the set member fires and the flag latches on).
+    await mgr_d._async_evaluate(None, ["directed"], {"ssc_" + "a" * 32})
+    assert ent_x.is_on is True, "directed target evaluated"
+    assert ent_g.is_on is True, (
+        "flag flip widened the directed scope to its downstream output"
+    )
+    mgr_d.async_unload()
+    print("[PASS] flag flip widens directed targets (review R1-2)")
+
+    # ------------------------------------------------------------------
+    # 0.9.0 review R1-7: remove_controller sweeps the registry by unique_id
+    # prefix even when no manager exists (disable-before-delete).
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.hub import ScannerHub
+
+    hub_t = ScannerHub(_Hass())
+    hub_t.set_entry("test_entry_id")
+    rid = "ctrl_ab12cd34"
+    hub_t.controllers[rid] = _vc({
+        "name": "sweep-me", "enabled": False, "logging_enabled": False,
+        "triggers": [], "sensors": [], "conditions": [],
+        "outputs": [],
+    })
+    _FAKE_REGISTRY.add("binary_sensor.mine", "ctrl_ab12cd34_ssc_1")
+    _FAKE_REGISTRY.add("binary_sensor.mine_no_hass", "ctrl_ab12cd34_ssc_2")
+    _FAKE_REGISTRY.add("binary_sensor.other", "ctrl_99999999_ssc_1")
+    hub_t.remove_controller(rid)
+    assert sorted(_FAKE_REGISTRY.removed) == [
+        "binary_sensor.mine",
+        "binary_sensor.mine_no_hass",
+    ], _FAKE_REGISTRY.removed
+    assert "binary_sensor.other" not in _FAKE_REGISTRY.removed
+    assert rid not in hub_t.controllers and rid not in hub_t.flag_states
+    print("[PASS] remove_controller registry sweep (review R1-7)")
 
 asyncio.run(main())
 print("SMOKE OK")

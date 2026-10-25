@@ -2356,7 +2356,7 @@ class ScannerPanel extends HTMLElement {
       ${isGroup
         ? `<p class="wha-sub">${esc(this.tr("members"))}: ${(cond.conditions || []).length}</p>`
         : this._condFieldsHtml(cond)}
-      ${isGroup || cond.type === "duration" || cond.type === "debounce"
+      ${isGroup || cond.type === "duration" || cond.type === "debounce" || cond.type === "flag"
         ? ""
         : `<label class="field"><span>${esc(this.tr("forDuration"))}</span><span class="wha-row">
             <input class="wha-input" type="number" min="0" max="24" style="width:64px" data-for="hours" value="${esc(f.hours)}">:

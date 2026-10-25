@@ -162,20 +162,21 @@ class ConditionEngine:
                 continue
             initial = bool(cond.get(CONF_INITIAL, False))
             old = self._flag_states.get(cid, initial)
+            # No short-circuit: every member is evaluated every cycle so its
+            # FOR/duration timers stay fresh (same rule as OR groups above).
             reset_met = False
             for member in cond.get(CONF_RESET_CONDITIONS) or []:
                 if await self._evaluate_id(member, set()):
                     reset_met = True
-                    break
+            set_met = False
+            if not reset_met:
+                for member in cond.get(CONF_SET_CONDITIONS) or []:
+                    if await self._evaluate_id(member, set()):
+                        set_met = True
             if reset_met:
                 new = False
             else:
-                new = old
-                if not new:
-                    for member in cond.get(CONF_SET_CONDITIONS) or []:
-                        if await self._evaluate_id(member, set()):
-                            new = True
-                            break
+                new = True if set_met else old
             self._flag_states[cid] = new
             if new != old:
                 flipped.append(cid)

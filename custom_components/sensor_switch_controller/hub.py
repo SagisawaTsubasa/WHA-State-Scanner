@@ -429,6 +429,11 @@ class ScannerHub:
         self.flag_states[cid] = dict(states)
         await self._flag_store.async_save({"flags": self.flag_states})
 
+    async def async_drop_flag_states(self, cid: str) -> None:
+        """Forget and persist-erase one controller's flag states."""
+        self.flag_states.pop(cid, None)
+        await self._flag_store.async_save({"flags": self.flag_states})
+
     # ------------------------------------------------------------------
     # Controllers CRUD (web API; caller schedules the entry reload)
     # ------------------------------------------------------------------
@@ -479,6 +484,8 @@ class ScannerHub:
         self.flag_states.pop(cid, None)
         self.controllers.pop(cid, None)
         self.invalid.pop(cid, None)
+        # The caller persists the flag store afterwards (web delete path) so
+        # the erased states do not resurrect on the next load (审查 R1-11).
 
     def _fresh_id(self) -> str:
         while True:

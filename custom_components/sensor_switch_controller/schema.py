@@ -543,6 +543,8 @@ def _validate_condition(cond) -> dict:
         # `reset_conditions` (any → off, reset wins) reference plain
         # condition ids; the verdict is stepped once per evaluation cycle
         # and persists across restarts. No `for` (timing gates below).
+        if cond.get("for"):
+            _fail("旗标条件不支持 for：旗标本身是锁存，不需要持续前置")
         for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
             members = cond.get(key) or []
             if not isinstance(members, list) or not all(
@@ -649,8 +651,14 @@ def _check_graph(
         label = cond.get("label") or cond["id"]
         for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
             for member in cond[key]:
-                if by_id[member]["type"] == COND_FLAG:
+                mtype = by_id[member]["type"]
+                if mtype == COND_FLAG:
                     _fail(f"旗标「{label}」的 {key} 引用了另一个旗标：旗标不能级联")
+                if mtype == COND_COOLDOWN:
+                    _fail(
+                        f"旗标「{label}」的 {key} 引用了冷却条件：冷却依赖输出上下文"
+                        "（旗标步进时没有），请把冷却放在输出链上"
+                    )
 
     # Cycle detection over group references and duration start/abort edges
     # (iterative DFS with colors).
