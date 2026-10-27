@@ -6,6 +6,7 @@ web API keeps answering (with torn-down runtime) while the entry reloads.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import uuid
@@ -391,6 +392,11 @@ class ScannerHub:
         # survives entry reloads, the store below survives HA restarts.
         self.flag_states: dict[str, dict[str, bool]] = {}
         self._flag_store = Store(hass, 1, STORE_KEY + "_flags")
+        # Serializes web CRUD (snapshot → mutate → save → rollback) and the
+        # reload-time store re-read (审查 R6-2): the whole-table save must
+        # never capture another request's half-committed mutation, and the
+        # reload re-read must never clobber one.
+        self.crud_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Storage
@@ -460,7 +466,29 @@ class ScannerHub:
             )
             data = None
         raw = (data or {}).get("flags")
-        self.flag_states = raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            _LOGGER.warning(
+                "Stored %s_flags 'flags' payload is not an object (%r); ignored",
+                STORE_KEY,
+                type(raw).__name__,
+            )
+            self.flag_states = {}
+            return
+        states: dict[str, dict[str, bool]] = {}
+        for cid, value in raw.items():
+            # per-controller guard (审查 R6-5): a non-object value would
+            # explode dict() inside every ConditionEngine
+            # (controller.py → condition_engine.__init__) and take down
+            # build_managers → the whole entry setup — drop it loudly.
+            if isinstance(cid, str) and isinstance(value, dict):
+                states[cid] = value
+            else:
+                _LOGGER.warning(
+                    "Dropping malformed flag state for controller %r (%s)",
+                    cid,
+                    type(value).__name__,
+                )
+        self.flag_states = states
 
     async def async_save_flag_states(self, cid: str, states: dict) -> None:
         """Persist one controller's flag states (called on flag flips)."""

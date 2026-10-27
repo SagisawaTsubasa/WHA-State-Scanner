@@ -108,9 +108,14 @@ class ControllersView(HomeAssistantView):
         except _WebError as err:
             return _error_response(self, err)
 
-        before = (dict(hub.controllers), dict(hub.invalid))
-        cid = hub.create_controller(config)
-        await _save_or_rollback(hass, hub, before)
+        # The lock spans snapshot → mutate → save (+ rollback) so the
+        # whole-table store write can never capture another request's
+        # half-committed mutation (审查 R6-2).
+        async with hub.crud_lock:
+            # A fresh id is guaranteed absent from both dicts (hub._fresh_id),
+            # so the key snapshot is the empty state.
+            cid = hub.create_controller(config)
+            await _save_or_rollback(hass, hub, cid, (False, None, None))
         _schedule_reload(hass, hub)
         _LOGGER.info("Created controller %s (%s) via web", cid, config["name"])
         return self.json({"ok": True, "id": cid})
@@ -142,17 +147,21 @@ class ControllerDetailView(HomeAssistantView):
         except _WebError as err:
             return _error_response(self, err)
 
-        before = (dict(hub.controllers), dict(hub.invalid))
-        try:
-            if repairing:
-                hub.repair_controller(cid, config)
-            else:
-                # Honor the id the client saved under (URL wins over body).
-                hub.update_controller(cid, config)
-        except KeyError:
-            # check-then-act raced a concurrent DELETE across the await above
-            return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
-        await _save_or_rollback(hass, hub, before)
+        # The lock spans snapshot → mutate → save (+ rollback) so the
+        # whole-table store write can never capture another request's
+        # half-committed mutation (审查 R6-2).
+        async with hub.crud_lock:
+            before_key = _key_snapshot(hub, cid)
+            try:
+                if repairing:
+                    hub.repair_controller(cid, config)
+                else:
+                    # Honor the id the client saved under (URL wins over body).
+                    hub.update_controller(cid, config)
+            except KeyError:
+                # check-then-act raced a concurrent DELETE across the await above
+                return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
+            await _save_or_rollback(hass, hub, cid, before_key)
         _schedule_reload(hass, hub)
         _LOGGER.info("Updated controller %s (%s) via web", cid, config["name"])
         return self.json({"ok": True, "id": cid})
@@ -170,13 +179,25 @@ class ControllerDetailView(HomeAssistantView):
         cid = controller_id
         if cid not in hub.controllers and cid not in hub.invalid:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
-        before = (dict(hub.controllers), dict(hub.invalid))
-        entity_ids = hub.remove_controller(cid)
-        await _save_or_rollback(hass, hub, before)
-        # Save won — the deletion is durable now. A failed flag-store write
-        # must not fake a failed DELETE: the next flag save of any
-        # controller rewrites the whole flag store and clears the orphan.
-        hub.sweep_registry(cid, entity_ids)
+        # The lock spans snapshot → mutate → save (+ rollback) so the
+        # whole-table store write can never capture another request's
+        # half-committed mutation (审查 R6-2).
+        async with hub.crud_lock:
+            before_key = _key_snapshot(hub, cid)
+            entity_ids = hub.remove_controller(cid)
+            await _save_or_rollback(hass, hub, cid, before_key)
+        # Save won — the deletion is durable now. Each post-save step is
+        # guarded on its own (审查 R6-4): a registry/flag failure must not
+        # fake a failed DELETE (the main store already committed) nor skip
+        # the remaining cleanup or the reload — every failure is logged,
+        # the next step still runs.
+        try:
+            hub.sweep_registry(cid, entity_ids)
+        except Exception:
+            _LOGGER.exception(
+                "Registry sweep failed for %s; deletion stays, ghost "
+                "entries clear on the next entry reload", cid,
+            )
         try:
             await hub.async_drop_flag_states(cid)
         except Exception:
@@ -298,24 +319,68 @@ def _valid_date(value: str) -> bool:
     return year.isdigit() and month.isdigit() and day.isdigit()
 
 
-async def _save_or_rollback(
-    hass: HomeAssistant, hub: ScannerHub, before: tuple
-) -> None:
-    """Persist the store; on failure restore the pre-mutation in-memory
-    state and schedule a reload so runtime matches the rolled-back store.
+def _key_snapshot(hub: ScannerHub, cid: str) -> tuple[bool, dict | None, dict | None]:
+    """Pre-mutation state of ONE controller key (审查 R6-2): the rollback
+    undo is key-granular, so a failed save never clobbers what a concurrent
+    request committed under its own lock window."""
+    return (
+        cid in hub.controllers,
+        hub.controllers.get(cid),
+        hub.invalid.get(cid),
+    )
 
-    Without this a failed save leaves memory new / disk old — worst on
-    DELETE, where the manager is already unloaded and a restart would
-    resurrect the "deleted" controller from disk (体检 P2-3). Re-raises so
-    the HTTP layer still answers 500.
+
+def _restore_key(hub: ScannerHub, cid: str, snap: tuple) -> None:
+    """Undo one request's single-key mutation (the exact inverse of
+    create/update/repair/remove) onto the current in-memory dicts."""
+    was_controller, config, invalid_item = snap
+    if was_controller:
+        hub.controllers[cid] = config
+    else:
+        hub.controllers.pop(cid, None)
+    if invalid_item is not None:
+        hub.invalid[cid] = invalid_item
+    else:
+        hub.invalid.pop(cid, None)
+
+
+async def _save_or_rollback(
+    hass: HomeAssistant,
+    hub: ScannerHub,
+    cid: str,
+    before_key: tuple,
+) -> None:
+    """Persist the store; on failure undo THIS request's key only and
+    converge memory with the durable state (审查 R6-2).
+
+    The store write is whole-table, but every CRUD mutation is single-key
+    and serialized by ``hub.crud_lock``: the rollback re-reads the store
+    (dropping whatever the failed write left behind) and then re-applies
+    the inverse of this request's key — concurrent requests' committed
+    changes survive and memory never stays split from disk. The first
+    in-memory restore runs before the re-read so readers never observe
+    the mutation. The detached manager is NOT resurrected; the scheduled
+    reload rebuilds it (a sub-second window with no runtime, accepted by
+    the R5 review). Re-raises so the HTTP layer still answers 500.
     """
     try:
         await hub.async_save()
     except Exception:
-        hub.controllers, hub.invalid = before
         _LOGGER.exception(
-            "Controller store save failed; in-memory state rolled back"
+            "Controller store save failed; rolling back controller %s", cid
         )
+        _restore_key(hub, cid, before_key)
+        try:
+            await hub.async_load()
+        except Exception:
+            _LOGGER.warning(
+                "Store re-read after the failed save failed too; %s is "
+                "rolled back in memory only",
+                cid,
+                exc_info=True,
+            )
+        else:
+            _restore_key(hub, cid, before_key)
         _schedule_reload(hass, hub)
         raise
 

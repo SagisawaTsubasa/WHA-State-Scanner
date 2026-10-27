@@ -39,10 +39,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # (reload / re-enable after SETUP_ERROR) the `hub is not None`
             # branch would skip BOTH loads and run on empty controllers,
             # where the first save overwrites the store with an empty
-            # payload — a deterministic data-loss path (审查 R5-1).
-            hass.data.pop(DOMAIN, None)
+            # payload — a deterministic data-loss path (审查 R5-1). The
+            # guard is the re-raise itself (审查 R6-7): hass.data[DOMAIN]
+            # is only assigned after both loads succeed, so a failed setup
+            # never published anything and there is nothing to pop.
             raise
         hass.data[DOMAIN] = hub
+    else:
+        # Entry reload with a surviving hub: re-read the store so memory
+        # converges with the durable state even after a rolled-back save
+        # (审查 R6-2 — a reload that skips the store would keep the
+        # rolled-back memory and the next save would overwrite disk with
+        # it). Serialized against in-flight web CRUD; a failed re-read
+        # keeps the last-known-good memory (logged, non-fatal). Flag
+        # latches are deliberately NOT re-read: surviving them across
+        # entry reloads is the designed behavior (hub.py flag_states).
+        try:
+            async with hub.crud_lock:
+                await hub.async_load()
+        except Exception:
+            _LOGGER.warning(
+                "Store re-read on entry reload failed; keeping the "
+                "in-memory controllers",
+                exc_info=True,
+            )
     hub.set_entry(entry.entry_id)
 
     hub.build_managers()

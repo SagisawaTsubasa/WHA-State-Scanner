@@ -613,19 +613,93 @@ def _validate_output(out) -> dict:
     return result
 
 
-def _condition_neighbors(cond: dict) -> list[str]:
+def _condition_neighbors(cond: dict, include_flag_edges: bool = True) -> list[str]:
     """Referenced condition ids of one condition (group members, duration
-    start/abort, flag set/reset) — the edge set for graph checks."""
+    start/abort, flag set/reset) — the edge set for graph checks.
+
+    Group members and duration start/abort are EVALUATION edges (the
+    engine recurses into them); flag set/reset are NOT — the flag step
+    only reads the latched verdict (engine ``COND_FLAG`` branch never
+    re-evaluates a flag's own inputs). Cycle detection and the flag
+    closure therefore pass ``include_flag_edges=False``: a flag edge can
+    neither close an evaluation cycle nor cascade (审查 R6-1). The
+    existence check keeps the default: a dangling set/reset reference
+    must still fail.
+    """
     edges = list(cond.get("conditions") or [])
     for key in (CONF_START, CONF_ABORT):
         ref = cond.get(key)
         if isinstance(ref, str):
             edges.append(ref)
-    for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
-        val = cond.get(key)
-        if isinstance(val, list):
-            edges.extend(m for m in val if isinstance(m, str))
+    if include_flag_edges:
+        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+            val = cond.get(key)
+            if isinstance(val, list):
+                edges.extend(m for m in val if isinstance(m, str))
     return edges
+
+
+def _flag_branch_verdict(
+    cond: dict,
+    by_id: dict[str, dict],
+    memo: dict[str, bool | None],
+) -> bool | None:
+    """Abstract verdict of one branch as the flag step evaluates it
+    (审查 R6-1/R6-3): False = provably dead in flag context (a cooldown
+    has no output context there, an AND with a dead member stays dead, a
+    duration gated by a dead start never completes); True = provably
+    satisfied (a disabled node — the engine returns satisfied WITHOUT
+    evaluating its members, condition_engine._evaluate_id); None =
+    depends on live state.
+
+    Flags read as None: a self reference reads the previous latch
+    (deterministic, so a self-resetting latch is legal — R6-1), any
+    other reachable flag was already rejected by the reachability walk.
+    Empty groups read as None too: they are wiring anchors whose members
+    may come later (the member_referenced check accepts flag wiring,
+    R6-3). Cycle-safe via a None placeholder before recursing.
+    """
+    cid = cond.get("id")
+    if cid in memo:
+        return memo[cid]
+    memo[cid] = None  # a reference loop is never provably constant
+    if cond.get("enabled") is False:
+        verdict: bool | None = True
+    else:
+        ctype = cond["type"]
+        if ctype == COND_COOLDOWN:
+            verdict = False  # no output context during the flag step
+        elif ctype == COND_FLAG:
+            verdict = None  # latched read; non-self callers already failed
+        elif ctype in GROUP_TYPES:
+            members = cond.get("conditions") or []
+            if not members:
+                verdict = None
+            else:
+                verdicts = [
+                    _flag_branch_verdict(by_id[member], by_id, memo)
+                    for member in members
+                ]
+                if any(v is None for v in verdicts):
+                    verdict = None
+                elif ctype == COND_AND:
+                    verdict = all(verdicts)
+                elif ctype == COND_OR:
+                    verdict = any(verdicts)
+                else:  # not
+                    verdict = not any(verdicts)
+        elif ctype == COND_DURATION:
+            start = by_id.get(cond.get(CONF_START))
+            verdict = (
+                False
+                if start is not None
+                and _flag_branch_verdict(start, by_id, memo) is False
+                else None
+            )
+        else:  # state/time/sun/template/calendar/debounce: live inputs
+            verdict = None
+    memo[cid] = verdict
+    return verdict
 
 
 def _check_graph(
@@ -649,33 +723,50 @@ def _check_graph(
         if cond["type"] != COND_FLAG:
             continue
         label = cond.get("label") or cond["id"]
+        # (a) Order-dependence hunt (审查 R5-4, narrowed by R6-1/R6-3): any
+        # reachable NON-self flag makes the verdict depend on flag stepping
+        # order. The flag itself is only ever READ during the step (latched
+        # value), so a self reference — directly or through a duration
+        # chain (self-resetting latch) — is legal. Disabled nodes are
+        # skipped: the engine returns satisfied for them without evaluating
+        # their members (condition_engine._evaluate_id).
         for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
-            # Closure walk over group/duration/flag edges (审查 R5-4): a
-            # cooldown (or another flag) hidden behind a group or behind a
-            # duration's start/abort is the same dead branch as a direct
-            # one — the flag step evaluates without output context, so any
-            # reachable cooldown is permanently False there, and any
-            # reachable flag makes the verdict depend on condition order.
-            stack = list(cond[key])
             seen: set[str] = set()
+            stack = list(cond[key])
             while stack:
                 member = stack.pop()
                 if member in seen:
                     continue
                 seen.add(member)
-                mtype = by_id[member]["type"]
-                if mtype == COND_FLAG:
+                mcond = by_id[member]
+                if mcond.get("enabled") is False:
+                    continue
+                if mcond["type"] == COND_FLAG:
+                    if member != cond["id"]:
+                        _fail(
+                            f"旗标「{label}」的 {key}（直接或经组/持续门间接）引用了"
+                            "另一个旗标：旗标不能级联"
+                        )
+                    continue  # self: reads the previous latch — safe (R6-1)
+                stack.extend(
+                    _condition_neighbors(mcond, include_flag_edges=False)
+                )
+        # (b) Dead-branch verdicts (审查 R5-4, narrowed by R6-3): a cooldown
+        # hidden behind a group/duration is still permanently False in the
+        # flag step (no output context), but only a branch with NO usable
+        # alternative is rejected — a mixed OR group keeps working via its
+        # other members, so rejecting the whole controller for it broke
+        # previously valid stores on upgrade.
+        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+            memo: dict[str, bool | None] = {}
+            for member in cond[key]:
+                if _flag_branch_verdict(by_id[member], by_id, memo) is False:
                     _fail(
-                        f"旗标「{label}」的 {key}（直接或经组/持续门间接）引用了"
-                        "另一个旗标：旗标不能级联"
+                        f"旗标「{label}」的 {key}（直接或经组/持续门间接）恒不成立："
+                        "冷却条件在旗标步进时没有输出上下文（恒 False），"
+                        "AND 组混入冷却、空组同理；请把冷却放在输出链上"
+                        "或修正该分支"
                     )
-                if mtype == COND_COOLDOWN:
-                    _fail(
-                        f"旗标「{label}」的 {key}（直接或经组/持续门间接）引用了"
-                        "冷却条件：冷却依赖输出上下文（旗标步进时没有），"
-                        "请把冷却放在输出链上"
-                    )
-                stack.extend(_condition_neighbors(by_id[member]))
 
     # Cycle detection over group references and duration start/abort edges
     # (iterative DFS with colors).
@@ -684,7 +775,12 @@ def _check_graph(
     for root, root_cond in by_id.items():
         if color[root] != WHITE:
             continue
-        stack = [(root, iter(_condition_neighbors(root_cond)))]
+        # flag set/reset edges are excluded (R6-1): the flag step only
+        # reads latched values, so flag references can never close an
+        # evaluation cycle — flag→duration→flag must stay saveable
+        stack = [
+            (root, iter(_condition_neighbors(root_cond, include_flag_edges=False)))
+        ]
         color[root] = GRAY
         while stack:
             node, members = stack[-1]
@@ -697,7 +793,16 @@ def _check_graph(
                     _fail("条件存在循环引用（组成员或持续的开始/中止链）")
                 if state == WHITE:
                     color[member] = GRAY
-                    stack.append((member, iter(_condition_neighbors(by_id[member]))))
+                    stack.append(
+                        (
+                            member,
+                            iter(
+                                _condition_neighbors(
+                                    by_id[member], include_flag_edges=False
+                                )
+                            ),
+                        )
+                    )
                     advanced = True
                     break
             if not advanced:
@@ -727,8 +832,9 @@ def _check_graph(
         for member in (trg.get(CONF_ROUTES) or {}).get("conditions") or []
     }
     # topological references (WHA-F-167/F-170): membership in another
-    # group, an output chain, or a duration start/abort — all keep an empty
-    # group alive on the canvas
+    # group, an output chain, a duration start/abort, or a flag's
+    # set/reset input (审查 R6-3 — same graph, same judgement) — all keep
+    # an empty group alive on the canvas
     member_referenced = {
         m
         for cond in conditions
@@ -737,6 +843,8 @@ def _check_graph(
             (cond.get("conditions") or [])
             + ([cond.get("start")] if cond.get("start") else [])
             + ([cond.get("abort")] if cond.get("abort") else [])
+            + list(cond.get(CONF_SET_CONDITIONS) or [])
+            + list(cond.get(CONF_RESET_CONDITIONS) or [])
         )
         if isinstance(m, str)
     }

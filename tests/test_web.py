@@ -16,6 +16,7 @@ import pytest
 from custom_components.sensor_switch_controller import web as web_mod
 from custom_components.sensor_switch_controller.const import (
     API_BASE,
+    DOMAIN,
     HUB_BUS_EVENT_PAGE_CHANGED,
     HUB_PAGE_ID,
     HUB_REGISTRY_KEY,
@@ -237,7 +238,8 @@ def test_started_recheck_rejudges_mode():
 
 
 # ----------------------------------------------------------------------
-# _save_or_rollback (体检 P2-3 / 审查 R5-10): rollback + reload + re-raise
+# _save_or_rollback (体检 P2-3 / 审查 R5-10, key-granular per 审查 R6-2):
+# single-key rollback + store re-read + reload + re-raise
 # ----------------------------------------------------------------------
 
 
@@ -258,28 +260,62 @@ def _hass_with_config_entries():
     return hass
 
 
-def test_save_rollback_restores_and_schedules_reload():
-    """Store.async_save 抛 OSError：内存回滚到快照、排 reload、异常上抛
-    （HTTP 层据此答 500）。"""
+def test_save_rollback_restores_key_and_schedules_reload():
+    """Store.async_save 抛 OSError（审查 R6-2）：只回滚本次请求的键、对端
+    已落盘改动经重读保留、排 reload、异常上抛（HTTP 层据此答 500）。
+    整表快照回滚会把对端键一并抹掉——那正是本钉要抓的回归。"""
     hass = _hass_with_config_entries()
     hub = _make_hub(hass)
-    hub.controllers["ctrl_a"] = {"name": "a"}
-    hub.invalid["ctrl_b"] = {"config": {"name": "b"}, "error": "x"}
-    before = (dict(hub.controllers), dict(hub.invalid))
-    # the mutation under test — a failed save must undo exactly this
-    hub.controllers["ctrl_a"] = {"name": "a2"}
-    hub.controllers["ctrl_c"] = {"name": "c"}
-    hub.invalid.pop("ctrl_b")
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "a"}
+    hub.controllers["ctrl_bbbbbbbb"] = {"name": "peer"}
+    snap = web_mod._key_snapshot(hub, "ctrl_aaaaaaaa")
+    # the mutation under test — a failed save must undo exactly this key
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "a2"}
+    # a peer change another request committed meanwhile (via its own save)
+    hub.controllers["ctrl_bbbbbbbb"] = {"name": "peer2"}
 
     async def _boom(data):
         raise OSError("disk full")
 
     hub.store.async_save = _boom
+    # the durable store holds the peer's committed state (not our failed one)
+    hub.store.load_result = {
+        "controllers": {"ctrl_aaaaaaaa": {"name": "a"}, "ctrl_bbbbbbbb": {"name": "peer2"}}
+    }
     with pytest.raises(OSError):
-        asyncio.run(web_mod._save_or_rollback(hass, hub, before))
-    assert hub.controllers == {"ctrl_a": {"name": "a"}}
-    assert hub.invalid == {"ctrl_b": {"config": {"name": "b"}, "error": "x"}}
+        asyncio.run(web_mod._save_or_rollback(hass, hub, "ctrl_aaaaaaaa", snap))
+    # the re-read normalizes configs through validate_controller — compare
+    # identities: our key rolled back, the peer's committed change survived
+    assert {cid: c["name"] for cid, c in hub.controllers.items()} == {
+        "ctrl_aaaaaaaa": "a",
+        "ctrl_bbbbbbbb": "peer2",
+    }, hub.controllers
     # a reload is queued so runtime matches the rolled-back store
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
+
+
+def test_save_rollback_without_reread_restores_key_in_memory():
+    """重读也失败（存储仍坏）时按键回滚内存快照兜底，并排 reload。"""
+    hass = _hass_with_config_entries()
+    hub = _make_hub(hass)
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "a"}
+    snap = web_mod._key_snapshot(hub, "ctrl_aaaaaaaa")
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "a2"}
+    hub.controllers["ctrl_cccccccc"] = {"name": "n"}
+
+    async def _boom(data):
+        raise OSError("disk full")
+
+    async def _load_broken():
+        raise OSError("still broken")
+
+    hub.store.async_save = _boom
+    hub.store.async_load = _load_broken
+    with pytest.raises(OSError):
+        asyncio.run(web_mod._save_or_rollback(hass, hub, "ctrl_aaaaaaaa", snap))
+    assert hub.controllers == {"ctrl_aaaaaaaa": {"name": "a"}, "ctrl_cccccccc": {"name": "n"}}, (
+        hub.controllers
+    )
     assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
 
 
@@ -287,8 +323,181 @@ def test_save_success_persists_without_rollback():
     """保存成功：store 落盘、内存原样、无回滚、不排 reload。"""
     hass = _hass_with_config_entries()
     hub = _make_hub(hass)
-    hub.controllers["ctrl_a"] = {"name": "a"}
-    asyncio.run(web_mod._save_or_rollback(hass, hub, (dict(hub.controllers), {})))
-    assert hub.controllers == {"ctrl_a": {"name": "a"}}
-    assert hub.store.saved[-1] == {"controllers": {"ctrl_a": {"name": "a"}}}
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "a"}
+    snap = web_mod._key_snapshot(hub, "ctrl_aaaaaaaa")
+    asyncio.run(web_mod._save_or_rollback(hass, hub, "ctrl_aaaaaaaa", snap))
+    assert hub.controllers == {"ctrl_aaaaaaaa": {"name": "a"}}
+    assert hub.store.saved[-1] == {"controllers": {"ctrl_aaaaaaaa": {"name": "a"}}}
     assert not hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
+
+
+# ----------------------------------------------------------------------
+# DELETE view ordering (审查 R6-6 / R6-4): sweep_registry only after the
+# durable save; a failed save skips the irreversible phases entirely.
+# ----------------------------------------------------------------------
+
+
+class _FakeManager:
+    """Duck-typed ControllerManager: records unload, holds one entity."""
+
+    def __init__(self):
+        self.entities = {
+            "ssc_x": types.SimpleNamespace(entity_id="binary_sensor.x")
+        }
+        self.unloaded = False
+
+    def async_unload(self):
+        self.unloaded = True
+
+
+def _make_crud_hub(hass):
+    """A hub PUBLISHED in hass.data — the views read it via get_hub()."""
+    hub = _make_hub(hass)
+    hass.data[DOMAIN] = hub
+    return hub
+
+
+def _make_request(hass):
+    return types.SimpleNamespace(app={"hass": hass})
+
+
+async def _async_noop(*args, **kwargs):
+    return None
+
+
+def _noop_task(coro, name=None):
+    """build_managers hands managers to the background scheduler; the
+    reload re-read tests only pin the store, so close the coroutine
+    (no runtime, no never-awaited warning)."""
+    coro.close()
+    return None
+
+
+def test_delete_view_sweeps_only_after_durable_save():
+    """DELETE 视图顺序 = 内存摘除（含活实体分支）→ 主存储落盘 → registry
+    清扫 → flag 丢弃 → reload；活实体的 manager 必须被卸载。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "doomed"}
+    mgr = _FakeManager()
+    hub.managers["ctrl_ab12cd34"] = mgr
+    calls: list[str] = []
+    hub.sweep_registry = lambda cid, eids: calls.append("sweep")
+
+    real_save = hub.store.async_save
+
+    async def _save(data):
+        calls.append("save")
+        await real_save(data)
+
+    hub.store.async_save = _save
+    resp = asyncio.run(
+        web_mod.ControllerDetailView().delete(
+            _make_request(hass), "ctrl_ab12cd34"
+        )
+    )
+    assert resp.status == 200
+    assert calls == ["save", "sweep"], calls
+    assert mgr.unloaded is True, "the live-entity branch must unload the manager"
+    assert "ctrl_ab12cd34" not in hub.controllers
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
+
+
+def test_delete_view_failed_save_keeps_controller_and_skips_sweep():
+    """save 抛错：不可逆的 registry 清扫不得运行，控制器按键回滚，
+    排 reload，异常上抛（HTTP 层据此答 500）。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    doomed = {"name": "doomed"}
+    hub.controllers["ctrl_ab12cd34"] = doomed
+    calls: list[str] = []
+    hub.sweep_registry = lambda cid, eids: calls.append("sweep")
+
+    async def _boom(data):
+        raise OSError("disk full")
+
+    hub.store.async_save = _boom
+    with pytest.raises(OSError):
+        asyncio.run(
+            web_mod.ControllerDetailView().delete(
+                _make_request(hass), "ctrl_ab12cd34"
+            )
+        )
+    assert "sweep" not in calls, (
+        "the irreversible sweep must not run before the save wins"
+    )
+    assert hub.controllers.get("ctrl_ab12cd34") == doomed, (
+        "the key rollback must restore the controller"
+    )
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
+
+
+# ----------------------------------------------------------------------
+# Entry reload with a surviving hub (审查 R6-2): the reload MUST re-read
+# the store, or a rolled-back memory would permanently diverge from disk
+# and the next save would overwrite the peer's committed changes.
+# ----------------------------------------------------------------------
+
+
+def test_setup_entry_reload_rereads_store():
+    """hub 存活条目重载：async_setup_entry 重读存储（持 crud_lock），
+    内存收敛到落盘状态；重读失败降级 warning 并保留原内存。"""
+    from custom_components.sensor_switch_controller import (
+        async_setup_entry as _setup_entry,
+    )
+
+    hass = make_hass()
+    hass.config_entries = types.SimpleNamespace(
+        async_get_entry=lambda eid: object(),
+        async_schedule_reload=lambda eid: None,
+        async_forward_entry_setups=_async_noop,
+    )
+    hass.async_create_background_task = _noop_task
+    hass.config = types.SimpleNamespace(config_dir="/tmp")
+    hass.services = types.SimpleNamespace(
+        has_service=lambda domain, name: True  # skip service registration
+    )
+    hub = _make_crud_hub(hass)
+    hub.store.load_result = {"controllers": {"ctrl_bbbbbbbb": {"name": "peer"}}}
+    entry = types.SimpleNamespace(
+        entry_id="entry1",
+        async_on_unload=lambda fn: None,
+        add_update_listener=lambda fn: None,
+    )
+    assert asyncio.run(_setup_entry(hass, entry)) is True
+    assert "ctrl_bbbbbbbb" in hub.controllers, (
+        "the reload must re-read the store into the surviving hub (R6-2)"
+    )
+
+
+def test_setup_entry_reload_keeps_memory_when_reread_fails():
+    """重读失败（存储坏）不炸条目 setup：warning + 保留 last-known-good。"""
+    from custom_components.sensor_switch_controller import (
+        async_setup_entry as _setup_entry,
+    )
+
+    hass = make_hass()
+    hass.config_entries = types.SimpleNamespace(
+        async_get_entry=lambda eid: object(),
+        async_schedule_reload=lambda eid: None,
+        async_forward_entry_setups=_async_noop,
+    )
+    hass.async_create_background_task = _noop_task
+    hass.config = types.SimpleNamespace(config_dir="/tmp")
+    hass.services = types.SimpleNamespace(has_service=lambda domain, name: True)
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "keep-me"}
+
+    async def _load_broken():
+        raise OSError("still broken")
+
+    hub.store.async_load = _load_broken
+    entry = types.SimpleNamespace(
+        entry_id="entry1",
+        async_on_unload=lambda fn: None,
+        add_update_listener=lambda fn: None,
+    )
+    assert asyncio.run(_setup_entry(hass, entry)) is True
+    assert hub.controllers.get("ctrl_aaaaaaaa") == {"name": "keep-me"}, (
+        "a failed re-read must keep the last-known-good memory"
+    )

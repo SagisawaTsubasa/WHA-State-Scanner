@@ -1288,6 +1288,81 @@ async def main():
     except _CVE:
         pass
 
+    # review R6-3: the closure narrows — a cooldown MIXED with usable
+    # members keeps the group usable (a dead branch inside a live group is
+    # not a dead controller), a disabled intermediate node is never
+    # evaluated (engine returns satisfied without reaching members), and an
+    # empty group wired into a flag input stays a legal anchor
+    # (member_referenced now collects flag set/reset edges).
+    mix_grp = "cond_" + "7" * 32
+    mix_cfg = json.loads(json.dumps(flag_cfg))
+    mix_cfg["conditions"].append(
+        {"id": "cond_" + "f" * 32, "type": "cooldown", "seconds": 60}
+    )
+    mix_cfg["conditions"].append(
+        {
+            "id": mix_grp,
+            "type": "or",
+            "conditions": [set_leaf["id"], "cond_" + "f" * 32],
+        }
+    )
+    mix_cfg["conditions"][3]["set_conditions"] = [mix_grp]
+    _vc(mix_cfg)  # usable via the state member — must NOT be rejected
+
+    dis_grp = "cond_" + "9" * 32
+    dis_cfg = json.loads(json.dumps(flag_cfg))
+    dis_cfg["conditions"].append(
+        {"id": "cond_" + "f" * 32, "type": "cooldown", "seconds": 60}
+    )
+    dis_cfg["conditions"].append(
+        {
+            "id": dis_grp,
+            "type": "or",
+            "conditions": ["cond_" + "f" * 32],
+            "enabled": False,
+        }
+    )
+    dis_cfg["conditions"][3]["set_conditions"] = [dis_grp]
+    _vc(dis_cfg)  # disabled group never evaluates its members
+
+    anchor_grp = "cond_" + "8" * 32
+    anchor_cfg = json.loads(json.dumps(flag_cfg))
+    anchor_cfg["conditions"].append(
+        {"id": anchor_grp, "type": "or", "conditions": []}
+    )
+    anchor_cfg["conditions"][3]["set_conditions"] = [anchor_grp]
+    _vc(anchor_cfg)  # empty group referenced by a flag stays alive (R6-3)
+
+    # review R6-1: a SELF-resetting latch (flag A → duration D → A's reset)
+    # is legal — the flag step only READS the latched value (no cascade,
+    # R5-4's blanket flag rejection was wrong here) and the flag edge is
+    # not an evaluation edge (no cycle). Before the fix this config saved
+    # fine on 0.8.x but the R5-4 closure and the cycle DFS rejected it,
+    # landing upgraded stores in `invalid`. Also asserted end-to-end
+    # through hub.async_load further below.
+    latch_set = "cond_" + "4" * 32
+    latch_flag = "cond_" + "5" * 32
+    latch_dur = "cond_" + "6" * 32
+    latch_cfg = {
+        "name": "self-latch", "enabled": True, "logging_enabled": False,
+        "triggers": [],
+        "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": latch_set, "type": "state",
+             "entity_id": "switch.c", "state": "on"},
+            {"id": latch_flag, "type": "flag",
+             "set_conditions": [latch_set], "reset_conditions": [latch_dur]},
+            {"id": latch_dur, "type": "duration",
+             "seconds": 5, "start": latch_flag, "abort": None},
+        ],
+        "outputs": [
+            {"name": "out-l", "type": "binary_sensor",
+             "entity_id": "ssc_" + "3" * 32,
+             "on_conditions": [latch_flag], "off_conditions": []},
+        ],
+    }
+    _vc(json.loads(json.dumps(latch_cfg)))  # R6-1: must be saveable
+
     mgr_f = ControllerManager(_Hass(), "ctrl_smoke05", _vc(json.loads(json.dumps(flag_cfg))))
     await mgr_f.async_setup()
     ent_fa = _Entity("binary_sensor.fa")
@@ -1355,6 +1430,32 @@ async def main():
     )
     mgr_d.async_unload()
     print("[PASS] flag flip widens directed targets (review R1-2)")
+
+    # ------------------------------------------------------------------
+    # review R6-1 runtime: the self-resetting latch (flag → duration →
+    # own reset) must actually cycle at runtime — set fires, the duration
+    # gate completes after its seconds, and the next step auto-clears.
+    # ------------------------------------------------------------------
+    mgr_s = ControllerManager(
+        _Hass(), "ctrl_smoke11", _vc(json.loads(json.dumps(latch_cfg)))
+    )
+    await mgr_s.async_setup()
+    ent_sl = _Entity("binary_sensor.sl")
+    mgr_s.register_entity("ssc_" + "3" * 32, ent_sl)
+    eng_s = mgr_s.engine
+    # stub default: switch.c is "on" → the first step latches on
+    assert await eng_s.step_flags() == [latch_flag], "set fires → latch on"
+    assert await eng_s.evaluate_any([latch_flag]) is True
+    assert await eng_s.step_flags() == [], (
+        "duration not yet elapsed → reset unmet, latch holds"
+    )
+    _advance_utc(6)
+    assert await eng_s.step_flags() == [latch_flag], (
+        "reset via own duration must auto-clear the latch"
+    )
+    assert await eng_s.evaluate_any([latch_flag]) is False
+    mgr_s.async_unload()
+    print("[PASS] self-resetting latch saves and cycles (review R6-1)")
 
     # ------------------------------------------------------------------
     # review R5-3: a reset window must not preserve the set member's FOR
@@ -1651,6 +1752,64 @@ async def main():
     await hub_t.async_drop_flag_states(rid)
     assert rid not in hub_t.flag_states
     print("[PASS] remove_controller two-phase sweep incl. devices (R1-7/R5-7/R5-8)")
+
+    # ------------------------------------------------------------------
+    # review R6-5/R6-6: the store/flag load guards need regression pins —
+    # a non-object payload (top level or the controllers value) degrades
+    # loudly to empty instead of killing setup (F-280), and a non-object
+    # per-controller flag value is dropped with a warning (R6-5). Also
+    # proves a VALID store — including the R6-1 self-resetting latch —
+    # loads back into controllers, not invalid.
+    # ------------------------------------------------------------------
+    hub_p = ScannerHub(_Hass())
+
+    async def _load_not_object():
+        return ["x"]
+
+    hub_p.store.async_load = _load_not_object
+    await hub_p.async_load()
+    assert hub_p.controllers == {} and hub_p.invalid == {}, (
+        "non-object store payload must degrade to empty (F-280)"
+    )
+
+    async def _load_controllers_list():
+        return {"controllers": ["x"]}
+
+    hub_p.store.async_load = _load_controllers_list
+    await hub_p.async_load()
+    assert hub_p.controllers == {} and hub_p.invalid == {}, (
+        "non-object controllers payload must degrade to empty (F-280)"
+    )
+
+    async def _load_valid():
+        return {
+            "controllers": {
+                "ctrl_ab12cd34": json.loads(json.dumps(latch_cfg)),
+            }
+        }
+
+    hub_p.store.async_load = _load_valid
+    await hub_p.async_load()
+    assert set(hub_p.controllers) == {"ctrl_ab12cd34"} and hub_p.invalid == {}, (
+        "a valid store (incl. the R6-1 self latch) must load, not land invalid"
+    )
+
+    async def _load_flags():
+        return {
+            "flags": {
+                "ctrl_good": {"cond_" + "1" * 32: True},
+                "ctrl_bad_str": "oops",
+                "ctrl_bad_num": 5,
+                42: {"cond_" + "1" * 32: True},
+            }
+        }
+
+    hub_p._flag_store.async_load = _load_flags
+    await hub_p.async_load_flag_states()
+    assert hub_p.flag_states == {"ctrl_good": {"cond_" + "1" * 32: True}}, (
+        "non-object per-controller flag values must be dropped loudly (R6-5)"
+    )
+    print("[PASS] store/flag load guards hold on corrupt payloads (F-280/R6-5)")
 
 asyncio.run(main())
 print("SMOKE OK")
