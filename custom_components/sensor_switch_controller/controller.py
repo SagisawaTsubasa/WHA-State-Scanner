@@ -144,6 +144,14 @@ class ControllerManager:
         # runs, force_evaluate) so engine state is never mutated concurrently.
         self._eval_lock = asyncio.Lock()
 
+        # Unload guard (set by async_unload, never reset): an evaluation
+        # already in flight must not re-arm wakeups, evaluate a backlog or
+        # persist flags after teardown — time/sun edges would otherwise
+        # re-arm forever on the dead manager (time/sun next_wakeup always
+        # offers a future edge), and a deleted controller could write its
+        # flag states back into the hub store (审查 R5-5).
+        self._stopped = False
+
         # Precise FOR-expiry wakeup (cancelled/re-armed after every cycle).
         self._for_wakeup_unsub = None
         # One-shot fallback for the init gate (see async_setup).
@@ -196,6 +204,10 @@ class ControllerManager:
 
     def async_unload(self) -> None:
         """Stop all triggers, timers and entity references."""
+        # Set BEFORE cancelling anything: an evaluation already in flight
+        # must see the guard and give up instead of re-arming or persisting
+        # after teardown (审查 R5-5).
+        self._stopped = True
         self.trigger_manager.async_unload()
         if self._debounce_unsub:
             self._debounce_unsub()
@@ -372,6 +384,10 @@ class ControllerManager:
         """Wake up at the earliest instant some gate may flip on its own
         (FOR/duration expiry, debounce quiet point, cooldown end, time/sun
         range edge) — and re-evaluate only the outputs it can reach."""
+        if self._stopped:
+            # Unload won: re-arming here would let the dead manager live on
+            # forever (time/sun edges always offer a future wakeup) (R5-5).
+            return
         self._cancel_for_wakeup()
         pending = self.engine.next_wakeup(self._cond_to_outs)
         if pending is None:
@@ -381,6 +397,8 @@ class ControllerManager:
         @callback
         def _woken(_now) -> None:
             self._for_wakeup_unsub = None
+            if self._stopped:
+                return
             self.hass.async_create_task(
                 self._async_evaluate(None, ["wakeup"], set(out_ids))
             )
@@ -443,6 +461,8 @@ class ControllerManager:
         the scope of the runs that were swallowed (a directed swallow never
         widens into a full sweep — WHA-F-012).
         """
+        if self._stopped:
+            return
         if sources:
             self._rerun_sources.update(sources)
         self._stack_targets(targets)
@@ -454,6 +474,10 @@ class ControllerManager:
     async def _async_drain(self) -> None:
         """Run stacked evaluations until no backlog is left."""
         while True:
+            if self._stopped:
+                # Unload won the race mid-drain: the backlog dies with the
+                # manager. _evaluating is already False here (finally ran).
+                return
             self._evaluating = True
             try:
                 async with self._eval_lock:
@@ -471,7 +495,14 @@ class ControllerManager:
         sources: list[str] | None = None,
         targets: set[str] | None = None,
     ) -> None:
-        self._first_eval_pending = False
+        # Only a FULL evaluation with every expected output registered
+        # retires the first-eval gate: directed or empty-coverage ticks
+        # during platform load must not steal it, or late-registering
+        # outputs would never receive their guaranteed first sweep — the
+        # 30s fallback would pass them by too, since the gate already
+        # looked retired (审查 R5-2).
+        if targets is None and self._expected_out_ids <= self._added_out_ids:
+            self._first_eval_pending = False
         readings = self._async_read_sensors()
         flipped = await self.engine.step_flags()
         if flipped:
@@ -510,6 +541,12 @@ class ControllerManager:
 
     async def _persist_flag_states(self) -> None:
         """Persist flag verdicts via the hub (survives reloads/restarts)."""
+        if self._stopped:
+            # Unload/delete won the race: the verdict is torn down with the
+            # manager, and writing it back would resurrect a deleted
+            # controller's flags in the hub store (审查 R5-5, R1-11). A
+            # reload re-steps the gates on its first evaluation anyway.
+            return
         hub = self.hass.data.get(DOMAIN)
         if hub is None:
             return

@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import types
 
+import pytest
+
 from custom_components.sensor_switch_controller import web as web_mod
 from custom_components.sensor_switch_controller.const import (
     API_BASE,
@@ -232,3 +234,61 @@ def test_started_recheck_rejudges_mode():
     recheck(None)
     assert HUB_PAGE_ID in hass.data[HUB_REGISTRY_KEY]
     assert PANEL_URL_PATH not in hass.data.get("frontend_panels", {})
+
+
+# ----------------------------------------------------------------------
+# _save_or_rollback (体检 P2-3 / 审查 R5-10): rollback + reload + re-raise
+# ----------------------------------------------------------------------
+
+
+def _make_hub(hass):
+    from custom_components.sensor_switch_controller.hub import ScannerHub
+
+    hub = ScannerHub(hass)
+    hub.set_entry("entry1")
+    return hub
+
+
+def _hass_with_config_entries():
+    hass = make_hass()
+    hass.config_entries = types.SimpleNamespace(
+        async_get_entry=lambda eid: object(),
+        async_schedule_reload=lambda eid: None,
+    )
+    return hass
+
+
+def test_save_rollback_restores_and_schedules_reload():
+    """Store.async_save 抛 OSError：内存回滚到快照、排 reload、异常上抛
+    （HTTP 层据此答 500）。"""
+    hass = _hass_with_config_entries()
+    hub = _make_hub(hass)
+    hub.controllers["ctrl_a"] = {"name": "a"}
+    hub.invalid["ctrl_b"] = {"config": {"name": "b"}, "error": "x"}
+    before = (dict(hub.controllers), dict(hub.invalid))
+    # the mutation under test — a failed save must undo exactly this
+    hub.controllers["ctrl_a"] = {"name": "a2"}
+    hub.controllers["ctrl_c"] = {"name": "c"}
+    hub.invalid.pop("ctrl_b")
+
+    async def _boom(data):
+        raise OSError("disk full")
+
+    hub.store.async_save = _boom
+    with pytest.raises(OSError):
+        asyncio.run(web_mod._save_or_rollback(hass, hub, before))
+    assert hub.controllers == {"ctrl_a": {"name": "a"}}
+    assert hub.invalid == {"ctrl_b": {"config": {"name": "b"}, "error": "x"}}
+    # a reload is queued so runtime matches the rolled-back store
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
+
+
+def test_save_success_persists_without_rollback():
+    """保存成功：store 落盘、内存原样、无回滚、不排 reload。"""
+    hass = _hass_with_config_entries()
+    hub = _make_hub(hass)
+    hub.controllers["ctrl_a"] = {"name": "a"}
+    asyncio.run(web_mod._save_or_rollback(hass, hub, (dict(hub.controllers), {})))
+    assert hub.controllers == {"ctrl_a": {"name": "a"}}
+    assert hub.store.saved[-1] == {"controllers": {"ctrl_a": {"name": "a"}}}
+    assert not hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")

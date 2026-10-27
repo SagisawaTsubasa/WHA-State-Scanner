@@ -11,7 +11,7 @@ import logging
 import uuid
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.storage import Store
 
 from .const import (
@@ -22,6 +22,8 @@ from .const import (
     CONF_ROUTES,
     CONF_TRIGGERS,
     CTRL_ID_PREFIX,
+    DOMAIN,
+    DURATION_MAX,
     STORE_KEY,
     STORE_VERSION,
 )
@@ -246,6 +248,22 @@ def _migrate_controller_v2(cfg: dict) -> dict:
         if seconds <= 0 or not isinstance(cid, str):
             cond.pop("for", None)
             continue
+        if seconds > DURATION_MAX:
+            # 0.5.x `for` accepted up to 24:59:59 (and bare seconds without
+            # a cap — premise verified against the V0.5.0 schema), but the
+            # v6 duration gate tops out at 86400s. Migrating such a value
+            # verbatim fails validate_controller and lands the whole
+            # controller in `invalid` with no in-place fix on the panel
+            # (审查 R5-6) — clamp it and say so.
+            _LOGGER.warning(
+                "Controller %s: condition %s for %ss exceeds the duration "
+                "cap (%ss); clamped to the cap by migration",
+                cfg.get("name", "?"),
+                cid,
+                seconds,
+                DURATION_MAX,
+            )
+            seconds = DURATION_MAX
         dur_id = f"cond_{uuid.uuid4().hex}"
         label = cond.get("label")
         new_nodes.append(
@@ -381,6 +399,17 @@ class ScannerHub:
     async def async_load(self) -> None:
         """Load controllers from storage, dropping malformed entries."""
         data = await self.store.async_load()
+        if data is not None and not isinstance(data, dict):
+            # Hand-edited / corrupt store: must not AttributeError through
+            # setup — degrade with a warning to the empty state, the same
+            # treatment the non-object controllers payload gets below
+            # (审查 R5-1).
+            _LOGGER.warning(
+                "Stored %s payload is not an object (%r); ignored",
+                STORE_KEY,
+                type(data).__name__,
+            )
+            data = None
         raw = (data or {}).get(CONF_CONTROLLERS) or {}
         if not isinstance(raw, dict):
             # Hand-edited / corrupt store: same guard as the migration path —
@@ -421,6 +450,15 @@ class ScannerHub:
     async def async_load_flag_states(self) -> None:
         """Load flag runtime states (latches survive HA restarts)."""
         data = await self._flag_store.async_load()
+        if data is not None and not isinstance(data, dict):
+            # Same hand-edit guard as async_load: flag latches are runtime
+            # cache, degrading loudly to empty beats bricking the setup.
+            _LOGGER.warning(
+                "Stored %s_flags payload is not an object (%r); ignored",
+                STORE_KEY,
+                type(data).__name__,
+            )
+            data = None
         raw = (data or {}).get("flags")
         self.flag_states = raw if isinstance(raw, dict) else {}
 
@@ -455,25 +493,52 @@ class ScannerHub:
         self.invalid.pop(cid, None)
         self.controllers[cid] = config
 
-    def remove_controller(self, cid: str) -> None:
-        """Delete a controller and ALL of its entity-registry entries."""
+    def remove_controller(self, cid: str) -> list[str]:
+        """Detach one controller: unload its manager and drop it from the
+        in-memory dicts. Returns the entity_ids of its live entities.
+
+        Registry/device cleanup is a separate follow-up (``sweep_registry``)
+        that the web delete path runs only AFTER the main store save
+        succeeded — the irreversible deletion must never precede the
+        durable write, or a failed save rolls back to a controller whose
+        registry entries are already gone (审查 R5-8). Flag states are not
+        touched here either: ``async_drop_flag_states`` erases them in the
+        same post-save phase, keeping the rollback fully intact (R1-11 +
+        R5-8).
+        """
         manager = self.managers.pop(cid, None)
+        entity_ids: list[str] = []
+        if manager:
+            # snapshot first: registry removals (and the unload) pop from
+            # manager.entities while we iterate it
+            entity_ids = [
+                entity_id
+                for entity in list(manager.entities.values())
+                if (entity_id := getattr(entity, "entity_id", None))
+            ]
+            manager.async_unload()
+        self.controllers.pop(cid, None)
+        self.invalid.pop(cid, None)
+        return entity_ids
+
+    def sweep_registry(self, cid: str, entity_ids: list[str]) -> None:
+        """Remove a detached controller's entity-registry entries and its
+        device entry. Call only after the main store save succeeded.
+
+        Beyond the live-entity pass, a unique_id-prefix sweep catches
+        entries the snapshot cannot see: a disable-before-delete controller
+        has no manager at all, and entities that never finished adding to
+        hass carry entity_id None. Registry entries outlive their entities,
+        so without this sweep they linger forever as ghost "no longer
+        provided" entries (体检 P2-2). The per-controller device created via
+        ``device_info`` owns no entities of its own and would linger as an
+        empty device without the device-registry cleanup (审查 R5-7).
+        """
         registry = er.async_get(self.hass)
         removed: set[str] = set()
-        if manager:
-            # registry.async_remove() runs the entity removal chain inline
-            # (eager task), which pops from manager.entities — snapshot first.
-            for entity in list(manager.entities.values()):
-                entity_id = getattr(entity, "entity_id", None)
-                if entity_id:
-                    registry.async_remove(entity_id)
-                    removed.add(entity_id)
-            manager.async_unload()
-        # Sweep registry entries the live-entity pass above cannot see:
-        # a disable-before-delete controller has no manager at all, and
-        # entities that never finished adding to hass carry entity_id None.
-        # Registry entries outlive their entities, so without this sweep
-        # they linger forever as ghost "no longer provided" entries (体检 P2-2).
+        for entity_id in entity_ids:
+            registry.async_remove(entity_id)
+            removed.add(entity_id)
         if self.entry_id:
             prefix = f"{cid}_"
             for entry in er.async_entries_for_config_entry(registry, self.entry_id):
@@ -481,11 +546,10 @@ class ScannerHub:
                     continue
                 if entry.unique_id.startswith(prefix):
                     registry.async_remove(entry.entity_id)
-        self.flag_states.pop(cid, None)
-        self.controllers.pop(cid, None)
-        self.invalid.pop(cid, None)
-        # The caller persists the flag store afterwards (web delete path) so
-        # the erased states do not resurrect on the next load (审查 R1-11).
+        device_registry = dr.async_get(self.hass)
+        device = device_registry.async_get_device(identifiers={(DOMAIN, cid)})
+        if device is not None:
+            device_registry.async_remove_device(device.id)
 
     def _fresh_id(self) -> str:
         while True:

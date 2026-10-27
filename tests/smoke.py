@@ -49,6 +49,8 @@ for k, v in {
     "CONF_VALUE_TEMPLATE": "value_template",
     "STATE_UNAVAILABLE": "unavailable",
     "STATE_UNKNOWN": "unknown",
+    "STATE_ON": "on",
+    "STATE_OFF": "off",
 }.items():
     setattr(ha_const, k, v)
 # any missing CONF_* resolves to its own key (same as real HA constants)
@@ -164,10 +166,19 @@ ha.helpers.entity.DeviceInfo = MagicMock
 
 
 class _RestoreEntity:
-    """Stub mixin: async_get_last_state yields no previous state."""
+    """Stub mixin: async_get_last_state yields the instance-configured
+    previous state (or None) so the RestoreEntity restore path is testable
+    (审查 R5-10)."""
+
+    _restored_state: str | None = None
+
+    async def async_added_to_hass(self):
+        return None
 
     async def async_get_last_state(self):
-        return None
+        if self._restored_state is None:
+            return None
+        return types.SimpleNamespace(state=self._restored_state)
 
 
 ha.helpers.restore_state = _mod("homeassistant.helpers.restore_state")
@@ -209,6 +220,36 @@ def _entries_for_config_entry(registry, config_entry_id):
 ha.helpers.entity_registry.async_entries_for_config_entry = (
     _entries_for_config_entry
 )
+
+
+class _FakeDeviceRegistry:
+    """Injectable device-registry stub: records removals, holds devices
+    (审查 R5-7)."""
+
+    def __init__(self):
+        self.removed: list[str] = []
+        self.devices: dict[str, types.SimpleNamespace] = {}
+
+    def add(self, device_id, identifiers):
+        self.devices[device_id] = types.SimpleNamespace(
+            id=device_id, identifiers=identifiers
+        )
+
+    def async_get_device(self, identifiers=None, connections=None):
+        for device in self.devices.values():
+            if device.identifiers == identifiers:
+                return device
+        return None
+
+    def async_remove_device(self, device_id):
+        self.removed.append(device_id)
+        self.devices.pop(device_id, None)
+
+
+_FAKE_DEVICE_REGISTRY = _FakeDeviceRegistry()
+ha.helpers.device_registry = _mod("homeassistant.helpers.device_registry")
+ha.helpers.device_registry.async_get = lambda hass: _FAKE_DEVICE_REGISTRY
+
 ha.loader = _mod("homeassistant.loader")
 ha.loader.async_get_loaded_integration = lambda hass, domain: types.SimpleNamespace(
     version="test"
@@ -479,6 +520,37 @@ assert cfg_durg["triggers"][0]["routes"]["conditions"] == [], (
     cfg_durg["triggers"][0]["routes"]
 )
 validate_controller(cfg_durg)  # must pass, not invalid
+
+# review R5-6: a 0.5.x `for` beyond the v6 duration cap (24:00:01+, legal
+# back then — premise verified against the V0.5.0 schema) must be clamped
+# by the v2 migration, not migrated into an invalid controller.
+long_cfg = {
+    "name": "long-for",
+    "conditions": [
+        {"id": "cond_" + "c" * 32, "type": "state", "entity_id": "sensor.a",
+         "state": "on", "for": {"hours": 24, "minutes": 30, "seconds": 0}},
+    ],
+    "outputs": [],
+    "triggers": [],
+}
+_migrate_controller_v2(long_cfg)
+dur_long = next(c for c in long_cfg["conditions"] if c.get("type") == COND_DURATION)
+assert dur_long["seconds"] == 86400, dur_long  # clamped to DURATION_MAX
+validate_controller(long_cfg)  # must pass, not land invalid
+cap_cfg = {
+    "name": "cap-for",
+    "conditions": [
+        {"id": "cond_" + "d" * 32, "type": "state", "entity_id": "sensor.a",
+         "state": "on", "for": {"hours": 24}},
+    ],
+    "outputs": [],
+    "triggers": [],
+}
+_migrate_controller_v2(cap_cfg)
+dur_cap = next(c for c in cap_cfg["conditions"] if c.get("type") == COND_DURATION)
+assert dur_cap["seconds"] == 86400, dur_cap  # exactly at the cap stays
+validate_controller(cap_cfg)
+print("[PASS] migration clamps over-cap v2 for (review R5-6)")
 
 kept = validate_trigger(trg)
 assert kept["id"] == TID1, f"trigger id must be preserved: {kept['id']}"
@@ -1188,6 +1260,34 @@ async def main():
     except _CVE:
         pass
 
+    # review R5-4: cooldown / flag hidden behind a GROUP is the same dead
+    # branch as a direct one — the graph check must walk the closure.
+    grp_cd = "cond_" + "e" * 32
+    bad_cd = json.loads(json.dumps(flag_cfg))
+    bad_cd["conditions"].append(
+        {"id": "cond_" + "f" * 32, "type": "cooldown", "seconds": 60}
+    )
+    bad_cd["conditions"].append(
+        {"id": grp_cd, "type": "or", "conditions": ["cond_" + "f" * 32]}
+    )
+    bad_cd["conditions"][3]["set_conditions"] = [grp_cd]
+    try:
+        _vc(bad_cd)
+        raise AssertionError("indirect cooldown via group must be rejected")
+    except _CVE:
+        pass
+    grp_fl = "cond_" + "0" * 32
+    bad_fl = json.loads(json.dumps(flag_cfg))
+    bad_fl["conditions"].append(
+        {"id": grp_fl, "type": "or", "conditions": [flag_b]}
+    )
+    bad_fl["conditions"][3]["set_conditions"] = [grp_fl]
+    try:
+        _vc(bad_fl)
+        raise AssertionError("flag cascade via group must be rejected")
+    except _CVE:
+        pass
+
     mgr_f = ControllerManager(_Hass(), "ctrl_smoke05", _vc(json.loads(json.dumps(flag_cfg))))
     await mgr_f.async_setup()
     ent_fa = _Entity("binary_sensor.fa")
@@ -1257,11 +1357,263 @@ async def main():
     print("[PASS] flag flip widens directed targets (review R1-2)")
 
     # ------------------------------------------------------------------
-    # 0.9.0 review R1-7: remove_controller sweeps the registry by unique_id
-    # prefix even when no manager exists (disable-before-delete).
+    # review R5-3: a reset window must not preserve the set member's FOR
+    # ledger — set members are evaluated unconditionally (no short-circuit
+    # on reset), so a stale ledger start cannot latch the flag early.
     # ------------------------------------------------------------------
+    s_leaf_id = "cond_" + "1" * 32   # set member: switch.c on, for 60s
+    r_leaf_id = "cond_" + "2" * 32   # reset member: switch.d on
+    w_flag = "cond_" + "3" * 32
+    for_flag_cfg = {
+        "name": "flag-for-reset", "enabled": True, "logging_enabled": False,
+        "triggers": [],
+        "sensors": [{"entity_id": "switch.c"}, {"entity_id": "switch.d"}],
+        "conditions": [
+            {"id": s_leaf_id, "type": "state", "entity_id": "switch.c",
+             "state": "on", "for": {"hours": 0, "minutes": 1, "seconds": 0}},
+            {"id": r_leaf_id, "type": "state", "entity_id": "switch.d", "state": "on"},
+            {"id": w_flag, "type": "flag",
+             "set_conditions": [s_leaf_id], "reset_conditions": [r_leaf_id]},
+        ],
+        "outputs": [],
+    }
+    mgr_w = ControllerManager(
+        _Hass(), "ctrl_smoke07", _vc(json.loads(json.dumps(for_flag_cfg)))
+    )
+    await mgr_w.async_setup()
+    eng_w = mgr_w.engine
+    # t0: set member holds → ledger opens, gate still False
+    assert await eng_w.step_flags() == []
+    _advance_utc(60)
+    # 60s elapsed → set satisfied → flag latches on
+    assert await eng_w.step_flags() == [w_flag]
+    # reset window: reset member on AND set member drops off — the set
+    # ledger must be popped (it is evaluated even though reset wins)
+    mgr_w.hass.states._d["switch.d"] = "on"
+    mgr_w.hass.states._d["switch.c"] = "off"
+    assert await eng_w.step_flags() == [w_flag]  # reset wins → off
+    # set member returns, then the reset releases 5s later: the FOR ledger
+    # restarted inside the window, so 5s < 60s must NOT latch the flag (the
+    # old short-circuit kept the stale pre-window ledger and latched at once)
+    mgr_w.hass.states._d["switch.c"] = "on"
+    _advance_utc(5)
+    mgr_w.hass.states._d["switch.d"] = "off"
+    assert await eng_w.step_flags() == [], (
+        "reset window must have cleared the set member's FOR ledger"
+    )
+    # 60 more seconds of continuous set → now it latches
+    _advance_utc(60)
+    assert await eng_w.step_flags() == [w_flag]
+    mgr_w.async_unload()
+    print("[PASS] flag reset window clears FOR ledgers (review R5-3)")
+
+    # ------------------------------------------------------------------
+    # review R5-2: a directed tick during platform load must not retire the
+    # first-eval gate — late-registering outputs still get their sweep.
+    # ------------------------------------------------------------------
+    x2_id = "cond_" + "5" * 32
+    y2_id = "cond_" + "6" * 32
+    late_cfg = {
+        "name": "late-batch", "enabled": True, "logging_enabled": True,
+        "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                      "routes": {"conditions": [x2_id]}}],
+        "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": x2_id, "type": "state", "entity_id": "switch.c", "state": "on"},
+            {"id": y2_id, "type": "state", "entity_id": "switch.d", "state": "on"},
+        ],
+        "outputs": [
+            {"name": "out-x", "type": "switch", "entity_id": "ssc_" + "c" * 32,
+             "on_conditions": [x2_id], "off_conditions": []},
+            {"name": "out-y", "type": "switch", "entity_id": "ssc_" + "d" * 32,
+             "on_conditions": [y2_id], "off_conditions": []},
+        ],
+    }
+    mgr_l = ControllerManager(
+        _Hass(), "ctrl_smoke08", _vc(json.loads(json.dumps(late_cfg)))
+    )
+    await mgr_l.async_setup()
+    # batch 1: only out-x registers
+    ent_lx = _Entity("switch.lx")
+    mgr_l.register_entity("ssc_" + "c" * 32, ent_lx)
+    mgr_l.async_entity_added("ssc_" + "c" * 32)
+    # directed tick between batches (covers out-x's chain only)
+    mgr_l._on_trigger_fire("trg_" + "1" * 32, "early")
+    mgr_l._async_debounced_evaluate(None)
+    await asyncio.sleep(0.05)
+    recs_before = _log_cycles("ctrl_smoke08")
+    mgr_l._on_trigger_fire("trg_" + "1" * 32, "early")
+    mgr_l._async_debounced_evaluate(None)
+    await asyncio.sleep(0.05)
+    tail_l = _log_tail(recs_before, "ctrl_smoke08")
+    assert [r["output"] for r in tail_l] == ["out-x"], tail_l
+    assert mgr_l._first_eval_pending is True, (
+        "directed tick must not retire the first-eval gate"
+    )
+    # batch 2: out-y registers → the deferred full first sweep must cover it
+    ent_ly = _Entity("switch.ly")
+    mgr_l.register_entity("ssc_" + "d" * 32, ent_ly)
+    mgr_l.async_entity_added("ssc_" + "d" * 32)
+    await asyncio.sleep(0.05)
+    tail_l = _log_tail(recs_before, "ctrl_smoke08")
+    assert [r["output"] for r in tail_l] == ["out-x", "out-x", "out-y"], tail_l
+    mgr_l.async_unload()
+    print("[PASS] first-eval gate survives directed ticks (review R5-2)")
+
+    # ------------------------------------------------------------------
+    # review R5-5: unload must win over an in-flight drain — no re-arm, no
+    # backlog evaluation, no flag write-back from the dead manager.
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.const import DOMAIN as _DOM
     from custom_components.sensor_switch_controller.hub import ScannerHub
 
+    _hass_g = _Hass()
+    hub_g = ScannerHub(_hass_g)
+    _hass_g.data[_DOM] = hub_g
+    u_cond = "cond_" + "d" * 32   # set member: switch.c on, for 60s
+    u_flag = "cond_" + "e" * 32
+    u_cfg = {
+        "name": "unload-guard", "enabled": True, "logging_enabled": True,
+        "triggers": [{"id": "trg_" + "7" * 32, "type": "state",
+                      "routes": {"conditions": [u_cond]}}],
+        "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": u_cond, "type": "state", "entity_id": "switch.c",
+             "state": "on", "for": {"hours": 0, "minutes": 1, "seconds": 0}},
+            {"id": u_flag, "type": "flag",
+             "set_conditions": [u_cond], "reset_conditions": []},
+        ],
+        "outputs": [
+            {"name": "out-u", "type": "switch", "entity_id": "ssc_" + "e" * 32,
+             "on_conditions": [u_flag], "off_conditions": []},
+        ],
+    }
+    mgr_g = ControllerManager(
+        _hass_g, "ctrl_smoke09", _vc(json.loads(json.dumps(u_cfg)))
+    )
+    await mgr_g.async_setup()
+    ent_gu = _Entity("switch.gu")
+    mgr_g.register_entity("ssc_" + "e" * 32, ent_gu)
+    mgr_g.async_entity_added("ssc_" + "e" * 32)
+    await asyncio.sleep(0.05)  # init sweep: for-ledger opens, rearm arms
+
+    def _pit_count():
+        return len([e for e in _Evt.LISTENERS if e[0] == "pit"])
+
+    recs_g = _log_cycles("ctrl_smoke09")
+    assert recs_g, "init sweep must have run"
+    pit_before = _pit_count()
+    assert pit_before >= 1, "the FOR ledger must have armed a wakeup"
+    # capture the wakeup callback the rearm registered, then unload: the
+    # captured callback firing afterwards is the R5-5 resurrection scenario
+    woken = [e for e in _Evt.LISTENERS if e[0] == "pit"][-1][1]
+    mgr_g.async_unload()
+    # 1) the captured wakeup fires after unload → no evaluation, no re-arm
+    woken(None)
+    await asyncio.sleep(0.05)
+    assert _log_cycles("ctrl_smoke09") == recs_g, "wakeup after unload must not evaluate"
+    assert _pit_count() == pit_before, "wakeup after unload must not re-arm"
+    # 2) rearm itself is a no-op after unload
+    mgr_g._rearm_for_wakeup()
+    assert _pit_count() == pit_before, "unload must stop wakeup re-arming"
+    # 3) an in-flight drain's backlog dies with the manager; the flag flip
+    #    it would produce is NOT written back into the hub store (the
+    #    deleted-controller resurrection path, R5-5 + R1-11)
+    eng_g = mgr_g.engine
+    eng_g._flag_states[u_flag] = False
+    eng_g._for_timers[u_cond] = _clock["utc"] - timedelta(seconds=120)
+    mgr_g._evaluating = True  # pretend a run owns the drain loop
+    mgr_g._stack_targets(None)
+    mgr_g._rerun_pending = True
+    await mgr_g._async_drain()
+    await asyncio.sleep(0.05)
+    assert _log_cycles("ctrl_smoke09") == recs_g, "backlog must die with the unloaded manager"
+    assert eng_g._flag_states.get(u_flag) is False, (
+        "post-unload drain must not step flags (zombie pass)"
+    )
+    assert "ctrl_smoke09" not in hub_g.flag_states, (
+        "unloaded manager must not write flag states back"
+    )
+    assert _pit_count() == pit_before, "drain must not re-arm after unload"
+    print("[PASS] unload stops rearm/evaluation/flag write-back (review R5-5)")
+
+    # ------------------------------------------------------------------
+    # review R5-10: RestoreEntity path — the output restores its stored
+    # pre-restart state on (re)add; no stored state keeps the default.
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.switch import SensorSwitch
+
+    rst_cfg = {
+        "name": "restore", "enabled": True, "logging_enabled": False,
+        "triggers": [], "sensors": [],
+        "conditions": [
+            {"id": "cond_" + "b" * 32, "type": "state",
+             "entity_id": "switch.c", "state": "on"},
+        ],
+        "outputs": [
+            {"name": "r-on", "type": "switch", "entity_id": "ssc_" + "f" * 32,
+             "on_conditions": ["cond_" + "b" * 32], "off_conditions": []},
+            {"name": "r-none", "type": "switch", "entity_id": "ssc_" + "0" * 32,
+             "on_conditions": [], "off_conditions": []},
+        ],
+    }
+    mgr_r = ControllerManager(
+        _Hass(), "ctrl_smoke10", _vc(json.loads(json.dumps(rst_cfg)))
+    )
+    await mgr_r.async_setup()
+    sw_on = SensorSwitch(_Hass(), mgr_r, "ctrl_smoke10", rst_cfg["outputs"][0])
+    sw_on._restored_state = "on"
+    await sw_on.async_added_to_hass()
+    assert sw_on._attr_is_on is True, "restored state must survive the re-add"
+    sw_none = SensorSwitch(_Hass(), mgr_r, "ctrl_smoke10", rst_cfg["outputs"][1])
+    await sw_none.async_added_to_hass()
+    assert sw_none._attr_is_on is False, "no stored state must leave the default"
+    assert "ssc_" + "f" * 32 in mgr_r._added_out_ids
+    await asyncio.sleep(0.05)  # let the init eval (both now added) settle
+    mgr_r.async_unload()
+    print("[PASS] RestoreEntity: last state restored on re-add (review R5-10)")
+
+    # ------------------------------------------------------------------
+    # review R5-10: R1-12 regression pin — a daily-at callback that raises
+    # must still re-arm (try/finally), or the trigger dies forever.
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.triggers import TriggerManager
+
+    tm = TriggerManager(_Hass(), [], lambda tid, desc: None)
+
+    def _boom(_now):
+        raise RuntimeError("daily-callback-boom")
+
+    cancel = tm._schedule_daily_at("23:59", _boom)
+    armed = _pit_count()
+    assert armed >= 1, "daily-at must arm a point-in-time listener"
+    action = [e for e in _Evt.LISTENERS if e[0] == "pit"][-1][1]
+    try:
+        action(None)  # the fire raises inside the callback…
+    except RuntimeError:
+        pass
+    assert _pit_count() == armed + 1, (
+        "a callback exception must not stop the daily re-arm (R1-12)"
+    )
+    cancel()
+    print("[PASS] daily-at re-arms through callback exceptions (R1-12 pin)")
+
+    # review R5-9: an empty-pool state trigger counts as a registration
+    # failure (panel badge), not a silent skip
+    tm_ep = TriggerManager(
+        _Hass(), [{"id": "trg_" + "8" * 32, "type": "state", "enabled": True}],
+        lambda tid, desc: None,
+    )
+    tm_ep.async_setup([])  # empty sensor pool → no targets
+    assert tm_ep.register_errors == 1, "empty-pool state trigger must be an error"
+    print("[PASS] empty-pool state trigger counts as registration error (R5-9)")
+
+    # ------------------------------------------------------------------
+    # 0.9.0 review R1-7 + R5-7/R5-8: remove_controller detaches memory and
+    # returns its entity ids; sweep_registry (post-save phase) removes the
+    # entity-registry entries by unique_id prefix AND the controller's
+    # device entry; flag states are erased by async_drop_flag_states only.
+    # ------------------------------------------------------------------
     hub_t = ScannerHub(_Hass())
     hub_t.set_entry("test_entry_id")
     rid = "ctrl_ab12cd34"
@@ -1270,17 +1622,35 @@ async def main():
         "triggers": [], "sensors": [], "conditions": [],
         "outputs": [],
     })
+    # the R1-11 pin must be non-vacuous: seed flag states first (R5-10)
+    hub_t.flag_states[rid] = {"cond_" + "a" * 32: True}
     _FAKE_REGISTRY.add("binary_sensor.mine", "ctrl_ab12cd34_ssc_1")
     _FAKE_REGISTRY.add("binary_sensor.mine_no_hass", "ctrl_ab12cd34_ssc_2")
     _FAKE_REGISTRY.add("binary_sensor.other", "ctrl_99999999_ssc_1")
-    hub_t.remove_controller(rid)
+    _FAKE_DEVICE_REGISTRY.add("dev_mine", {("sensor_switch_controller", rid)})
+    _FAKE_DEVICE_REGISTRY.add(
+        "dev_other", {("sensor_switch_controller", "ctrl_99999999")}
+    )
+    entity_ids = hub_t.remove_controller(rid)
+    # phase 1 detaches memory only — nothing irreversible happened yet (R5-8)
+    assert entity_ids == [] and rid not in hub_t.controllers
+    assert hub_t.flag_states[rid] == {"cond_" + "a" * 32: True}, (
+        "phase 1 must not touch flag states"
+    )
+    assert _FAKE_REGISTRY.removed == [] and _FAKE_DEVICE_REGISTRY.removed == []
+    # phase 2 (the web handler runs it only after the store save won)
+    hub_t.sweep_registry(rid, entity_ids)
     assert sorted(_FAKE_REGISTRY.removed) == [
         "binary_sensor.mine",
         "binary_sensor.mine_no_hass",
     ], _FAKE_REGISTRY.removed
     assert "binary_sensor.other" not in _FAKE_REGISTRY.removed
-    assert rid not in hub_t.controllers and rid not in hub_t.flag_states
-    print("[PASS] remove_controller registry sweep (review R1-7)")
+    assert _FAKE_DEVICE_REGISTRY.removed == ["dev_mine"], _FAKE_DEVICE_REGISTRY.removed
+    assert "dev_other" not in _FAKE_DEVICE_REGISTRY.removed
+    # flag drop (phase 2, persisted — R1-11 made observable by R5-10)
+    await hub_t.async_drop_flag_states(rid)
+    assert rid not in hub_t.flag_states
+    print("[PASS] remove_controller two-phase sweep incl. devices (R1-7/R5-7/R5-8)")
 
 asyncio.run(main())
 print("SMOKE OK")

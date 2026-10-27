@@ -650,15 +650,32 @@ def _check_graph(
             continue
         label = cond.get("label") or cond["id"]
         for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
-            for member in cond[key]:
+            # Closure walk over group/duration/flag edges (审查 R5-4): a
+            # cooldown (or another flag) hidden behind a group or behind a
+            # duration's start/abort is the same dead branch as a direct
+            # one — the flag step evaluates without output context, so any
+            # reachable cooldown is permanently False there, and any
+            # reachable flag makes the verdict depend on condition order.
+            stack = list(cond[key])
+            seen: set[str] = set()
+            while stack:
+                member = stack.pop()
+                if member in seen:
+                    continue
+                seen.add(member)
                 mtype = by_id[member]["type"]
                 if mtype == COND_FLAG:
-                    _fail(f"旗标「{label}」的 {key} 引用了另一个旗标：旗标不能级联")
+                    _fail(
+                        f"旗标「{label}」的 {key}（直接或经组/持续门间接）引用了"
+                        "另一个旗标：旗标不能级联"
+                    )
                 if mtype == COND_COOLDOWN:
                     _fail(
-                        f"旗标「{label}」的 {key} 引用了冷却条件：冷却依赖输出上下文"
-                        "（旗标步进时没有），请把冷却放在输出链上"
+                        f"旗标「{label}」的 {key}（直接或经组/持续门间接）引用了"
+                        "冷却条件：冷却依赖输出上下文（旗标步进时没有），"
+                        "请把冷却放在输出链上"
                     )
+                stack.extend(_condition_neighbors(by_id[member]))
 
     # Cycle detection over group references and duration start/abort edges
     # (iterative DFS with colors).

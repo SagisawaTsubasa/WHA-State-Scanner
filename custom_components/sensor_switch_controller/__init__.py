@@ -31,9 +31,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hub = hass.data.get(DOMAIN)
     if hub is None:
         hub = ScannerHub(hass)
+        try:
+            await hub.async_load()
+            await hub.async_load_flag_states()
+        except Exception:
+            # A half-initialized hub must not stay published: on the retry
+            # (reload / re-enable after SETUP_ERROR) the `hub is not None`
+            # branch would skip BOTH loads and run on empty controllers,
+            # where the first save overwrites the store with an empty
+            # payload — a deterministic data-loss path (审查 R5-1).
+            hass.data.pop(DOMAIN, None)
+            raise
         hass.data[DOMAIN] = hub
-        await hub.async_load()
-        await hub.async_load_flag_states()
     hub.set_entry(entry.entry_id)
 
     hub.build_managers()

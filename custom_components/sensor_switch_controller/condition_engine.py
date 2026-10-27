@@ -169,10 +169,9 @@ class ConditionEngine:
                 if await self._evaluate_id(member, set()):
                     reset_met = True
             set_met = False
-            if not reset_met:
-                for member in cond.get(CONF_SET_CONDITIONS) or []:
-                    if await self._evaluate_id(member, set()):
-                        set_met = True
+            for member in cond.get(CONF_SET_CONDITIONS) or []:
+                if await self._evaluate_id(member, set()):
+                    set_met = True
             if reset_met:
                 new = False
             else:

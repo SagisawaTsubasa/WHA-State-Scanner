@@ -95,6 +95,8 @@ if _INSTALL_STUBS:
         CONF_VALUE_TEMPLATE="value_template",
         STATE_UNAVAILABLE="unavailable",
         STATE_UNKNOWN="unknown",
+        STATE_ON="on",
+        STATE_OFF="off",
     )
     # any missing CONF_* resolves to its own key (same as real HA constants)
     ha_const.__getattr__ = lambda name: name
@@ -205,6 +207,34 @@ if _INSTALL_STUBS:
             async_remove=lambda entity_id: None
         ),
         async_entries_for_config_entry=lambda registry, entry_id: [],
+    )
+
+    class _FakeDeviceRegistry:
+        """Injectable device-registry stub: records removals, holds devices."""
+
+        def __init__(self) -> None:
+            self.devices: dict[str, Any] = {}
+            self.removed: list[str] = []
+
+        def add(self, device_id: str, identifiers: set) -> None:
+            self.devices[device_id] = types.SimpleNamespace(
+                id=device_id, identifiers=identifiers
+            )
+
+        def async_get_device(self, identifiers=None, connections=None):
+            for device in self.devices.values():
+                if device.identifiers == identifiers:
+                    return device
+            return None
+
+        def async_remove_device(self, device_id: str) -> None:
+            self.removed.append(device_id)
+            self.devices.pop(device_id, None)
+
+    _FAKE_DEVICE_REGISTRY = _FakeDeviceRegistry()
+    ha.helpers.device_registry = _module(
+        "homeassistant.helpers.device_registry",
+        async_get=lambda hass: _FAKE_DEVICE_REGISTRY,
     )
     ha.loader = _module(
         "homeassistant.loader",

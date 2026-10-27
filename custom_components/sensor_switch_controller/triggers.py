@@ -117,8 +117,13 @@ class TriggerManager:
             else:
                 targets = list(pool_entity_ids)
             if not targets:
-                _LOGGER.debug(
-                    "State trigger %s has no targets (empty pool); skipped",
+                # A never-firing trigger is a registration failure, not a
+                # note in the debug log: count it so the panel shows the
+                # trigger-error badge (审查 R5-9)
+                self._register_errors += 1
+                _LOGGER.warning(
+                    "State trigger %s has no targets (empty sensor pool); "
+                    "it can never fire",
                     trg.get("id"),
                 )
                 return

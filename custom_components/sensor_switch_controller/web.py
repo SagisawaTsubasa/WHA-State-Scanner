@@ -159,7 +159,10 @@ class ControllerDetailView(HomeAssistantView):
 
     @require_admin
     async def delete(self, request: web.Request, controller_id: str) -> web.Response:
-        """Delete one controller."""
+        """Delete one controller — two-phase (审查 R5-8): detach memory and
+        write the main store FIRST; only once the deletion is durable do the
+        irreversible registry/device cleanups and the flag-state drop run.
+        A failed main save rolls back to a fully intact controller."""
         hass = request.app["hass"]
         hub = get_hub(hass)
         if hub is None:
@@ -168,9 +171,19 @@ class ControllerDetailView(HomeAssistantView):
         if cid not in hub.controllers and cid not in hub.invalid:
             return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
         before = (dict(hub.controllers), dict(hub.invalid))
-        hub.remove_controller(cid)
+        entity_ids = hub.remove_controller(cid)
         await _save_or_rollback(hass, hub, before)
-        await hub.async_drop_flag_states(cid)
+        # Save won — the deletion is durable now. A failed flag-store write
+        # must not fake a failed DELETE: the next flag save of any
+        # controller rewrites the whole flag store and clears the orphan.
+        hub.sweep_registry(cid, entity_ids)
+        try:
+            await hub.async_drop_flag_states(cid)
+        except Exception:
+            _LOGGER.exception(
+                "Failed dropping flag states for %s; deletion stays, the "
+                "orphaned entry clears on the next flag save", cid,
+            )
         _schedule_reload(hass, hub)
         _LOGGER.info("Deleted controller %s via web", cid)
         return self.json({"ok": True})
