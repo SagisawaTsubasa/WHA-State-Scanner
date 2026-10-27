@@ -28,3 +28,5 @@ Thumbs.db
 dev/*
 !dev/test_routing.py
 /*.png
+
+.zcode/
