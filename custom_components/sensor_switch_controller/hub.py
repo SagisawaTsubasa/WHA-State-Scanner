@@ -403,7 +403,17 @@ class ScannerHub:
     # ------------------------------------------------------------------
 
     async def async_load(self) -> None:
-        """Load controllers from storage, dropping malformed entries."""
+        """Load controllers from storage, dropping malformed entries.
+
+        A ``None`` payload (missing file, or a corrupt one — helpers/
+        storage.py renames it ``.corrupt.*``, verified against the HA
+        2026.1.3 wheel) keeps the in-memory controllers when they are
+        non-empty (审查 R7-1): both re-read entry points (the rollback
+        re-read and the entry reload) must never let a vanished file
+        wipe a populated table — the next save would persist the wipe,
+        the same hazard F-280 closed on the first entry point. First
+        setup is unaffected: the memory is still empty there.
+        """
         data = await self.store.async_load()
         if data is not None and not isinstance(data, dict):
             # Hand-edited / corrupt store: must not AttributeError through
@@ -416,6 +426,16 @@ class ScannerHub:
                 type(data).__name__,
             )
             data = None
+        if data is None and (self.controllers or self.invalid):
+            _LOGGER.warning(
+                "Stored %s payload is missing (file absent or corrupt); "
+                "keeping the in-memory controllers (%d, %d invalid) — the "
+                "next save re-writes them instead of persisting the wipe",
+                STORE_KEY,
+                len(self.controllers),
+                len(self.invalid),
+            )
+            return
         raw = (data or {}).get(CONF_CONTROLLERS) or {}
         if not isinstance(raw, dict):
             # Hand-edited / corrupt store: same guard as the migration path —
@@ -481,7 +501,22 @@ class ScannerHub:
             # (controller.py → condition_engine.__init__) and take down
             # build_managers → the whole entry setup — drop it loudly.
             if isinstance(cid, str) and isinstance(value, dict):
-                states[cid] = value
+                # inner-value guard (审查 R7-6): a non-boolean latch would
+                # be trusted as truthy/falsy by the engine forever and be
+                # persisted straight back — keep only str→bool entries
+                clean = {
+                    k: v
+                    for k, v in value.items()
+                    if isinstance(k, str) and isinstance(v, bool)
+                }
+                if len(clean) != len(value):
+                    _LOGGER.warning(
+                        "Dropping %d malformed flag state entries for "
+                        "controller %s (values must be booleans)",
+                        len(value) - len(clean),
+                        cid,
+                    )
+                states[cid] = clean
             else:
                 _LOGGER.warning(
                     "Dropping malformed flag state for controller %r (%s)",
@@ -517,7 +552,15 @@ class ScannerHub:
         self.controllers[cid] = config
 
     def repair_controller(self, cid: str, config: dict) -> None:
-        """Replace a previously invalid stored config with a valid one."""
+        """Replace a previously invalid stored config with a valid one.
+
+        Raises KeyError like ``update_controller`` when the key has
+        vanished (审查 R7-4): the PUT's repairing verdict was taken before
+        the lock, so a concurrent DELETE must not be silently resurrected
+        by an in-flight repair — same contract, same 404 for both branches.
+        """
+        if cid not in self.invalid:
+            raise KeyError(cid)
         self.invalid.pop(cid, None)
         self.controllers[cid] = config
 

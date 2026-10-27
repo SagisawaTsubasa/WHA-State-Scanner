@@ -151,6 +151,12 @@ class ControllerDetailView(HomeAssistantView):
         # whole-table store write can never capture another request's
         # half-committed mutation (审查 R6-2).
         async with hub.crud_lock:
+            # Re-derive the repairing verdict under the lock (审查 R7-4):
+            # the pre-lock check raced concurrent DELETEs across the JSON
+            # parse await — repairing a controller that was just deleted
+            # would resurrect it. repair_controller raises KeyError like
+            # update_controller, so both branches answer the same 404.
+            repairing = cid in hub.invalid
             before_key = _key_snapshot(hub, cid)
             try:
                 if repairing:

@@ -501,3 +501,186 @@ def test_setup_entry_reload_keeps_memory_when_reread_fails():
     assert hub.controllers.get("ctrl_aaaaaaaa") == {"name": "keep-me"}, (
         "a failed re-read must keep the last-known-good memory"
     )
+
+
+# ----------------------------------------------------------------------
+# Discriminating pins for the R6 protections themselves (审查 R7-5): the
+# per-phase isolation on DELETE (F-293) and the crud_lock serialization
+# (F-291) must turn red when the guard itself is deleted, not only when
+# the happy path changes shape.
+# ----------------------------------------------------------------------
+
+
+def test_delete_view_sweep_failure_still_drops_flags_and_reloads():
+    """sweep_registry 抛错（审查 R7-5/F-293 判别钉）：不假 500、不跳过
+    flag 丢弃与 reload——DELETE 后段各阶段独立收口，删除任一 try/except
+    本用例即红。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "doomed"}
+
+    def _boom(cid, eids):
+        raise RuntimeError("registry gone")
+
+    hub.sweep_registry = _boom
+    dropped: list[str] = []
+    real_drop = hub.async_drop_flag_states
+
+    async def _drop(cid):
+        dropped.append(cid)
+        await real_drop(cid)
+
+    hub.async_drop_flag_states = _drop
+    resp = asyncio.run(
+        web_mod.ControllerDetailView().delete(
+            _make_request(hass), "ctrl_ab12cd34"
+        )
+    )
+    assert resp.status == 200
+    assert dropped == ["ctrl_ab12cd34"], (
+        "the flag drop must still run after a failed sweep"
+    )
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending"), (
+        "the reload must still be scheduled after a failed sweep"
+    )
+
+
+def test_delete_view_flag_drop_failure_still_reloads():
+    """async_drop_flag_states 抛错（审查 R7-5/F-293 判别钉）：sweep 已
+    完成、reload 仍排队——删掉第二个 try/except 本用例即红。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "doomed"}
+    swept: list[str] = []
+    hub.sweep_registry = lambda cid, eids: swept.append(cid)
+
+    async def _boom(cid):
+        raise RuntimeError("flag store locked")
+
+    hub.async_drop_flag_states = _boom
+    resp = asyncio.run(
+        web_mod.ControllerDetailView().delete(
+            _make_request(hass), "ctrl_ab12cd34"
+        )
+    )
+    assert resp.status == 200
+    assert swept == ["ctrl_ab12cd34"], (
+        "the sweep must still have run before the flag drop failed"
+    )
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending"), (
+        "the reload must still be scheduled after a failed flag drop"
+    )
+
+
+def test_crud_lock_serializes_delete_requests():
+    """crud_lock 判别钉（审查 R7-5/F-291）：第二个请求的键快照必须等第
+    一个请求的 save 释放锁之后发生——把三视图的 ``async with
+    hub.crud_lock`` 删掉本用例即红（快照会在对方 save 挂起时插入）。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_aaaaaaaa"] = {"name": "a"}
+    hub.controllers["ctrl_bbbbbbbb"] = {"name": "b"}
+    events: list[str] = []
+    real_snapshot = web_mod._key_snapshot
+
+    def _snapshot(h, cid):
+        events.append(f"snapshot:{cid}")
+        return real_snapshot(h, cid)
+
+    web_mod._key_snapshot = _snapshot
+
+    async def _driver():
+        release = asyncio.Event()
+        real_save = hub.store.async_save
+        state = {"n": 0}
+
+        async def _gated_save(data):
+            state["n"] += 1
+            if state["n"] == 1:
+                events.append("save:enter:a")
+                await release.wait()
+                events.append("save:exit:a")
+            else:
+                events.append("save:fast")
+                await real_save(data)
+
+        hub.store.async_save = _gated_save
+        view = web_mod.ControllerDetailView()
+        t1 = asyncio.create_task(
+            view.delete(_make_request(hass), "ctrl_aaaaaaaa")
+        )
+        for _ in range(20):  # let task 1 reach its gated save
+            await asyncio.sleep(0)
+        assert "save:enter:a" in events, events
+        t2 = asyncio.create_task(
+            view.delete(_make_request(hass), "ctrl_bbbbbbbb")
+        )
+        for _ in range(20):  # the lock must keep task 2 waiting
+            await asyncio.sleep(0)
+        assert "snapshot:ctrl_bbbbbbbb" not in events, (
+            "the second request must block on crud_lock while the first "
+            f"save is in flight; events={events}"
+        )
+        release.set()
+        await asyncio.gather(t1, t2)
+
+    try:
+        asyncio.run(_driver())
+    finally:
+        web_mod._key_snapshot = real_snapshot
+    assert events.index("save:exit:a") < events.index(
+        "snapshot:ctrl_bbbbbbbb"
+    ), events
+    assert events.count("save:fast") == 1, events
+
+
+# ----------------------------------------------------------------------
+# PUT repair race (审查 R7-4/F-300): the repairing verdict is re-derived
+# under the lock and repair_controller raises KeyError on a vanished key
+# like update_controller — a concurrent DELETE is never resurrected.
+# ----------------------------------------------------------------------
+
+
+def test_repair_controller_raises_on_vanished_key():
+    """repair_controller 对已消失的键抛 KeyError（与 update 同判据）。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    with pytest.raises(KeyError):
+        hub.repair_controller("ctrl_ab12cd34", {"name": "x"})
+
+
+def test_put_repair_racing_delete_answers_404():
+    """repairing 判据在锁内重判：pre-lock 看见 invalid、拿锁时键已被并发
+    DELETE 清掉 → 404，绝不复活已删控制器。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    seen = {"first": True}
+
+    class _FlippyInvalid(dict):
+        """pre-lock 检查答 True，锁内重判答 False（模拟并发 DELETE 清键）。"""
+
+        def __contains__(self, key):
+            if key == "ctrl_ab12cd34" and seen["first"]:
+                seen["first"] = False
+                return True
+            return super().__contains__(key)
+
+    hub.invalid = _FlippyInvalid()
+    real_validate = web_mod.validate_controller
+    web_mod.validate_controller = lambda body: dict(body)
+    req = _make_request(hass)
+
+    async def _json():
+        return {"name": "raced"}
+
+    req.json = _json
+    try:
+        resp = asyncio.run(
+            web_mod.ControllerDetailView().put(req, "ctrl_ab12cd34")
+        )
+    finally:
+        web_mod.validate_controller = real_validate
+    assert resp.status == 404, resp
+    assert "ctrl_ab12cd34" not in hub.controllers, (
+        "a controller deleted concurrently must not be resurrected"
+    )

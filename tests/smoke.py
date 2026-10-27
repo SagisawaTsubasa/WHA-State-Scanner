@@ -1333,6 +1333,65 @@ async def main():
     anchor_cfg["conditions"][3]["set_conditions"] = [anchor_grp]
     _vc(anchor_cfg)  # empty group referenced by a flag stays alive (R6-3)
 
+    # review R7-2: constant dominance — the old "any unknown → unknown"
+    # short-circuit let provably dead groups save silently (the flag then
+    # never latched). Kleene merge rejects them again.
+    and_grp = "cond_" + "6" * 32
+    bad_and = json.loads(json.dumps(flag_cfg))
+    bad_and["conditions"].append(
+        {"id": "cond_" + "f" * 32, "type": "cooldown", "seconds": 60}
+    )
+    bad_and["conditions"].append(
+        {
+            "id": and_grp,
+            "type": "and",
+            "conditions": ["cond_" + "f" * 32, set_leaf["id"]],
+        }
+    )
+    bad_and["conditions"][3]["set_conditions"] = [and_grp]
+    try:
+        _vc(bad_and)
+        raise AssertionError("AND mixing a cooldown must be rejected (R7-2)")
+    except _CVE:
+        pass
+
+    not_grp = "cond_" + "7" * 32
+    bad_not = json.loads(json.dumps(flag_cfg))
+    bad_not["conditions"].append(
+        {
+            "id": not_grp,
+            "type": "not",
+            "conditions": [dis_leaf["id"], set_leaf["id"]],
+        }
+    )
+    bad_not["conditions"][3]["set_conditions"] = [not_grp]
+    try:
+        _vc(bad_not)
+        raise AssertionError(
+            "NOT with a provably-true member must be rejected (R7-2)"
+        )
+    except _CVE:
+        pass
+
+    bad_dur_abort = json.loads(json.dumps(flag_cfg))
+    bad_dur_abort["conditions"].append(
+        {
+            "id": "cond_" + "e" * 32,
+            "type": "duration",
+            "seconds": 5,
+            "start": set_leaf["id"],
+            "abort": dis_leaf["id"],
+        }
+    )
+    bad_dur_abort["conditions"][3]["set_conditions"] = ["cond_" + "e" * 32]
+    try:
+        _vc(bad_dur_abort)
+        raise AssertionError(
+            "duration with a provably-satisfied abort must be rejected (R7-2)"
+        )
+    except _CVE:
+        pass
+
     # review R6-1: a SELF-resetting latch (flag A → duration D → A's reset)
     # is legal — the flag step only READS the latched value (no cascade,
     # R5-4's blanket flag rejection was wrong here) and the flag edge is
@@ -1388,6 +1447,49 @@ async def main():
     assert ent_fb.is_on is False, "output driven by latched flag_b"
     mgr_f.async_unload()
     print("[PASS] flag latch: stepping, reset-wins, initial, disabled freeze, cascade rules")
+
+    # review R7-3: an empty NON-signal group wired into a flag branch is
+    # saveable (canvas anchor) but evaluates False every cycle — the dead
+    # branch must be visible once via warning, not a silent debug line.
+    anchor_rt_grp = "cond_" + "8" * 32
+    from custom_components.sensor_switch_controller.condition_engine import (
+        ConditionEngine,
+    )
+
+    anchor_rt_cfg = json.loads(json.dumps(flag_cfg))
+    anchor_rt_cfg["conditions"].append(
+        {"id": anchor_rt_grp, "type": "or", "conditions": []}
+    )
+    anchor_rt_cfg["conditions"][3]["set_conditions"] = [anchor_rt_grp]
+    eng_rt = ConditionEngine(
+        _Hass(), _vc(json.loads(json.dumps(anchor_rt_cfg)))["conditions"]
+    )
+    import logging as _logging
+
+    class _Cap(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    _cap = _Cap()
+    _lg = _logging.getLogger(
+        "custom_components.sensor_switch_controller.condition_engine"
+    )
+    _lg.addHandler(_cap)
+    try:
+        await eng_rt.step_flags()
+        await eng_rt.step_flags()  # steady state: no second warning
+    finally:
+        _lg.removeHandler(_cap)
+    warns = [r for r in _cap.records if "empty group" in r.getMessage()]
+    assert len(warns) == 1, [r.getMessage() for r in _cap.records]
+    assert anchor_rt_grp in warns[0].getMessage(), warns[0].getMessage()
+    # once-only bookkeeping is per (flag, side, group)
+    assert eng_rt._empty_branch_warned == {(flag_a, "set", anchor_rt_grp)}
+    print("[PASS] empty-group flag branch warns once (R7-3)")
 
     # ------------------------------------------------------------------
     # 0.9.0 review R1-2: a directed evaluation must widen its targets with
@@ -1794,6 +1896,18 @@ async def main():
         "a valid store (incl. the R6-1 self latch) must load, not land invalid"
     )
 
+    # review R7-1: a None payload (missing / corrupt file) on the re-read
+    # path (rollback re-read or entry reload) must keep the populated
+    # memory — a wipe would be persisted by the very next save
+    async def _load_none():
+        return None
+
+    hub_p.store.async_load = _load_none
+    await hub_p.async_load()
+    assert set(hub_p.controllers) == {"ctrl_ab12cd34"}, (
+        "a None payload must keep the last-known-good memory (R7-1)"
+    )
+
     async def _load_flags():
         return {
             "flags": {
@@ -1801,15 +1915,26 @@ async def main():
                 "ctrl_bad_str": "oops",
                 "ctrl_bad_num": 5,
                 42: {"cond_" + "1" * 32: True},
+                # review R7-6: non-boolean latch values inside the dict
+                "ctrl_bad_val": {
+                    "cond_" + "1" * 32: "on",
+                    "cond_" + "2" * 32: True,
+                },
+                "ctrl_all_bad": {"cond_" + "1" * 32: 1},
             }
         }
 
     hub_p._flag_store.async_load = _load_flags
     await hub_p.async_load_flag_states()
-    assert hub_p.flag_states == {"ctrl_good": {"cond_" + "1" * 32: True}}, (
-        "non-object per-controller flag values must be dropped loudly (R6-5)"
+    assert hub_p.flag_states == {
+        "ctrl_good": {"cond_" + "1" * 32: True},
+        "ctrl_bad_val": {"cond_" + "2" * 32: True},
+        "ctrl_all_bad": {},
+    }, hub_p.flag_states
+    print(
+        "[PASS] store/flag load guards hold on corrupt payloads"
+        " (F-280/R6-5/R7-1/R7-6)"
     )
-    print("[PASS] store/flag load guards hold on corrupt payloads (F-280/R6-5)")
 
 asyncio.run(main())
 print("SMOKE OK")

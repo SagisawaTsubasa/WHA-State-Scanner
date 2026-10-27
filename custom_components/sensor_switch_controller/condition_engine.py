@@ -102,6 +102,10 @@ class ConditionEngine:
         # groups referenced by trigger signal coverage (0.7.3 trigger-logic
         # mode): they evaluate as pass-through instead of their members
         self.signal_group_ids: set[str] = set()
+        # (flag id, side, group id) pairs already warned about (审查 R7-3):
+        # an empty non-signal group wired into a flag branch evaluates
+        # False every cycle — visible once instead of a debug line per tick
+        self._empty_branch_warned: set[tuple[str, str, str]] = set()
         self._template_cache: dict[str, Template] = {}
         self._sun_cache: dict[tuple[str, str], Any] = {}
 
@@ -160,6 +164,35 @@ class ConditionEngine:
                 continue
             if cond.get("enabled") is False:
                 continue
+            # Empty-group branches (审查 R7-3): the schema keeps them
+            # saveable as canvas wiring anchors, but an empty group that is
+            # NOT a signal anchor evaluates False every cycle
+            # (_evaluate_id) — the branch silently never fires. Warn once
+            # per flag/side/group so the dead branch is visible without
+            # breaking the incremental wiring workflow.
+            for side, members in (
+                ("set", cond.get(CONF_SET_CONDITIONS)),
+                ("reset", cond.get(CONF_RESET_CONDITIONS)),
+            ):
+                for member in members or []:
+                    m = self._conditions.get(member)
+                    if (
+                        isinstance(m, dict)
+                        and m.get("type") in GROUP_TYPES
+                        and not (m.get("conditions") or [])
+                        and member not in self.signal_group_ids
+                        and (cid, side, member) not in self._empty_branch_warned
+                    ):
+                        self._empty_branch_warned.add((cid, side, member))
+                        _LOGGER.warning(
+                            "Flag '%s' %s branch references empty group "
+                            "'%s': it is not a signal anchor, so it "
+                            "evaluates False and this branch can never "
+                            "fire (add members to the group or unwire it)",
+                            cond.get("label") or cid,
+                            side,
+                            member,
+                        )
             initial = bool(cond.get(CONF_INITIAL, False))
             old = self._flag_states.get(cid, initial)
             # No short-circuit: every member is evaluated every cycle so its

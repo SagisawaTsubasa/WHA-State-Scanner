@@ -647,10 +647,18 @@ def _flag_branch_verdict(
     """Abstract verdict of one branch as the flag step evaluates it
     (审查 R6-1/R6-3): False = provably dead in flag context (a cooldown
     has no output context there, an AND with a dead member stays dead, a
-    duration gated by a dead start never completes); True = provably
+    NOT with a satisfied member stays false, a duration whose start is
+    dead never completes and whose abort is provably satisfied aborts
+    every tick — condition_engine._evaluate_duration); True = provably
     satisfied (a disabled node — the engine returns satisfied WITHOUT
     evaluating its members, condition_engine._evaluate_id); None =
     depends on live state.
+
+    Groups merge under three-valued (Kleene) logic with constant
+    dominance (审查 R7-2): one provably False member keeps an AND dead
+    and one provably True member kills a NOT, even when another member
+    is still unknown — the old "any unknown → unknown" short-circuit
+    let exactly those permanently-dead branches save silently.
 
     Flags read as None: a self reference reads the previous latch
     (deterministic, so a self-resetting latch is legal — R6-1), any
@@ -680,22 +688,49 @@ def _flag_branch_verdict(
                     _flag_branch_verdict(by_id[member], by_id, memo)
                     for member in members
                 ]
-                if any(v is None for v in verdicts):
-                    verdict = None
-                elif ctype == COND_AND:
-                    verdict = all(verdicts)
+                # Kleene merge with constant dominance (审查 R7-2): the
+                # engine evaluates every member every cycle, so a single
+                # provably-constant member dominates the group verdict —
+                # AND(False, x) is dead whatever x is, NOT(True, x) can
+                # never pass.
+                if ctype == COND_AND:
+                    verdict = (
+                        False
+                        if any(v is False for v in verdicts)
+                        else None if any(v is None for v in verdicts) else True
+                    )
                 elif ctype == COND_OR:
-                    verdict = any(verdicts)
-                else:  # not
-                    verdict = not any(verdicts)
+                    verdict = (
+                        True
+                        if any(v is True for v in verdicts)
+                        else None if any(v is None for v in verdicts) else False
+                    )
+                else:  # not: passes only when NO member is true (engine :500)
+                    verdict = (
+                        False
+                        if any(v is True for v in verdicts)
+                        else None if any(v is None for v in verdicts) else True
+                    )
         elif ctype == COND_DURATION:
             start = by_id.get(cond.get(CONF_START))
-            verdict = (
-                False
+            abort = by_id.get(cond.get(CONF_ABORT))
+            start_v = (
+                _flag_branch_verdict(start, by_id, memo)
                 if start is not None
-                and _flag_branch_verdict(start, by_id, memo) is False
                 else None
             )
+            abort_v = (
+                _flag_branch_verdict(abort, by_id, memo)
+                if abort is not None
+                else None
+            )
+            # The gate drops the timer and returns False the moment the
+            # abort is satisfied, and never completes while the start
+            # never holds (condition_engine._evaluate_duration) — so a
+            # provably-dead start or a provably-satisfied abort keeps the
+            # gate provably False (审查 R7-2); anything else is time/live-
+            # state dependent.
+            verdict = False if start_v is False or abort_v is True else None
         else:  # state/time/sun/template/calendar/debounce: live inputs
             verdict = None
     memo[cid] = verdict
@@ -764,8 +799,8 @@ def _check_graph(
                     _fail(
                         f"旗标「{label}」的 {key}（直接或经组/持续门间接）恒不成立："
                         "冷却条件在旗标步进时没有输出上下文（恒 False），"
-                        "AND 组混入冷却、空组同理；请把冷却放在输出链上"
-                        "或修正该分支"
+                        "AND 组混入冷却、NOT 组含恒真成员、持续门起点恒假"
+                        "或中止恒真同理；请修正该分支"
                     )
 
     # Cycle detection over group references and duration start/abort edges
