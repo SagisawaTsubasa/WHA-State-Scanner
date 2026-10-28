@@ -411,8 +411,12 @@ class ScannerHub:
         non-empty (审查 R7-1): both re-read entry points (the rollback
         re-read and the entry reload) must never let a vanished file
         wipe a populated table — the next save would persist the wipe,
-        the same hazard F-280 closed on the first entry point. First
-        setup is unaffected: the memory is still empty there.
+        the same hazard F-280 closed on the first entry point. The same
+        guard covers a payload that parses but carries no usable
+        controllers object — an empty store object or a non-object
+        ``controllers`` value (审查 R9-1). First setup is unaffected:
+        the memory is still empty there, so every bad payload degrades
+        to the empty state loudly (F-280 semantics).
         """
         data = await self.store.async_load()
         if data is not None and not isinstance(data, dict):
@@ -436,10 +440,35 @@ class ScannerHub:
                 len(self.invalid),
             )
             return
-        raw = (data or {}).get(CONF_CONTROLLERS) or {}
+        raw = data.get(CONF_CONTROLLERS) if isinstance(data, dict) else None
+        if (
+            data is not None
+            and not isinstance(raw, dict)
+            and (self.controllers or self.invalid)
+        ):
+            # 审查 R9-1 (WHA-F-304): a payload that parses but carries no
+            # usable controllers object — an empty store object (raw None)
+            # or a non-object controllers value — is the same data-loss
+            # class as the missing file above: keep the last-known-good
+            # memory instead of wiping it (the next save would persist the
+            # wipe). The None case itself stays owned by the missing-file
+            # guard above; and an explicit empty controllers OBJECT
+            # ({"controllers": {}}) remains a legitimate "user deleted
+            # everything" load below.
+            _LOGGER.warning(
+                "Stored %s payload has no usable controllers object (%r); "
+                "keeping the in-memory controllers (%d, %d invalid) — the "
+                "next save re-writes them instead of persisting the wipe",
+                STORE_KEY,
+                type(raw).__name__,
+                len(self.controllers),
+                len(self.invalid),
+            )
+            return
         if not isinstance(raw, dict):
             # Hand-edited / corrupt store: same guard as the migration path —
             # a non-object payload must not abort the whole integration.
+            # Only reachable with empty memory (first setup): degrade loudly.
             _LOGGER.warning(
                 "Stored %s payload is not an object (%r); ignored",
                 CONF_CONTROLLERS, type(raw).__name__,

@@ -10,6 +10,13 @@ reports PASS-CAUGHT / MUTANT-SURVIVED. Exit 0 = every mutant caught.
 Round 4 (R7, WHA-F-297..302): M1-M3 = F-298 Kleene dominance, M4 = F-297
 None-payload guard, M5 = F-299 empty-branch warning, M6 = F-300 repair
 KeyError contract, M7 = F-302 inner-value filter.
+
+Round 5 (R9, WHA-F-304..308): M5's anchor follows the rewritten warning
+scan (F-305/F-306 abstract evaluation walk), M8 = F-298 OR True-dominance
+pin; and the verdict itself got honest (F-308): a mutant counts CAUGHT
+only when its run exits non-zero AND the output carries the expected
+fragment — a non-zero exit without the fragment is INVALID, and both
+runners are baseline-checked green before the first mutation.
 """
 
 from __future__ import annotations
@@ -77,8 +84,8 @@ MUTATIONS = [
     (
         "M5 F-299: empty-branch warning suppressed again",
         CC / "condition_engine.py",
-        "                        and (cid, side, member) not in self._empty_branch_warned",
-        "                        and False",
+        "                    if (cid, side, group) in self._empty_branch_warned:",
+        "                    if False:",
         "smoke",
         [],
         "empty-group flag branch warns once",
@@ -105,6 +112,26 @@ MUTATIONS = [
         [],
         "store/flag load guards hold on corrupt payloads",
     ),
+    (
+        "M8 F-298: OR loses its provably-true dominance again",
+        CC / "schema.py",
+        "                elif ctype == COND_OR:\n"
+        "                    verdict = (\n"
+        "                        True\n"
+        "                        if any(v is True for v in verdicts)\n"
+        "                        else None if any(v is None for v in verdicts)"
+        " else False\n"
+        "                    )",
+        "                elif ctype == COND_OR:\n"
+        "                    verdict = (\n"
+        "                        None\n"
+        "                        if any(v is None for v in verdicts)\n"
+        "                        else False\n"
+        "                    )",
+        "smoke",
+        [],
+        "OR with a provably-true member must be rejected",
+    ),
 ]
 
 
@@ -125,7 +152,25 @@ def run_pytest(targets: list[str]) -> tuple[int, str]:
 
 
 def main() -> int:
-    caught, survived = [], []
+    # Baseline self-check (审查 R9-5): every verdict below compares a
+    # mutant run against a green suite — a broken environment (import
+    # error, missing dependency, collection error) would otherwise fail
+    # every mutant run and fake a full CAUGHT scoreboard.
+    base_rc, base_out = run_smoke()
+    if base_rc != 0:
+        print("[BASELINE] smoke failed before any mutation; aborting")
+        for line in base_out.strip().splitlines()[-10:]:
+            print(f"         {line}")
+        return 1
+    print("[BASELINE] smoke green (exit 0)")
+    base_rc, base_out = run_pytest([str(TESTS)])
+    if base_rc != 0:
+        print("[BASELINE] pytest failed before any mutation; aborting")
+        for line in base_out.strip().splitlines()[-10:]:
+            print(f"         {line}")
+        return 1
+    print("[BASELINE] pytest green (exit 0)")
+    caught, survived, invalid = [], [], []
     for name, path, old, new, runner, targets, frag in MUTATIONS:
         backup = path.with_suffix(path.suffix + ".mutbak")
         shutil.copy2(path, backup)
@@ -139,27 +184,36 @@ def main() -> int:
                 rc, out = run_smoke()
             else:
                 rc, out = run_pytest(targets)
-            # the pin must FAIL (non-zero exit) under the mutant
-            failed = rc != 0
             detail = ""
-            if failed:
+            if out.strip():
                 tail = out.strip().splitlines()[-3:]
                 detail = " | ".join(t.strip() for t in tail)[:220]
-                if frag and frag not in out:
-                    detail = "failed without expected fragment; last: " + detail
-            (caught if failed else survived).append((name, detail))
+            # The pin must FAIL (non-zero exit) AND fail through the pinned
+            # assertion (expected fragment present): a non-zero exit without
+            # the fragment is some global breakage, not a caught mutant
+            # (审查 R9-5).
+            if rc == 0:
+                survived.append((name, detail))
+            elif frag and frag not in out:
+                invalid.append(
+                    (name, "failed without expected fragment; last: " + detail)
+                )
+            else:
+                caught.append((name, detail))
         finally:
             shutil.copy2(backup, path)
             backup.unlink()
-    print("=== MUTATION DISCRIMINATION (round 4, R7) ===")
+    print("=== MUTATION DISCRIMINATION (round 5, R9) ===")
     for name, detail in caught:
         print(f"[CAUGHT] {name}")
         if detail:
             print(f"         {detail}")
+    for name, detail in invalid:
+        print(f"[INVALID] {name} — {detail}")
     for name, detail in survived:
         print(f"[SURVIVED] {name} — {detail}")
     print(f"caught {len(caught)}/{len(MUTATIONS)}")
-    return 0 if not survived else 1
+    return 0 if not survived and not invalid else 1
 
 
 if __name__ == "__main__":

@@ -164,34 +164,51 @@ class ConditionEngine:
                 continue
             if cond.get("enabled") is False:
                 continue
-            # Empty-group branches (审查 R7-3): the schema keeps them
-            # saveable as canvas wiring anchors, but an empty group that is
-            # NOT a signal anchor evaluates False every cycle
-            # (_evaluate_id) — the branch silently never fires. Warn once
-            # per flag/side/group so the dead branch is visible without
-            # breaking the incremental wiring workflow.
-            for side, members in (
-                ("set", cond.get(CONF_SET_CONDITIONS)),
-                ("reset", cond.get(CONF_RESET_CONDITIONS)),
+            # Empty-group branches (审查 R7-3, widened by R9-2/R9-3): the
+            # schema keeps empty groups saveable as canvas wiring anchors,
+            # but a non-signal-anchor empty group evaluates False every
+            # cycle (_evaluate_cond). Walk each side's evaluation edges
+            # statically (group membership + duration start/abort, mirroring
+            # _evaluate_id/_evaluate_cond — disabled reads True, a signal
+            # anchor reads True, live inputs read unknown) and warn once per
+            # flag/side/group: branch-level when the whole side is provably
+            # dead, member-level when the empty group is merely useless.
+            for side, key in (
+                ("set", CONF_SET_CONDITIONS),
+                ("reset", CONF_RESET_CONDITIONS),
             ):
-                for member in members or []:
-                    m = self._conditions.get(member)
-                    if (
-                        isinstance(m, dict)
-                        and m.get("type") in GROUP_TYPES
-                        and not (m.get("conditions") or [])
-                        and member not in self.signal_group_ids
-                        and (cid, side, member) not in self._empty_branch_warned
-                    ):
-                        self._empty_branch_warned.add((cid, side, member))
+                members = cond.get(key) or []
+                if not members:
+                    continue
+                dead_groups: list[str] = []
+                verdicts = [
+                    self._static_verdict(m, set(), dead_groups)
+                    for m in members
+                ]
+                side_dead = not any(v is True or v is None for v in verdicts)
+                for group in dead_groups:
+                    if (cid, side, group) in self._empty_branch_warned:
+                        continue
+                    self._empty_branch_warned.add((cid, side, group))
+                    if side_dead:
                         _LOGGER.warning(
                             "Flag '%s' %s branch references empty group "
-                            "'%s': it is not a signal anchor, so it "
+                            "'%s': it is not a signal anchor, so it always "
                             "evaluates False and this branch can never "
                             "fire (add members to the group or unwire it)",
                             cond.get("label") or cid,
                             side,
-                            member,
+                            group,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "Flag '%s' %s branch references empty group "
+                            "'%s': it is not a signal anchor, so it always "
+                            "evaluates False and cannot contribute to this "
+                            "gate (add members to the group or unwire it)",
+                            cond.get("label") or cid,
+                            side,
+                            group,
                         )
             initial = bool(cond.get(CONF_INITIAL, False))
             old = self._flag_states.get(cid, initial)
@@ -213,6 +230,128 @@ class ConditionEngine:
             if new != old:
                 flipped.append(cid)
         return flipped
+
+    def _static_verdict(
+        self,
+        cid: str | None,
+        visited: set[str],
+        dead_groups: list[str],
+        *,
+        inverted: bool = False,
+        in_abort: bool = False,
+    ) -> bool | None:
+        """Abstract verdict of one condition id, mirroring _evaluate_id's
+        decision points without touching live state: unknown id → False,
+        circular reference → False, disabled → True, groups merged
+        Kleene-style (审查 R9-3: a constant member dominates through NOT
+        too — NOT(empty) is constant True — so verdicts must propagate,
+        not be judged member-by-member), everything that reads live state
+        or timers (leaves, flags, duration timers, debounce) → None.
+
+        Reachable non-signal-anchor empty groups are collected into
+        ``dead_groups`` for the step_flags warning — unless a NOT on the
+        path inverts their constant False into a constant True (they make
+        the branch MORE likely to fire) or they sit in a duration's abort
+        slot (an empty abort never fires — harmless); neither deadens
+        anything, so neither is collected.
+        """
+        cond = self._conditions.get(cid)
+        if cond is None:
+            return False
+        if cid in visited:
+            return False  # the engine resolves a circular reference False
+        if cond.get("enabled") is False:
+            return True
+        visited.add(cid)
+        try:
+            return self._static_cond(
+                cond, visited, dead_groups,
+                inverted=inverted, in_abort=in_abort,
+            )
+        finally:
+            visited.discard(cid)
+
+    def _static_cond(
+        self,
+        cond: Any,
+        visited: set[str],
+        dead_groups: list[str],
+        *,
+        inverted: bool,
+        in_abort: bool,
+    ) -> bool | None:
+        """Abstract verdict of one condition dict (mirror of _evaluate_cond)."""
+        if not isinstance(cond, dict):
+            return False
+        ctype = cond.get("type")
+        if ctype is None:
+            if "conditions" in cond:
+                ctype = "and"  # legacy group without explicit type
+            else:
+                return False
+        if ctype in GROUP_TYPES:
+            cond_id = cond.get("id")
+            if cond_id and cond_id in self.signal_group_ids:
+                return True  # pass-through anchor: members never evaluated
+            members = cond.get("conditions") or []
+            if not members:
+                # Non-signal-anchor empty group: the engine evaluates it
+                # False every cycle (_evaluate_cond).
+                if cond_id and not inverted and not in_abort:
+                    dead_groups.append(cond_id)
+                return False
+            verdicts: list[bool | None] = []
+            for member in members:
+                if isinstance(member, str):
+                    verdicts.append(
+                        self._static_verdict(
+                            member, visited, dead_groups,
+                            inverted=inverted, in_abort=in_abort,
+                        )
+                    )
+                else:
+                    verdicts.append(
+                        self._static_cond(
+                            member, visited, dead_groups,
+                            inverted=inverted, in_abort=in_abort,
+                        )
+                    )
+            if ctype == "and":
+                return (
+                    False if any(v is False for v in verdicts)
+                    else None if any(v is None for v in verdicts) else True
+                )
+            if ctype == "or":
+                return (
+                    True if any(v is True for v in verdicts)
+                    else None if any(v is None for v in verdicts) else False
+                )
+            # not: passes only when NO member is true (engine :532)
+            return (
+                False if any(v is True for v in verdicts)
+                else None if any(v is None for v in verdicts) else True
+            )
+        if ctype == COND_FLAG:
+            return None  # latched read — not statically decidable
+        if ctype == "duration":
+            start_v = self._static_verdict(
+                cond.get(CONF_START), visited, dead_groups,
+                inverted=inverted, in_abort=False,
+            )
+            abort_v = (
+                self._static_verdict(
+                    cond.get(CONF_ABORT), visited, dead_groups,
+                    inverted=inverted, in_abort=True,
+                )
+                if cond.get(CONF_ABORT) else False
+            )
+            # Mirror _evaluate_duration: a provably-dead start or a
+            # provably-satisfied abort keeps the gate False; anything else
+            # depends on timers/live state.
+            return False if start_v is False or abort_v is True else None
+        if ctype == "cooldown":
+            return False  # no output context during the flag step
+        return None  # state/time/sun/template/calendar/debounce: live inputs
 
     def next_wakeup(
         self, reverse: dict[str, set[str]]

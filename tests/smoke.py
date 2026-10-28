@@ -1373,6 +1373,34 @@ async def main():
     except _CVE:
         pass
 
+    # review R9-4 (WHA-F-307): the OR True-dominance arm needs its own pin —
+    # set=[NOT(OR(disabled_leaf, live_leaf))]: OR reads True from the
+    # disabled member → NOT reads False → rejected. If OR loses its
+    # dominance (falls back to any-unknown), the verdict degrades to
+    # None → NOT reads None → allowed — yet at runtime NOT(any([True, ...]))
+    # is constant False: a silent dead branch would return.
+    or_inner_grp = "cond_" + "5" * 32
+    or_not_grp = "cond_" + "6" * 32
+    bad_or_not = json.loads(json.dumps(flag_cfg))
+    bad_or_not["conditions"].append(
+        {
+            "id": or_inner_grp,
+            "type": "or",
+            "conditions": [dis_leaf["id"], set_leaf["id"]],
+        }
+    )
+    bad_or_not["conditions"].append(
+        {"id": or_not_grp, "type": "not", "conditions": [or_inner_grp]}
+    )
+    bad_or_not["conditions"][3]["set_conditions"] = [or_not_grp]
+    try:
+        _vc(bad_or_not)
+        raise AssertionError(
+            "OR with a provably-true member must be rejected (R9-4)"
+        )
+    except _CVE:
+        pass
+
     bad_dur_abort = json.loads(json.dumps(flag_cfg))
     bad_dur_abort["conditions"].append(
         {
@@ -1485,11 +1513,138 @@ async def main():
     finally:
         _lg.removeHandler(_cap)
     warns = [r for r in _cap.records if "empty group" in r.getMessage()]
-    assert len(warns) == 1, [r.getMessage() for r in _cap.records]
+    assert len(warns) == 1, (
+        "empty-group flag branch warns once: "
+        + str([r.getMessage() for r in _cap.records])
+    )
     assert anchor_rt_grp in warns[0].getMessage(), warns[0].getMessage()
     # once-only bookkeeping is per (flag, side, group)
     assert eng_rt._empty_branch_warned == {(flag_a, "set", anchor_rt_grp)}
     print("[PASS] empty-group flag branch warns once (R7-3)")
+
+    # ------------------------------------------------------------------
+    # review R9-2/R9-3 (WHA-F-305/F-306): the empty-branch warning must
+    # follow the engine's abstract semantics — disabled groups read True,
+    # NOT flips a constant False into a constant True, duration aborts are
+    # harmless — and the wording must be member-level unless the whole
+    # side is provably dead.
+    # ------------------------------------------------------------------
+
+    async def _capture_steps(eng, steps=2):
+        """Run step_flags with the capture handler attached; return the
+        'empty group' warning records."""
+        _cap.records.clear()
+        _lg.addHandler(_cap)
+        try:
+            for _ in range(steps):
+                await eng.step_flags()
+        finally:
+            _lg.removeHandler(_cap)
+        return [r for r in _cap.records if "empty group" in r.getMessage()]
+
+    # R9-2 (1/2): a DISABLED empty group evaluates True every cycle — it
+    # latches the flag on and must NOT be called a dead branch.
+    dis_empty_grp = "cond_" + "9" * 32
+    de_flag = "cond_" + "e" * 32
+    dis_empty_cfg = {
+        "name": "flag-dis-empty", "enabled": True, "logging_enabled": False,
+        "triggers": [], "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": dis_empty_grp, "type": "or", "conditions": [],
+             "enabled": False},
+            {"id": de_flag, "type": "flag",
+             "set_conditions": [dis_empty_grp], "reset_conditions": []},
+        ],
+        "outputs": [
+            {"name": "out-de", "type": "binary_sensor",
+             "entity_id": "ssc_" + "9" * 32,
+             "on_conditions": [de_flag], "off_conditions": []},
+        ],
+    }
+    eng_de = ConditionEngine(
+        _Hass(), _vc(json.loads(json.dumps(dis_empty_cfg)))["conditions"]
+    )
+    warns = await _capture_steps(eng_de)
+    assert warns == [], [r.getMessage() for r in _cap.records]
+    assert eng_de.flag_states().get(de_flag) is True, eng_de.flag_states()
+    print("[PASS] disabled empty group latches on, no dead warning (R9-2)")
+
+    # R9-2 (2/2): an empty group beside a live member is real but useless —
+    # member-level wording, never "this branch can never fire".
+    mix_empty_grp = "cond_" + "9" * 32
+    mix_empty_cfg = json.loads(json.dumps(flag_cfg))
+    mix_empty_cfg["conditions"].append(
+        {"id": mix_empty_grp, "type": "or", "conditions": []}
+    )
+    mix_empty_cfg["conditions"][3]["set_conditions"] = [
+        mix_empty_grp, set_leaf["id"],
+    ]
+    eng_me = ConditionEngine(
+        _Hass(), _vc(json.loads(json.dumps(mix_empty_cfg)))["conditions"]
+    )
+    warns = await _capture_steps(eng_me)
+    assert len(warns) == 1, [r.getMessage() for r in _cap.records]
+    msg = warns[0].getMessage()
+    assert mix_empty_grp in msg and "cannot contribute" in msg, msg
+    assert "can never fire" not in msg, (
+        "a side with a live member must not be called dead: " + msg
+    )
+    print(
+        "[PASS] empty group beside a live member warns member-level (R9-2)"
+    )
+
+    # R9-3 (1/2): the walk follows evaluation edges — a group whose member
+    # is an empty group is itself provably False → branch-level warning
+    # naming the inner empty group.
+    nest_outer = "cond_" + "9" * 32
+    nest_inner = "cond_" + "0" * 32
+    nest_cfg = json.loads(json.dumps(flag_cfg))
+    nest_cfg["conditions"].append(
+        {"id": nest_inner, "type": "or", "conditions": []}
+    )
+    nest_cfg["conditions"].append(
+        {"id": nest_outer, "type": "or", "conditions": [nest_inner]}
+    )
+    nest_cfg["conditions"][3]["set_conditions"] = [nest_outer]
+    eng_n = ConditionEngine(
+        _Hass(), _vc(json.loads(json.dumps(nest_cfg)))["conditions"]
+    )
+    warns = await _capture_steps(eng_n)
+    assert len(warns) == 1, [r.getMessage() for r in _cap.records]
+    msg = warns[0].getMessage()
+    assert nest_inner in msg and "can never fire" in msg, msg
+    assert eng_n._empty_branch_warned == {(flag_a, "set", nest_inner)}, (
+        eng_n._empty_branch_warned
+    )
+    assert eng_n.flag_states().get(flag_a) is False, eng_n.flag_states()
+    print("[PASS] nested empty group dead branch warns once (R9-3)")
+
+    # R9-3 (2/2): a duration whose start is an empty group is provably
+    # False (start never holds) → branch-level warning through the
+    # duration's start edge.
+    dur_gate = "cond_" + "9" * 32
+    dur_empty = "cond_" + "0" * 32
+    dur_cfg = json.loads(json.dumps(flag_cfg))
+    dur_cfg["conditions"].append(
+        {"id": dur_empty, "type": "or", "conditions": []}
+    )
+    dur_cfg["conditions"].append(
+        {"id": dur_gate, "type": "duration", "seconds": 5,
+         "start": dur_empty, "abort": None}
+    )
+    dur_cfg["conditions"][3]["set_conditions"] = [dur_gate]
+    eng_du = ConditionEngine(
+        _Hass(), _vc(json.loads(json.dumps(dur_cfg)))["conditions"]
+    )
+    warns = await _capture_steps(eng_du)
+    assert len(warns) == 1, [r.getMessage() for r in _cap.records]
+    msg = warns[0].getMessage()
+    assert dur_empty in msg and "can never fire" in msg, msg
+    assert eng_du._empty_branch_warned == {(flag_a, "set", dur_empty)}, (
+        eng_du._empty_branch_warned
+    )
+    assert eng_du.flag_states().get(flag_a) is False, eng_du.flag_states()
+    print("[PASS] duration-start empty group dead branch warns once (R9-3)")
 
     # ------------------------------------------------------------------
     # 0.9.0 review R1-2: a directed evaluation must widen its targets with
@@ -1896,6 +2051,26 @@ async def main():
         "a valid store (incl. the R6-1 self latch) must load, not land invalid"
     )
 
+    # review R9-1 (WHA-F-304): load one valid + one broken controller so
+    # BOTH halves of the (controllers or invalid) memory condition are
+    # populated before the shape-guard pins below
+    async def _load_mixed():
+        return {
+            "controllers": {
+                "ctrl_ab12cd34": json.loads(json.dumps(latch_cfg)),
+                "ctrl_beef0000": {},
+            }
+        }
+
+    hub_p.store.async_load = _load_mixed
+    await hub_p.async_load()
+    assert set(hub_p.controllers) == {"ctrl_ab12cd34"}, (
+        "the valid half of a mixed store must load"
+    )
+    assert set(hub_p.invalid) == {"ctrl_beef0000"}, (
+        "the broken half of a mixed store must land invalid, kept as-is"
+    )
+
     # review R7-1: a None payload (missing / corrupt file) on the re-read
     # path (rollback re-read or entry reload) must keep the populated
     # memory — a wipe would be persisted by the very next save
@@ -1904,9 +2079,36 @@ async def main():
 
     hub_p.store.async_load = _load_none
     await hub_p.async_load()
-    assert set(hub_p.controllers) == {"ctrl_ab12cd34"}, (
-        "a None payload must keep the last-known-good memory (R7-1)"
+    assert (
+        set(hub_p.controllers) == {"ctrl_ab12cd34"}
+        and set(hub_p.invalid) == {"ctrl_beef0000"}
+    ), "a None payload must keep the last-known-good memory (R7-1)"
+
+    # review R9-1 (WHA-F-304): a payload that parses but carries no usable
+    # controllers object — a non-object controllers value or an empty store
+    # object — must keep the populated memory too (the guard returns before
+    # the table rebuild, so the invalid half survives as well). The same
+    # shapes degraded to empty further above with EMPTY memory: the memory
+    # condition is what separates keep from degrade.
+    hub_p.store.async_load = _load_controllers_list
+    await hub_p.async_load()
+    assert (
+        set(hub_p.controllers) == {"ctrl_ab12cd34"}
+        and set(hub_p.invalid) == {"ctrl_beef0000"}
+    ), (
+        "a non-object controllers payload must keep the last-known-good "
+        "memory (R9-1)"
     )
+
+    async def _load_empty_object():
+        return {}
+
+    hub_p.store.async_load = _load_empty_object
+    await hub_p.async_load()
+    assert (
+        set(hub_p.controllers) == {"ctrl_ab12cd34"}
+        and set(hub_p.invalid) == {"ctrl_beef0000"}
+    ), "an empty store object must keep the last-known-good memory (R9-1)"
 
     async def _load_flags():
         return {
@@ -1930,10 +2132,12 @@ async def main():
         "ctrl_good": {"cond_" + "1" * 32: True},
         "ctrl_bad_val": {"cond_" + "2" * 32: True},
         "ctrl_all_bad": {},
-    }, hub_p.flag_states
+    }, "store/flag load guards hold on corrupt payloads: " + repr(
+        hub_p.flag_states
+    )
     print(
         "[PASS] store/flag load guards hold on corrupt payloads"
-        " (F-280/R6-5/R7-1/R7-6)"
+        " (F-280/R6-5/R7-1/R7-6/R9-1)"
     )
 
 asyncio.run(main())
