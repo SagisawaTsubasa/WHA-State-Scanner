@@ -12,11 +12,11 @@
 
 - **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
 - **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，试运行实时染色（绿=满足/红=不满足/输出徽章显示决策）
-- **触发器可连线路由（0.7.0）** — 触发器是画布上的信号源：信号线连到条件或逻辑组的「信号」口开始评估；信号覆盖了哪些门，就沿链唤醒哪些输出；未连线=不评估，到期唤醒同样定向（逻辑组：连信号=触发合并贯通，连成员=条件判定）
+- **触发器可连线路由（0.7.0，0.10.0 起强制显式）** — 触发器是画布上的信号源：信号线连到条件或逻辑组的「信号」口开始评估；信号覆盖了哪些门，就沿链唤醒哪些输出；未连线=不评估，到期唤醒同样定向（逻辑组：连信号=触发合并贯通，连成员=条件判定）。0.10.0 起遗留全量评估（routes 缺省）与「留空监听整个传感器池」均废弃：routes 与触发实体（可逗号分隔多实体）必须显式声明
 - **传感器池** — 一个控制器可引用任意数量的实体；总览页有全局传感器池视图，共享传感器高亮
 - **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒），支持 `AND`/`OR`/`NOT` 嵌套组合
 - **多路输出** — 一个控制器可生成多个开关或二进制传感器；`off_conditions` 优先于 `on_conditions`（防抖动）
-- **决策日志** — 每周期逐输出写入独立 JSONL（含传感器读数快照、applied/override 标记），面板内可直接查询
+- **决策日志** — 每周期逐输出写入独立 JSONL（含传感器读数快照、触发源实体与状态变化、逐条件求值明细、applied/override 标记），面板内可直接查询
 - **手动覆盖** — 开关类型支持可选的手动强制控制
 - **零构建前端** — 集成自带全部静态资源（vendored Drawflow），无 Node 工具链、无外网依赖
 
@@ -27,7 +27,7 @@
 - **Sensor pool** — any number of entities per controller; a global pool view highlights sensors shared across controllers
 - **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), plus `AND`/`OR`/`NOT` nesting
 - **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
-- **Decision log** — per-cycle JSONL with sensor readings, applied/override flags; queryable in the panel
+- **Decision log** — per-cycle JSONL with sensor readings, firing entity + state change, per-condition verdicts, applied/override flags; queryable in the panel
 - **Manual override** — optional per-switch manual control lock
 - **Zero-build frontend** — all static assets vendored (Drawflow); no Node toolchain, no external requests
 
@@ -107,11 +107,12 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 **示例记录 / Example record：**
 
 ```json
-{"timestamp":"2026-10-05T14:30:00+08:00","controller":"浴室湿度控制","output":"湿度控制使能","decision":"off","on_met":false,"off_met":true,"applied":true,"override":false,"readings":{"sensor.shi_du_chai_zhi":"8.2"}}
+{"timestamp":"2026-10-05T14:30:00+08:00","controller":"浴室湿度控制","output":"湿度控制使能","decision":"off","on_met":false,"off_met":true,"applied":true,"override":false,"triggered_by":"湿度达标 [switch.shi_du: off→on]","conditions":{"cond_1a2b…":false},"readings":{"sensor.shi_du_chai_zhi":"8.2"}}
 ```
 
 - `decision` 为条件判定结果（on/off/hold，hold 也记录——"为什么没动作"同样有据可查）
 - `applied` 表示判定是否实际写入实体；`override` 表示该写入被手动覆盖拦截
+- `triggered_by` 记录触发来源（触发器标签 + 触发实体及其状态变化）；`conditions` 是本周期输出链逐条件求值明细（条件 id → 布尔结果）
 - `readings` 是本周期传感器池的完整读数快照
 
 ---
@@ -161,7 +162,7 @@ target:
 
 0.6.0 起画布连线遵循统一的「信号+门」语义，与米家自动化极客版的事件/状态模型同构：
 
-- **⚡ 触发器 = 开始评估**（HA 同构）：触发器节点带一个信号输出口（琥珀色框）。触发器 fire = 发出一个信号，信号沿**琥珀色信号线**流入条件门；信号覆盖了哪些门，评估就沿这些门向下走到输出——**未连线 = 不评估**。
+- **⚡ 触发器 = 开始评估**（HA 同构）：触发器节点带一个信号输出口（琥珀色框）。触发器 fire = 发出一个信号，信号沿**琥珀色信号线**流入条件门；信号覆盖了哪些门，评估就沿这些门向下走到输出——**未连线 = 不评估**。0.10.0 起 routes 必填、state 触发器触发实体必填（遗留全量与池监听废弃，见「升级兼容」）。
 - **👁 条件 = 判定门**：条件节点（灰蓝色框）是拦在链上的门，条件为真门开、为假门关。`AND`/`OR`/`NOT` 组是**双模式**：连成员线=条件逻辑（AND/OR/NOT 判定）；连触发器信号线=触发逻辑（合并器，任一触发贯通放行）。两种模式对称互斥，连了一侧另一侧隐藏。
 - **⏳ 持续（duration）= 掐表门**：两个口——开始口（input_1）进线的条件为真时开始掐表，持续满 N 秒放行；开始掉线或中止口（input_2，红）进线的条件为真即复位。持续不是信号起点（无信号口）。
 - **⊕⊗¬ 逻辑组 = 汇聚判定**：**双模式**——成员口（input_1，灰蓝）收条件线组成 AND/OR/NOT（条件逻辑）；信号口（input_3，琥珀）收触发器线做触发合并（任一触发贯通放行，可多条；空组合法）。两侧对称互斥：连了一侧另一侧隐藏，删线恢复。
@@ -175,9 +176,11 @@ target:
 
 0.7.1（v5）已展开为纯叶子覆盖的存量保持不变；0.7.0/0.7.2 存量升级时剥离持续覆盖并把有成员的组覆盖展开为叶子集（v5→v6）。两点 0.7.0 时代的可观测差异需要知晓：① 0.6.x 中把触发器**只直连到部分输出**的存量，若这些输出与其它输出共享条件，折算后信号覆盖会沿共享链扩展到同链输出（v4 的条件载体无法无损表达「只唤其中一半」）；如需收窄，在画布上把信号线改连到更靠近该输出的条件门。② **没有任何条件**的空输出（开/关链皆空）不再进入触发器驱动的定向评估与日志（实体状态本就不受影响；初始评估/立即评估/试运行等全量扫描仍会记一条 hold），如需恢复请给它接条件。
 
+**0.10.0（v7 迁移，因果显式化）**：遗留全量触发器（routes 缺省）物化 `routes.conditions` 为其输出链可达的全部合法信号起点——叶子条件（持续门/旗标/逻辑组不是信号起点，叶子经组的成员边、持续的 start/abort、旗标的 set/reset 边天然可达）；物化后的定向唤醒集覆盖原全量扫描中每个可能改变状态的输出。池监听 state 触发器（entity_id 缺省）物化 `entity_id` 为传感器池全部实体列表（等价原监听面）。此后 schema **拒绝** routes 缺省与触发实体留空：新建触发器必须显式连线、显式声明实体（面板支持逗号分隔多实体，单实体保持字符串形态）。传感器池为空的池监听触发器迁移后实体列表为空：启用的触发器落 invalid 可见修复（该触发器原本就永不触发），停用的触发器保持合法惰性（运行时本就不注册）；pre-0.5.0 无触发器列表的远古存量映射出的扫描触发器自动物化 routes（与 v7 同一套信号叶子集，行为等价原全量评估面）、触发器 id 由配置确定性派生（跨重载稳定），无需重建。
+
 ## 路线图 / Roadmap
 
-- **0.8 候选** — 旗标节点（控制器内置虚拟布尔，极客版「自定义状态」等价物，赋值语义绑定输出翻转）；执行路径引擎（信号沿边串行传播、中途赋值、动作序列链）专项调研
+- **候选** — 执行路径引擎（信号沿边串行传播、中途赋值、动作序列链）专项调研
 
 
 ## 兼容性 / Compatibility
@@ -196,6 +199,20 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.10.0（2026-10-29）— 因果显式化：废弃遗留全量、触发实体显式化、因果日志
+
+**行为变更（breaking，存量自动迁移保语义）**
+- **触发器 routes 必填**：遗留全量评估（routes 键缺省）废弃，schema 直接拒绝；v6 存量经 v7 迁移自动物化 `routes.conditions` 为输出链可达的全部合法信号起点（叶子条件），物化后定向唤醒集覆盖原全量扫描中每个可能改变状态的输出（空链输出原本只产出 hold 记录，冻结等价）
+- **state 触发器实体必填**：留空监听整个传感器池废弃；v6 存量池监听触发器物化 `entity_id` 为传感器池全部实体列表（等价原监听面）；`entity_id` 放开字符串列表（多实体触发，单监听器生效）；池为空的迁移存量：启用的触发器落 invalid 可见修复（原本就是永不触发的注册错误），停用的触发器保持合法惰性（运行时本就不注册）
+- pre-0.5.0 远古存量（无触发器列表）映射出的扫描触发器自动物化 routes（与 v7 同一套信号叶子集，行为等价），触发器 id 由配置确定性派生，无需重建触发器
+
+**新功能**
+- **决策日志因果显式化**：`triggered_by` 记录触发源实体与状态变化（`标签 [switch.c: off→on]`）；每条记录新增 `conditions` 逐条件求值明细（复用试运行同款 evaluate_detailed 路径，评估语义不变）
+- **面板多实体触发**：state 触发器实体字段支持逗号分隔多实体（inspector 提示+节点摘要显示 N 实体）；面板新建触发器改为 born directed-empty（routes 必填，未连线走既有死触发确认防线）
+
+**内部**
+- 存储版本 v6→v7（迁移含旗标 set/reset 边可达性与组类型过滤：有成员组不进覆盖、空组保持死锚点语义防判定翻转）；smoke 新增迁移等价性钉（评估面=原全量、监听面=原池）、legacy/池空拒绝、多实体触发、triggered_by/conditions 明细断言
 
 ### 0.9.0（2026-10-26）— 旗标节点 + 暗病修复 + 面板死触发防线
 

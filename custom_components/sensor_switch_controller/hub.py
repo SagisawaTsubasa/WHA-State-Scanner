@@ -11,6 +11,7 @@ import copy
 import logging
 import uuid
 
+from homeassistant.const import CONF_ENTITY_ID
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.storage import Store
@@ -27,9 +28,16 @@ from .const import (
     DURATION_MAX,
     STORE_KEY,
     STORE_VERSION,
+    TRG_STATE,
 )
 from .controller import ControllerManager
-from .schema import CTRL_ID_RE, ControllerValidationError, validate_controller
+from .schema import (
+    CTRL_ID_RE,
+    ControllerValidationError,
+    _covered_condition_ids,
+    _signal_leaf_ids,
+    validate_controller,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,38 +54,6 @@ def _for_seconds(for_cfg) -> int:
         )
     except (TypeError, ValueError):
         return 0
-
-
-def _covered_condition_ids(conditions: list, outputs: list, out_ids: list[str]) -> set[str]:
-    """All condition ids reachable from the given outputs' chains: on/off
-    members, group members (recursive) and duration start/abort inputs.
-    ``conditions`` builds the id table, ``outputs`` provides the seeds."""
-    by_id = {
-        c.get("id"): c
-        for c in conditions
-        if isinstance(c, dict) and isinstance(c.get("id"), str)
-    }
-    stack: list[str] = []
-    for o in outputs:
-        if not isinstance(o, dict) or o.get("entity_id") not in out_ids:
-            continue
-        stack.extend(o.get("on_conditions") or [])
-        stack.extend(o.get("off_conditions") or [])
-    seen: set[str] = set()
-    while stack:
-        cid = stack.pop()
-        if cid in seen:
-            continue
-        seen.add(cid)
-        cond = by_id.get(cid)
-        if not cond:
-            continue
-        stack.extend(cond.get("conditions") or [])
-        if isinstance(cond.get("start"), str):
-            stack.append(cond["start"])
-        if isinstance(cond.get("abort"), str):
-            stack.append(cond["abort"])
-    return seen
 
 
 def _migrate_controller_v4(cfg: dict) -> dict:
@@ -216,6 +192,50 @@ def _flatten_group_coverage(cfg: dict) -> dict:
     return cfg
 
 
+def _migrate_controller_v7(cfg: dict) -> dict:
+    """v6→v7 (0.10.0): explicit causality for every trigger.
+
+    ① routes 缺省（遗留全量评估）触发器物化 ``routes.conditions`` 为其输出链
+       可达的全部合法信号起点（叶子条件）。duration/旗标被 schema 直接拒绝；
+       有成员的组进 routes 触发「成员+信号覆盖二选一」互斥；空组物化进
+       routes 会被引擎当贯通锚点求值恒真（翻转原 False 判定）——所以组一律
+       不进物化集合，叶子经组的成员边、持续的 start/abort 边、旗标的
+       set/reset 边天然可达（_signal_leaf_ids，与 pre-0.5 扫描间隔映射共享
+       同一排除集）。等价性：物化后的定向唤醒集 ⊇ 原全量扫描中每个可能改变
+       状态的输出（带非空条件链的输出都经其链上叶子保持在唤醒集内）；空链
+       输出原全量也只产出 hold 记录（永不翻转），冻结等价（README 0.7.0 迁
+       移差异②同口径）。
+    ② 池监听 state 触发器（entity_id 缺省）物化 entity_id=传感器池全部实体
+       列表（等价原监听面）。池为空时物化为空列表：启用的触发器随后被校验
+       拒绝、控制器落 invalid 可见修复（该触发器在 v6 就永不触发、计注册错
+       误徽章，审查 R5-9）——显式失败优于静默保留；停用的触发器运行时本就
+       不注册（注册循环跳过 enabled=False），空列表保持合法惰性（schema 归
+       一化，WHA-F-309）。
+    """
+    triggers = cfg.get(CONF_TRIGGERS)
+    if not isinstance(triggers, list):
+        return cfg
+    pool = [
+        s.get("entity_id")
+        for s in (cfg.get("sensors") or [])
+        if isinstance(s, dict) and isinstance(s.get("entity_id"), str)
+    ]
+    leaves = _signal_leaf_ids(
+        cfg.get("conditions") or [], cfg.get("outputs") or []
+    )
+    for trg in triggers:
+        if not isinstance(trg, dict):
+            continue
+        if trg.get(CONF_ROUTES) is None:
+            trg[CONF_ROUTES] = {"conditions": list(leaves)}
+        if trg.get("type") == TRG_STATE and not trg.get(CONF_ENTITY_ID):
+            # falsy (None/""/…) — the v6 register path read
+            # ``entity_id or None`` and fell back to the whole pool;
+            # materialize that listening surface verbatim.
+            trg[CONF_ENTITY_ID] = list(pool)
+    return cfg
+
+
 def _migrate_controller_v2(cfg: dict) -> dict:
     """Migrate one controller config from v2 (0.5.x) to v3, in place.
 
@@ -324,7 +344,7 @@ def _migrate_controller_v2(cfg: dict) -> dict:
 
 
 class _MigratingStore(Store):
-    """Store with the v2/v3/v4/v5→6 migrations wired in.
+    """Store with the v2/v3/v4/v5/v6→7 migrations wired in.
 
     ``Store`` has no ``migrate_func=`` constructor argument; a subclass
     overrides ``_async_migrate_func(old_major_version, old_minor_version,
@@ -348,10 +368,25 @@ class _MigratingStore(Store):
                     _migrate_controller_v4,
                     _strip_duration_coverage,
                     _flatten_group_coverage,
+                    _migrate_controller_v7,
                 ),
-                3: (_migrate_controller_v4, _strip_duration_coverage, _flatten_group_coverage),
-                4: (_strip_duration_coverage, _flatten_group_coverage),
-                5: (_strip_duration_coverage, _flatten_group_coverage),
+                3: (
+                    _migrate_controller_v4,
+                    _strip_duration_coverage,
+                    _flatten_group_coverage,
+                    _migrate_controller_v7,
+                ),
+                4: (
+                    _strip_duration_coverage,
+                    _flatten_group_coverage,
+                    _migrate_controller_v7,
+                ),
+                5: (
+                    _strip_duration_coverage,
+                    _flatten_group_coverage,
+                    _migrate_controller_v7,
+                ),
+                6: (_migrate_controller_v7,),
             }
             chain = steps.get(old_major_version, ())
             for cid, cfg in raw.items():
@@ -364,7 +399,7 @@ class _MigratingStore(Store):
                     raw[cid] = migrated
                 except Exception:
                     # keep the ORIGINAL untouched object, as advertised. Note
-                    # the whole payload is still saved back as version 6, so
+                    # the whole payload is still saved back as version 7, so
                     # the automatic migration will not re-run for this
                     # controller; the legacy config then fails validate and
                     # lands in `invalid` (visible + round-tripped, no data
@@ -416,7 +451,9 @@ class ScannerHub:
         controllers object — an empty store object or a non-object
         ``controllers`` value (审查 R9-1). First setup is unaffected:
         the memory is still empty there, so every bad payload degrades
-        to the empty state loudly (F-280 semantics).
+        to the empty state loudly (F-280 semantics) — except the
+        missing-file / first-install ``None`` itself, which is the
+        documented empty-store result and stays silent (WHA-F-311).
         """
         data = await self.store.async_load()
         if data is not None and not isinstance(data, dict):
@@ -468,11 +505,15 @@ class ScannerHub:
         if not isinstance(raw, dict):
             # Hand-edited / corrupt store: same guard as the migration path —
             # a non-object payload must not abort the whole integration.
-            # Only reachable with empty memory (first setup): degrade loudly.
-            _LOGGER.warning(
-                "Stored %s payload is not an object (%r); ignored",
-                CONF_CONTROLLERS, type(raw).__name__,
-            )
+            # Only reachable with empty memory (the populated-memory case
+            # returned above): degrade loudly. A None payload (missing file
+            # / first setup) is the documented empty-store result, not
+            # corruption — stay silent (WHA-F-311).
+            if data is not None:
+                _LOGGER.warning(
+                    "Stored %s payload is not an object (%r); ignored",
+                    CONF_CONTROLLERS, type(raw).__name__,
+                )
             raw = {}
         controllers: dict[str, dict] = {}
         self.invalid: dict[str, dict] = {}
@@ -516,11 +557,15 @@ class ScannerHub:
             data = None
         raw = (data or {}).get("flags")
         if not isinstance(raw, dict):
-            _LOGGER.warning(
-                "Stored %s_flags 'flags' payload is not an object (%r); ignored",
-                STORE_KEY,
-                type(raw).__name__,
-            )
+            # First setup (missing file → data None) is the documented empty
+            # result, not corruption — stay silent (WHA-F-311); a present
+            # payload with an unusable 'flags' value still degrades loudly.
+            if data is not None and raw is not None:
+                _LOGGER.warning(
+                    "Stored %s_flags 'flags' payload is not an object (%r); ignored",
+                    STORE_KEY,
+                    type(raw).__name__,
+                )
             self.flag_states = {}
             return
         states: dict[str, dict[str, bool]] = {}

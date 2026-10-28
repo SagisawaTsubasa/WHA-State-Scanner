@@ -2,8 +2,16 @@
 
 Every configured trigger funnels into ``on_fire``; the controller debounces
 those callbacks and runs one evaluation, directed to the outputs the firing
-trigger's routes reach (no routes → full sweep). Semantics stay level-based
-— triggers only decide *when* to evaluate, never *what* the result is.
+trigger's routes reach. Semantics stay level-based — triggers only decide
+*when* to evaluate, never *what* the result is.
+
+Since 0.10.0 the causality is explicit end to end: routes are required
+(legacy full-sweep is rejected by the schema; the v6→v7 migration
+materializes them), state triggers declare their ``entity_id`` list
+explicitly (the old "listen to the whole sensor pool" fallback is gone),
+and state callbacks fold the firing entity and its state change into the
+description (``"label [switch.c: off→on]"``) so the decision log's
+``triggered_by`` answers what fired.
 """
 
 from __future__ import annotations
@@ -77,7 +85,7 @@ class TriggerManager:
     def configs(self) -> list[dict]:
         return self._configs
 
-    def async_setup(self, pool_entity_ids: list[str]) -> None:
+    def async_setup(self) -> None:
         """Register listeners for every enabled trigger."""
         if self._started:
             return
@@ -86,7 +94,7 @@ class TriggerManager:
             if not trg.get("enabled", True):
                 continue
             try:
-                self._async_register(trg, pool_entity_ids)
+                self._async_register(trg)
             except Exception:
                 self._register_errors += 1
                 _LOGGER.exception(
@@ -107,26 +115,30 @@ class TriggerManager:
     # ------------------------------------------------------------------
 
     @callback
-    def _async_register(self, trg: dict, pool_entity_ids: list[str]) -> None:
+    def _async_register(self, trg: dict) -> None:
         ttype = trg.get("type")
 
         if ttype == TRG_STATE:
-            entity_id = trg.get(CONF_ENTITY_ID) or None
-            if entity_id:
-                targets = [entity_id]
+            # 0.10.0: the trigger entities are declared explicitly (schema
+            # validates str | list[str] — the sensor-pool fallback is gone).
+            raw = trg.get(CONF_ENTITY_ID)
+            if isinstance(raw, str):
+                targets = [raw]
             else:
-                targets = list(pool_entity_ids)
+                targets = [e for e in raw or [] if isinstance(e, str)]
             if not targets:
-                # A never-firing trigger is a registration failure, not a
-                # note in the debug log: count it so the panel shows the
-                # trigger-error badge (审查 R5-9)
+                # Unreachable for validated configs (entity_id is required,
+                # non-empty) — a malformed one must surface as a
+                # registration failure, not a silent skip (审查 R5-9 口径).
                 self._register_errors += 1
                 _LOGGER.warning(
-                    "State trigger %s has no targets (empty sensor pool); "
+                    "State trigger %s has no trigger entities; "
                     "it can never fire",
                     trg.get("id"),
                 )
                 return
+            # native list form: one listener tracks every trigger entity
+            # (signature verified against HA 2026.1.3 helpers/event.py)
             self._unsubs.append(
                 async_track_state_change_event(
                     self.hass, targets, self._make_state_cb(trg)
@@ -140,6 +152,10 @@ class TriggerManager:
             else:
                 every = int(trg.get(CONF_EVERY_SECONDS, 0))
                 if every <= 0:
+                    # Defensive (schema rejects this shape): same口径 as the
+                    # empty-targets branch above — surface it, don't skip
+                    # silently (审查 R5-9 / WHA-F-312).
+                    self._register_errors += 1
                     _LOGGER.warning(
                         "Time trigger %s without at/every_seconds; skipped",
                         trg.get("id"),
@@ -168,6 +184,9 @@ class TriggerManager:
             )
 
         else:
+            # Defensive (schema's type whitelist rejects this shape): count it
+            # like every other unregistrable trigger (WHA-F-312).
+            self._register_errors += 1
             _LOGGER.warning("Unknown trigger type %r; skipped", ttype)
 
     @callback
@@ -209,7 +228,14 @@ class TriggerManager:
                 return
             if not _match_filter(new_val, to_filter):
                 return
-            self._on_fire(trg_id, description)
+            # 0.10.0 causal description: the firing entity and its change go
+            # into the description so the decision log's triggered_by answers
+            # "what changed" without cross-referencing the readings.
+            self._on_fire(
+                trg_id,
+                f"{description} [{event.data.get('entity_id')}: "
+                f"{old_val}→{new_val}]",
+            )
 
         return _on_event
 

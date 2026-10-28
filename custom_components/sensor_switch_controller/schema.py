@@ -18,11 +18,22 @@ mutually exclusive on the canvas. Since 0.9.0 there is a ``flag`` node: a
 latched virtual boolean with set/reset condition references; its verdict
 is stepped once per evaluation cycle (reset wins over set), it carries no
 ``for``, and it may be referenced by outputs and groups but not by
-triggers' routes nor by another flag's set/reset.
+triggers' routes nor by another flag's set/reset. Since 0.10.0 legacy
+full-sweep triggers are gone: ``routes`` is REQUIRED (absent → rejected;
+upgraded stores get it materialized by the v6→v7 store migration, and
+pre-0.5 configs without a trigger list get it materialized when their
+scan interval maps to a time trigger — same signal-leaf set,
+WHA-F-310), and state triggers must declare their trigger entities
+explicitly — ``entity_id`` as one id or a list of ids (the old "listen
+to the whole sensor pool" default is rejected for ENABLED triggers;
+pool-empty migrated stores land invalid with a visible error instead of
+a never-firing trigger, while a DISABLED pool listener stays legal and
+inert — it never registers, WHA-F-309).
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import uuid
@@ -214,16 +225,28 @@ def validate_trigger(trg) -> dict:
 
     A well-formed caller-supplied ``id`` is preserved so canvas wires
     (trigger routes) survive save/reload round-trips; only a missing or
-    malformed id gets a fresh one. ``routes`` is optional: present means
-    directed routing (evaluate the outputs reachable from the covered
-    conditions — routes carry conditions only), absent means legacy
-    behaviour (evaluate everything).
+    malformed id gets a fresh one. ``routes`` is REQUIRED since 0.10.0
+    (legacy full-sweep evaluation is deprecated): present means directed
+    routing — evaluate the outputs reachable from the covered conditions
+    (routes carry conditions only). The v6→v7 store migration materializes
+    routes for upgraded configs, and the pre-0.5 scan-interval mapping
+    materializes them for trigger-less configs, before validation runs.
     """
     if not isinstance(trg, dict):
         _fail("触发器必须是对象")
     ttype = trg.get("type")
     if ttype not in TRIGGER_TYPES:
         _fail(f"未知触发器类型：{ttype!r}")
+
+    routes = trg.get(CONF_ROUTES)
+    if routes is None:
+        # 0.10.0: legacy full-sweep (routes absent) is deprecated — every
+        # trigger must declare its signal coverage explicitly so the canvas
+        # and the decision log can always answer "what fired what".
+        _fail(
+            "触发器缺少 routes（0.10.0 起废弃遗留全量评估）："
+            "请在画布把信号线连到条件；存量配置升级后由 v7 迁移自动物化"
+        )
 
     tid = trg.get("id")
     if isinstance(tid, str) and _TRG_ID_RE.match(tid):
@@ -238,24 +261,48 @@ def validate_trigger(trg) -> dict:
         "enabled": _to_bool(trg.get("enabled", True), "触发器 enabled"),
     }
 
-    routes = trg.get(CONF_ROUTES)
-    if routes is not None:
-        if not isinstance(routes, dict):
-            _fail("触发器的 routes 必须是对象")
-        if "outputs" in routes:
-            _fail(
-                "触发器不再直连输出：信号线请连到条件，"
-                "输出只由条件链决定"
-            )
-        result[CONF_ROUTES] = _validate_routes(routes)
+    if not isinstance(routes, dict):
+        _fail("触发器的 routes 必须是对象")
+    if "outputs" in routes:
+        _fail(
+            "触发器不再直连输出：信号线请连到条件，"
+            "输出只由条件链决定"
+        )
+    result[CONF_ROUTES] = _validate_routes(routes)
 
     if ttype == TRG_STATE:
         entity_id = trg.get("entity_id")
-        if entity_id in (None, ""):
-            # empty = whole sensor pool
-            result["entity_id"] = None
-        else:
+        if entity_id in (None, "", []):
+            if result["enabled"] is False:
+                # 0.10.0 carve-out (WHA-F-309): a DISABLED state trigger
+                # never registers (TriggerManager.async_setup skips
+                # enabled=False before registration), so the v6-legal
+                # "disabled pool listener" shape — including the empty-pool
+                # migration result — stays valid and inert, normalized to
+                # an empty list. Enabling it re-runs validation, which
+                # then requires explicit entities.
+                result["entity_id"] = []
+            else:
+                # 0.10.0: "empty = whole sensor pool" is deprecated — the
+                # trigger entities must be declared explicitly. Pool-empty
+                # migrated ENABLED triggers land invalid here (a
+                # never-firing trigger was already a registration error).
+                _fail(
+                    "state 触发器必须声明触发实体（0.10.0 起废弃留空="
+                    "监听整个传感器池）：请填写实体，多个实体用列表"
+                )
+        elif isinstance(entity_id, str):
             result["entity_id"] = _validate_entity_id(entity_id, "触发实体")
+        elif isinstance(entity_id, list):
+            if not all(isinstance(e, str) for e in entity_id):
+                _fail("触发实体列表必须全是实体 ID 字符串")
+            result["entity_id"] = list(
+                dict.fromkeys(
+                    _validate_entity_id(e, "触发实体") for e in entity_id
+                )
+            )
+        else:
+            _fail(f"触发实体必须是字符串或非空字符串列表：{entity_id!r}")
         attribute = _optional_str(trg.get("attribute"), "触发 attribute")
         if attribute:
             result["attribute"] = attribute
@@ -328,23 +375,120 @@ def _validate_routes(routes: dict) -> dict:
     return validated
 
 
+def _covered_condition_ids(conditions: list, outputs: list, out_ids: list[str]) -> set[str]:
+    """All condition ids reachable from the given outputs' chains: on/off
+    members, group members (recursive), duration start/abort inputs and
+    flag set/reset inputs. ``conditions`` builds the id table, ``outputs``
+    provides the seeds. Shared by the two 0.10.0 materializations (the
+    v6→v7 store migration in hub.py and the pre-0.5 scan-interval mapping
+    below) plus the older v4 chain, so their coverage sets can never
+    drift apart.
+
+    Flag edges matter for both 0.10.0 materializations: without them a
+    flag-driven output's set/reset leaves drop out of the materialized
+    coverage and the output is never woken again (migration equivalence
+    break; the controller's own reachability index walks these edges).
+    The v4 chain predates flag nodes entirely (no v≤5 store can carry
+    one), so walking set/reset there is a no-op.
+    """
+    by_id = {
+        c.get("id"): c
+        for c in conditions
+        if isinstance(c, dict) and isinstance(c.get("id"), str)
+    }
+    stack: list[str] = []
+    for o in outputs:
+        if not isinstance(o, dict) or o.get("entity_id") not in out_ids:
+            continue
+        stack.extend(o.get("on_conditions") or [])
+        stack.extend(o.get("off_conditions") or [])
+    seen: set[str] = set()
+    while stack:
+        cid = stack.pop()
+        if cid in seen:
+            continue
+        seen.add(cid)
+        cond = by_id.get(cid)
+        if not cond:
+            continue
+        stack.extend(cond.get("conditions") or [])
+        if isinstance(cond.get("start"), str):
+            stack.append(cond["start"])
+        if isinstance(cond.get("abort"), str):
+            stack.append(cond["abort"])
+        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+            stack.extend(m for m in cond.get(key) or [] if isinstance(m, str))
+    return seen
+
+
+def _signal_leaf_ids(conditions: list, outputs: list) -> list[str]:
+    """Sorted signal-origin leaf ids reachable from ALL output chains —
+    the exact materialization set of the v6→v7 routes migration: group,
+    duration and flag ids are not signal origins (schema rejects them as
+    route targets; an empty group would flip into a pass-through anchor
+    and invert its verdict), yet every driving leaf stays reachable via
+    group-member, duration start/abort and flag set/reset edges
+    (_covered_condition_ids). Outputs without a usable ``entity_id``
+    contribute no coverage — the same face the v7 migration shows.
+    """
+    by_id = {
+        c.get("id"): c
+        for c in conditions
+        if isinstance(c, dict) and isinstance(c.get("id"), str)
+    }
+    out_ids = [
+        o.get("entity_id")
+        for o in outputs
+        if isinstance(o, dict) and isinstance(o.get("entity_id"), str)
+    ]
+    return sorted(
+        cid
+        for cid in _covered_condition_ids(conditions, outputs, out_ids)
+        if cid in by_id
+        and by_id[cid].get("type")
+        not in (COND_DURATION, COND_FLAG, COND_AND, COND_OR, COND_NOT)
+    )
+
+
 def _map_legacy_scan_interval(data: dict) -> list[dict]:
     """Old configs carried a global scan_interval; keep its cadence as a
-    time trigger so upgrades never silently stop evaluating."""
+    time trigger so upgrades never silently stop evaluating.
+
+    0.10.0 (WHA-F-310): the synthetic trigger is born DIRECTED — its
+    routes materialize the same signal-leaf set the v6→v7 migration uses
+    (_signal_leaf_ids). An unrouted trigger would fail validate_trigger on
+    the next whole-table save and land the controller invalid on an
+    unrelated CRUD. The id is derived from the config (name + raw
+    interval) instead of a fresh uuid4 so repeated loads of a
+    never-re-saved store keep the same trigger id (panel/log
+    correlation); the first whole-table save persists the trigger list
+    verbatim anyway. The result is closed through validate_trigger so the
+    mapped shape is guaranteed valid.
+    """
     interval = data.get(CONF_SCAN_INTERVAL)
     try:
         interval = int(interval)
     except (TypeError, ValueError):
         interval = DEFAULT_SCAN_INTERVAL
     interval = max(EVERY_SECONDS_MIN, min(interval, EVERY_SECONDS_MAX))
+    seed = f"scan_interval:{data.get('name')}:{data.get(CONF_SCAN_INTERVAL)}"
     return [
-        {
-            "id": f"{TRG_ID_PREFIX}{uuid.uuid4().hex}",
-            "type": TRG_TIME,
-            "label": "（原扫描间隔）",
-            "enabled": True,
-            CONF_EVERY_SECONDS: interval,
-        }
+        validate_trigger(
+            {
+                "id": f"{TRG_ID_PREFIX}"
+                f"{hashlib.sha256(seed.encode()).hexdigest()[:32]}",
+                "type": TRG_TIME,
+                "label": "（原扫描间隔）",
+                "enabled": True,
+                CONF_EVERY_SECONDS: interval,
+                CONF_ROUTES: {
+                    "conditions": _signal_leaf_ids(
+                        data.get("conditions") or [],
+                        data.get("outputs") or [],
+                    )
+                },
+            }
+        )
     ]
 
 

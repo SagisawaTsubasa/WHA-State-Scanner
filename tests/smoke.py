@@ -6,7 +6,7 @@ Catches the failure classes that ruff/py_compile/node cannot see:
      stale imports) — run by importing every module with a stubbed HA tree.
   2. Runtime AttributeError inside the evaluation path — driven end-to-end
      against stub HA.
-  3. 0.7.3 semantics: v2/v3/v4/v5→v6 store migration (condition coverage),
+  3. 0.7.3 semantics: v2/v3/v4/v5/v6→v7 store migration (condition coverage),
      trigger routes (directed evaluation, wired-to-nothing wakes nothing),
      duration TON gate,
      debounce quiet gate, directed timed wakeups, schema rules (time.at
@@ -319,13 +319,14 @@ if failures:
 print("[PASS] import chain: 12 modules import cleanly")
 
 # ---------------------------------------------------------------------------
-# 2) v2/v3→v6 store migration chain (pure functions).
+# 2) v2/v3→v7 store migration chain (pure functions).
 # ---------------------------------------------------------------------------
 
 from custom_components.sensor_switch_controller.hub import (  # noqa: E402
     _flatten_group_coverage,
     _migrate_controller_v2,
     _migrate_controller_v4,
+    _migrate_controller_v7,
     _strip_duration_coverage,
 )
 from custom_components.sensor_switch_controller.const import COND_DURATION  # noqa: E402
@@ -356,6 +357,7 @@ cfg = {
             "off_conditions": [],
         }
     ],
+    "sensors": [{"entity_id": "sensor.a"}],
     "triggers": [{"id": TID1, "type": "state"}],
 }
 import copy as _copy
@@ -363,7 +365,8 @@ _cfg_v2_snapshot = _copy.deepcopy(cfg)  # pre-migration snapshot for dispatch ne
 _migrate_controller_v2(cfg)
 _migrate_controller_v4(cfg)
 _strip_duration_coverage(cfg)
-_flatten_group_coverage(cfg)  # the full hub chain, v2→6
+_flatten_group_coverage(cfg)
+_migrate_controller_v7(cfg)  # the full hub chain, v2→7
 
 durs = [c for c in cfg["conditions"] if c.get("type") == COND_DURATION]
 assert len(durs) == 1, f"migration must split one duration node: {cfg['conditions']}"
@@ -443,7 +446,7 @@ leaf_ids = {
     if c["type"] not in gate_types
 }
 assert got_cov == leaf_ids, got_cov
-print("[PASS] migration v2/v3→v6: for→duration split, at→after, condition coverage")
+print("[PASS] migration v2/v3→v7: for→duration split, at→after, condition coverage")
 
 # ---------------------------------------------------------------------------
 # 3) Schema rules: trigger id preserved, routes validated, time.at rejected.
@@ -456,7 +459,7 @@ from custom_components.sensor_switch_controller.schema import (  # noqa: E402
     validate_trigger,
 )
 
-trg = {"id": TID1, "type": "state", "routes": {"conditions": []}}
+trg = {"id": TID1, "type": "state", "entity_id": "sensor.a", "routes": {"conditions": []}}
 # migrated output must pass validate_controller as-is (WHA-F-119): the
 # group-coverage flattener guarantees schema exclusivity
 validate_controller(cfg)
@@ -475,7 +478,8 @@ v5cfg = {
          "on_conditions": [g_id], "off_conditions": []},
     ],
     "triggers": [
-        {"id": TID1, "type": "state", "routes": {"conditions": [g_id]}}
+        {"id": TID1, "type": "state", "entity_id": "sensor.a",
+         "routes": {"conditions": [g_id]}}
     ],
 }
 _v5cfg_snapshot = _copy.deepcopy(v5cfg)  # pre-migration (WHA-F-169)
@@ -511,7 +515,8 @@ cfg_durg = {
          "on_conditions": [g_dur], "off_conditions": []},
     ],
     "triggers": [
-        {"id": TID1, "type": "state", "routes": {"conditions": [g_dur]}}
+        {"id": TID1, "type": "state", "entity_id": "sensor.a",
+         "routes": {"conditions": [g_dur]}}
     ],
 }
 _strip_duration_coverage(cfg_durg)
@@ -559,7 +564,7 @@ dur_id2 = "cond_" + "cc" * 16
 bad_dur = {
     "name": "bad-dur-route",
     "triggers": [
-        {"id": TID1, "type": "state",
+        {"id": TID1, "type": "state", "entity_id": "sensor.a",
          "routes": {"conditions": [dur_id2]}}
     ],
     "conditions": [
@@ -585,7 +590,8 @@ empty_anchor = "cond_" + "ce" * 16
 dual_cfg = {
     "name": "dual-mode",
     "triggers": [
-        {"id": TID1, "type": "state", "routes": {"conditions": [empty_anchor]}}
+        {"id": TID1, "type": "state", "entity_id": "sensor.a",
+         "routes": {"conditions": [empty_anchor]}}
     ],
     "conditions": [
         {"id": empty_anchor, "type": "or", "conditions": []},
@@ -622,7 +628,7 @@ assert validated["conditions"][2]["conditions"] == ["cond_" + "d2" * 16]
 ok_gate = {
     "name": "gate-route",
     "triggers": [
-        {"id": TID1, "type": "state",
+        {"id": TID1, "type": "state", "entity_id": "sensor.a",
          "routes": {"conditions": ["cond_" + "d0" * 16]}}
     ],
     "conditions": [
@@ -672,8 +678,43 @@ for bad_routes in (
         raise AssertionError(f"routes.outputs must be rejected: {bad_routes}")
     except ControllerValidationError:
         pass
-fresh = validate_trigger({"type": "state"})
+fresh = validate_trigger(
+    {"type": "state", "entity_id": "sensor.a", "routes": {"conditions": []}}
+)
 assert fresh["id"].startswith("trg_") and len(fresh["id"]) == 36, fresh["id"]
+
+# 0.10.0: legacy full-sweep (routes absent) is rejected — every trigger must
+# declare its signal coverage explicitly
+try:
+    validate_trigger({"type": "state", "entity_id": "sensor.a"})
+    raise AssertionError("routes-absent (legacy full-sweep) trigger must be rejected")
+except ControllerValidationError:
+    pass
+# pool listening is gone: entity_id is required (None / "" / [] all fail)
+for bad_ent in (None, "", []):
+    try:
+        validate_trigger(
+            {"type": "state", "routes": {"conditions": []}, "entity_id": bad_ent}
+        )
+        raise AssertionError(f"pool-listening trigger must be rejected: {bad_ent!r}")
+    except ControllerValidationError:
+        pass
+# multi-entity: str | list[str] both accepted; list entries validated+deduped
+multi = validate_trigger({
+    "type": "state",
+    "routes": {"conditions": []},
+    "entity_id": ["switch.a", "sensor.b", "switch.a"],
+})
+assert multi["entity_id"] == ["switch.a", "sensor.b"], multi["entity_id"]
+single = validate_trigger({
+    "type": "state", "routes": {"conditions": []}, "entity_id": " switch.a ",
+})
+assert single["entity_id"] == "switch.a", single["entity_id"]
+try:
+    validate_trigger({"type": "state", "routes": {"conditions": []}, "entity_id": [42]})
+    raise AssertionError("non-string entity list must be rejected")
+except ControllerValidationError:
+    pass
 
 try:
     _validate_condition({"id": CID2, "type": "time", "at": "07:30"})
@@ -710,7 +751,8 @@ assert tm_cond["for"] == {"hours": 0, "minutes": 2, "seconds": 0}, tm_cond
 bad = {
     "name": "bad-routes",
     "triggers": [
-        {"id": TID1, "type": "state", "routes": {"conditions": ["cond_" + "f" * 32]}}
+        {"id": TID1, "type": "state", "entity_id": "sensor.a",
+         "routes": {"conditions": ["cond_" + "f" * 32]}}
     ],
     "conditions": [],
     "outputs": [
@@ -817,6 +859,179 @@ def _log_tail(recs, controller_id="ctrl_smoke01"):
     return _log_cycles(controller_id)[len(recs):]
 
 
+# ---------------------------------------------------------------------------
+# 2b) v6→v7 migration (0.10.0 causal explicitness): the materialized coverage
+# equals the legacy full-sweep evaluation face; the materialized entity_id
+# equals the original pool listening face.
+# ---------------------------------------------------------------------------
+
+v7_leaf_a = "cond_" + "a1" * 16   # state switch.c on (reached via the group)
+v7_leaf_b = "cond_" + "b1" * 16   # numeric sensor.a above 5 (direct chain)
+v7_dur_leaf = "cond_" + "c1" * 16
+v7_dur = "cond_" + "d1" * 16      # duration gate driven via its start leaf
+v7_set_leaf = "cond_" + "e1" * 16
+v7_flag = "cond_" + "f1" * 16     # flag driven via its set leaf
+v7_empty_g = "cond_" + "01" * 16  # empty-group chain (dead anchor)
+v7_grp = "cond_" + "11" * 16      # member-carrying group (never signal-covered)
+v7_o1 = "ssc_" + "2" * 32
+v7_o2 = "ssc_" + "3" * 32
+v7_o3 = "ssc_" + "4" * 32
+v7_o4 = "ssc_" + "5" * 32
+v7_trg = "trg_" + "6" * 32
+v7_cfg = {
+    "name": "v6-legacy",
+    "conditions": [
+        {"id": v7_leaf_a, "type": "state", "entity_id": "switch.c", "state": "on"},
+        {"id": v7_leaf_b, "type": "numeric_state", "entity_id": "sensor.a", "above": 5},
+        {"id": v7_dur_leaf, "type": "state", "entity_id": "switch.d", "state": "on"},
+        {"id": v7_dur, "type": "duration", "seconds": 5, "start": v7_dur_leaf, "abort": None},
+        {"id": v7_set_leaf, "type": "state", "entity_id": "switch.e", "state": "on"},
+        {"id": v7_flag, "type": "flag", "set_conditions": [v7_set_leaf], "reset_conditions": []},
+        {"id": v7_empty_g, "type": "or", "conditions": []},
+        {"id": v7_grp, "type": "or", "conditions": [v7_leaf_a]},
+    ],
+    "outputs": [
+        {"name": "o1", "type": "switch", "entity_id": v7_o1,
+         "on_conditions": [v7_grp], "off_conditions": [v7_leaf_b]},
+        {"name": "o2", "type": "switch", "entity_id": v7_o2,
+         "on_conditions": [v7_dur], "off_conditions": []},
+        {"name": "o3", "type": "binary_sensor", "entity_id": v7_o3,
+         "on_conditions": [v7_flag], "off_conditions": []},
+        {"name": "o4", "type": "switch", "entity_id": v7_o4,
+         "on_conditions": [v7_empty_g], "off_conditions": []},
+    ],
+    "sensors": [{"entity_id": "switch.c"}, {"entity_id": "switch.d"},
+                {"entity_id": "switch.e"}, {"entity_id": "sensor.a"}],
+    # born legacy (no routes) + pool listener (no entity_id) — exactly the
+    # two deprecated shapes the v7 migration exists to materialize
+    "triggers": [{"id": v7_trg, "type": "state", "enabled": True}],
+}
+v7_snapshot = _copy.deepcopy(v7_cfg)
+_migrate_controller_v7(v7_cfg)
+# coverage: leaves only — group/duration/flag ids are excluded (schema rejects
+# them as signal origins; an empty group would flip into a pass-through
+# anchor and invert its verdict), yet every driving leaf stays reachable via
+# group members, the duration start edge and the flag set edge
+v7_cov = set(v7_cfg["triggers"][0]["routes"]["conditions"])
+assert v7_cov == {v7_leaf_a, v7_leaf_b, v7_dur_leaf, v7_set_leaf}, v7_cov
+# listening face: the whole pool, verbatim (pool order preserved)
+assert v7_cfg["triggers"][0]["entity_id"] == [
+    "switch.c", "switch.d", "switch.e", "sensor.a"
+], v7_cfg["triggers"][0]["entity_id"]
+validate_controller(v7_cfg)
+# evaluation face = the legacy full sweep: every output whose chain can flip
+# is woken by the single migrated trigger — o1 (group/state chains), o2
+# (duration via its start leaf), o3 (flag via its set leaf); o4 (empty-group
+# chain) is the documented hold-frozen exception (README 0.7.0 note ②). No
+# group may flip into a signal anchor: verdicts must stay byte-identical.
+mgr_v7 = ControllerManager(_Hass(), "ctrl_smoke12", v7_cfg)
+assert mgr_v7.engine.signal_group_ids == set(), mgr_v7.engine.signal_group_ids
+assert mgr_v7._trg_targets[v7_trg] == {v7_o1, v7_o2, v7_o3}, mgr_v7._trg_targets
+# dispatch form: the Store chain v6→7 runs the same migration
+migrated7 = asyncio.run(
+    store._async_migrate_func(6, 1, {"controllers": {"ctrl_x": v7_snapshot}})
+)
+m7 = migrated7["controllers"]["ctrl_x"]
+assert set(m7["triggers"][0]["routes"]["conditions"]) == v7_cov
+assert m7["triggers"][0]["entity_id"] == [
+    "switch.c", "switch.d", "switch.e", "sensor.a"
+]
+validate_controller(m7)
+# pool-empty store: materializes to an empty list and lands invalid (visible
+# fix-up) — the trigger was a never-firing registration error in v6 anyway
+v7_empty_pool = {
+    "name": "empty-pool",
+    "conditions": [
+        {"id": v7_leaf_a, "type": "state", "entity_id": "switch.c", "state": "on"}
+    ],
+    "outputs": [],
+    "sensors": [],
+    "triggers": [{"id": v7_trg, "type": "state", "enabled": True}],
+}
+_migrate_controller_v7(v7_empty_pool)
+assert v7_empty_pool["triggers"][0]["entity_id"] == []
+try:
+    validate_controller(v7_empty_pool)
+    raise AssertionError("pool-empty migrated store must land invalid")
+except ControllerValidationError:
+    pass
+print("[PASS] v6→v7 migration: coverage=leaf set, entity_id=pool, faces preserved")
+
+# WHA-F-309: a DISABLED pool listener on an empty pool is a legal v6 shape —
+# the migration materializes entity_id=[] and the schema keeps the controller
+# valid and the trigger inert (it never registers); ENABLED triggers still
+# require entities.
+v7_disabled_pool = {
+    "name": "disabled-empty-pool",
+    "conditions": [
+        {"id": v7_leaf_a, "type": "state", "entity_id": "switch.c", "state": "on"}
+    ],
+    "outputs": [
+        {"name": "o1", "type": "switch", "entity_id": v7_o1,
+         "on_conditions": [v7_leaf_a], "off_conditions": []},
+    ],
+    "sensors": [],
+    "triggers": [
+        {"id": v7_trg, "type": "state", "enabled": False},
+        {"id": "trg_" + "7" * 32, "type": "time", "every_seconds": 60,
+         "routes": {"conditions": [v7_leaf_a]}},
+    ],
+}
+_migrate_controller_v7(v7_disabled_pool)
+assert v7_disabled_pool["triggers"][0]["entity_id"] == [], (
+    v7_disabled_pool["triggers"][0]
+)
+v7_validated = validate_controller(v7_disabled_pool)
+assert v7_validated["triggers"][0]["entity_id"] == [], v7_validated["triggers"][0]
+assert v7_validated["triggers"][0]["routes"]["conditions"] == [v7_leaf_a], (
+    v7_validated["triggers"][0]
+)
+try:
+    validate_controller({
+        **v7_disabled_pool,
+        "triggers": [{"id": v7_trg, "type": "state", "enabled": True}],
+    })
+    raise AssertionError("ENABLED pool-empty trigger must stay rejected")
+except ControllerValidationError:
+    pass
+print("[PASS] WHA-F-309: disabled pool listener on empty pool stays valid+inert")
+
+# WHA-F-310: pre-0.5 stores (no triggers key) — the mapped scan-interval
+# trigger is born DIRECTED: routes materialize the same signal-leaf set the
+# v7 migration uses, the shape passes validate_trigger, the id is derived
+# deterministically from the config (stable across loads of a never-re-saved
+# store), and the validated config round-trips (the PUT / whole-table-save /
+# reload sequence that used to 400 and land the controller invalid).
+pre05 = {
+    "name": "pre05-legacy",
+    "scan_interval": 30,
+    "conditions": [
+        {"id": v7_leaf_a, "type": "state", "entity_id": "switch.c", "state": "on"},
+        {"id": v7_leaf_b, "type": "numeric_state", "entity_id": "sensor.a", "above": 5},
+    ],
+    "outputs": [
+        {"name": "o1", "type": "switch", "entity_id": v7_o1,
+         "on_conditions": [v7_leaf_a], "off_conditions": [v7_leaf_b]},
+    ],
+    "sensors": [{"entity_id": "switch.c"}, {"entity_id": "sensor.a"}],
+    # no triggers key — the pre-0.5 shape
+}
+pre05_mapped = validate_controller(_copy.deepcopy(pre05))
+pre05_trg = pre05_mapped["triggers"][0]
+assert pre05_trg["type"] == "time" and pre05_trg["every_seconds"] == 30, pre05_trg
+assert pre05_trg["routes"] == {"conditions": sorted([v7_leaf_a, v7_leaf_b])}, (
+    pre05_trg["routes"]
+)
+pre05_id = pre05_trg["id"]
+assert pre05_id.startswith("trg_") and len(pre05_id) == 36, pre05_id
+assert validate_controller(_copy.deepcopy(pre05))["triggers"][0]["id"] == pre05_id, (
+    "the mapped trigger id must be deterministic across loads"
+)
+pre05_rt = validate_controller(_copy.deepcopy(pre05_mapped))
+assert pre05_rt["triggers"][0] == pre05_trg, pre05_rt["triggers"][0]
+print("[PASS] WHA-F-310: pre-0.5 scan-interval mapping is born directed + stable")
+
+
 async def main():
     cond_a = "cond_" + "a" * 32  # numeric_state above 20 (False for 16.7)
     cond_b = "cond_" + "b" * 32  # switch.c on (True)
@@ -834,11 +1049,13 @@ async def main():
             {
                 "id": trg_wired,
                 "type": "state",
+                "entity_id": "switch.c",
                 "routes": {"conditions": [cond_b]},
             },
             {
                 "id": trg_a_only,
                 "type": "state",
+                "entity_id": "switch.c",
                 "routes": {"conditions": [cond_a]},
             },
             {"id": trg_empty, "type": "time", "every_seconds": 300, "routes": {"conditions": []}},
@@ -1774,6 +1991,7 @@ async def main():
     late_cfg = {
         "name": "late-batch", "enabled": True, "logging_enabled": True,
         "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                      "entity_id": "switch.c",
                       "routes": {"conditions": [x2_id]}}],
         "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
@@ -1833,6 +2051,7 @@ async def main():
     u_cfg = {
         "name": "unload-guard", "enabled": True, "logging_enabled": True,
         "triggers": [{"id": "trg_" + "7" * 32, "type": "state",
+                      "entity_id": "switch.c",
                       "routes": {"conditions": [u_cond]}}],
         "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
@@ -1962,9 +2181,150 @@ async def main():
         _Hass(), [{"id": "trg_" + "8" * 32, "type": "state", "enabled": True}],
         lambda tid, desc: None,
     )
-    tm_ep.async_setup([])  # empty sensor pool → no targets
-    assert tm_ep.register_errors == 1, "empty-pool state trigger must be an error"
-    print("[PASS] empty-pool state trigger counts as registration error (R5-9)")
+    tm_ep.async_setup()  # 0.10.0: no declared entities → no targets
+    assert tm_ep.register_errors == 1, "entity-less state trigger must be an error"
+    print("[PASS] entity-less state trigger counts as registration error (R5-9)")
+
+    # WHA-F-312: the other defensive skip paths count too — same口径 as R5-9
+    # (a trigger that can never register must surface on the panel badge)
+    tm_t0 = TriggerManager(
+        _Hass(),
+        [{"id": "trg_" + "b" * 32, "type": "time", "every_seconds": 0}],
+        lambda tid, desc: None,
+    )
+    tm_t0.async_setup()
+    assert tm_t0.register_errors == 1, "unregistrable time trigger must be an error"
+    tm_uk = TriggerManager(
+        _Hass(), [{"id": "trg_" + "c" * 32, "type": "poltergeist"}],
+        lambda tid, desc: None,
+    )
+    tm_uk.async_setup()
+    assert tm_uk.register_errors == 1, "unknown trigger type must be an error"
+    print("[PASS] defensive skip paths count as registration errors (WHA-F-312)")
+
+    # WHA-F-309 runtime face: the migrated disabled-pool-empty controller is
+    # valid; the disabled trigger registers NOTHING (no listener, no error)
+    # while the other trigger and the output keep working.
+    f309_leaf = "cond_" + "c" * 32  # switch.c on → True (stub state)
+    f309_out = "ssc_" + "9" * 32
+    f309_cfg = {
+        "name": "f309", "enabled": True, "logging_enabled": True,
+        "triggers": [
+            {"id": "trg_" + "9" * 32, "type": "state", "enabled": False},
+            {"id": "trg_" + "a" * 32, "type": "time", "every_seconds": 300,
+             "routes": {"conditions": [f309_leaf]}},
+        ],
+        "sensors": [],
+        "conditions": [
+            {"id": f309_leaf, "type": "state", "entity_id": "switch.c", "state": "on"},
+        ],
+        "outputs": [{
+            "name": "out_f309", "type": "switch", "entity_id": f309_out,
+            "on_conditions": [f309_leaf], "off_conditions": [],
+        }],
+    }
+    _migrate_controller_v7(f309_cfg)
+    f309_valid = _vc(f309_cfg)
+    assert f309_valid["triggers"][0]["entity_id"] == [], f309_valid["triggers"][0]
+    state_before = len([e for e in _Evt.LISTENERS if e[0] == "state"])
+    interval_before = len([e for e in _Evt.LISTENERS if e[0] == "interval"])
+    mgr_f309 = ControllerManager(_Hass(), "ctrl_smoke14", f309_valid)
+    await mgr_f309.async_setup()
+    ent_f309 = _Entity("switch.f309")
+    mgr_f309.register_entity(f309_out, ent_f309)
+    assert len([e for e in _Evt.LISTENERS if e[0] == "state"]) == state_before, (
+        "the disabled pool listener must not register any listener"
+    )
+    assert mgr_f309.trigger_manager.register_errors == 0, (
+        "a disabled trigger must not count as a registration error"
+    )
+    interval_ls = [e for e in _Evt.LISTENERS if e[0] == "interval"]
+    assert len(interval_ls) == interval_before + 1, (
+        "the time trigger must still register"
+    )
+    recs_f309 = _log_cycles("ctrl_smoke14")
+    interval_ls[-1][1](None)
+    mgr_f309._async_debounced_evaluate(None)
+    await asyncio.sleep(0.05)
+    tail_f309 = _log_tail(recs_f309, "ctrl_smoke14")
+    assert len(tail_f309) == 1 and tail_f309[0]["output"] == "out_f309", tail_f309
+    assert tail_f309[0]["decision"] == "on" and tail_f309[0]["applied"] is True, (
+        tail_f309[0]
+    )
+    mgr_f309.async_unload()
+    print("[PASS] WHA-F-309 runtime: disabled pool listener inert, rest works")
+
+    # ------------------------------------------------------------------
+    # 0.10.0 causal explicitness: a multi-entity state trigger registers ONE
+    # listener for the whole list (native list form, HA 2026.1.3 verified),
+    # the firing entity + its change land in the decision log's
+    # triggered_by, and every record carries the per-condition verdicts.
+    # ------------------------------------------------------------------
+    ce_a = "cond_" + "a" * 32  # numeric sensor.a above 20 (False: 16.7)
+    ce_b = "cond_" + "b" * 32  # switch.c on (True)
+    ce_out = "ssc_" + "7" * 32
+    ce_trg = "trg_" + "e" * 32
+    ce_cfg = {
+        "name": "causal", "enabled": True, "logging_enabled": True,
+        "triggers": [{
+            "id": ce_trg, "type": "state", "enabled": True,
+            "entity_id": ["switch.c", "switch.d"],
+            "routes": {"conditions": [ce_b]},
+        }],
+        "sensors": [{"entity_id": "sensor.a"}, {"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": ce_a, "type": "numeric_state", "entity_id": "sensor.a", "above": 20},
+            {"id": ce_b, "type": "state", "entity_id": "switch.c", "state": "on"},
+        ],
+        "outputs": [{
+            "name": "out_ce", "type": "switch", "entity_id": ce_out,
+            "on_conditions": [ce_a, ce_b], "off_conditions": [],
+            "manual_override": False,
+        }],
+    }
+    mgr_ce = ControllerManager(
+        _Hass(), "ctrl_smoke13", _vc(json.loads(json.dumps(ce_cfg)))
+    )
+    await mgr_ce.async_setup()
+    ent_ce = _Entity("switch.ce")
+    mgr_ce.register_entity(ce_out, ent_ce)
+    state_ls = [e for e in _Evt.LISTENERS if e[0] == "state"]
+    assert state_ls and state_ls[-1][1] == ["switch.c", "switch.d"], (
+        "the whole entity list must reach async_track_state_change_event"
+    )
+    from types import SimpleNamespace as _NS
+
+    def _state_event(eid, old, new):
+        return _NS(data={
+            "entity_id": eid,
+            "old_state": _NS(state=old, attributes={}) if old else None,
+            "new_state": _NS(state=new, attributes={}) if new else None,
+        })
+
+    action = state_ls[-1][2]
+    recs_ce = _log_cycles("ctrl_smoke13")
+    action(_state_event("switch.c", "off", "on"))
+    mgr_ce._async_debounced_evaluate(None)
+    await asyncio.sleep(0.05)
+    tail_ce = _log_tail(recs_ce, "ctrl_smoke13")
+    assert len(tail_ce) == 1, tail_ce
+    assert "switch.c: off→on" in tail_ce[0]["triggered_by"], tail_ce[0]
+    # per-condition verdicts of the evaluated chain are in the record
+    assert tail_ce[0]["conditions"] == {ce_a: False, ce_b: True}, tail_ce[0]
+    # a change on the SECOND list entity fires too (per-event matching —
+    # from/to semantics unchanged for lists)
+    recs_ce = _log_cycles("ctrl_smoke13")
+    action(_state_event("switch.d", "on", "off"))
+    mgr_ce._async_debounced_evaluate(None)
+    await asyncio.sleep(0.05)
+    tail_ce = _log_tail(recs_ce, "ctrl_smoke13")
+    assert len(tail_ce) == 1, tail_ce
+    assert "switch.d: on→off" in tail_ce[0]["triggered_by"], tail_ce[0]
+    mgr_ce.async_unload()
+    print(
+        "[PASS] causal log: multi-entity listener, entity+change in "
+        "triggered_by, conditions detail"
+    )
 
     # ------------------------------------------------------------------
     # 0.9.0 review R1-7 + R5-7/R5-8: remove_controller detaches memory and

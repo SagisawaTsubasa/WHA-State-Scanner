@@ -9,10 +9,14 @@ moment a gate can flip on its own.
 Since 0.6.0 evaluation is *directed*; since 0.7.0 triggers carry only
 ``routes.conditions`` (the gates their canvas wires cover) and wake the
 outputs those chains reach — outputs are driven purely by condition
-chains (routes absent → legacy evaluate-everything; covering no gate →
-wakes nothing). Timed wakeups (FOR/duration expiry, debounce quiet
-points, cooldown ends, time-range/sun edges) are directed too, via a
-precomputed condition→outputs reverse index.
+chains. Timed wakeups (FOR/duration expiry, debounce quiet points,
+cooldown ends, time-range/sun edges) are directed too, via a precomputed
+condition→outputs reverse index. Since 0.10.0 the routes-optional legacy
+full sweep is config-level deprecated (schema requires routes; the
+in-code legacy branch only remains as a defensive path for unknown
+trigger ids), and every logged record carries the firing trigger's
+entity/change description plus the per-condition verdicts of the
+evaluated chains (``record["conditions"]``).
 """
 
 from __future__ import annotations
@@ -170,11 +174,9 @@ class ControllerManager:
         The first evaluation is deferred until the platform entities have
         been registered (see ``async_entity_added``) so it does not idle.
         """
-        pool_ids = [
-            s.get("entity_id") for s in self.sensors
-            if isinstance(s, dict) and s.get("entity_id")
-        ]
-        self.trigger_manager.async_setup(pool_ids)
+        # 0.10.0: triggers declare their entities explicitly (the sensor
+        # pool is no longer a listening fallback), so nothing is passed in.
+        self.trigger_manager.async_setup()
         self.hass.async_create_task(self.logger.async_cleanup())
         # Fallback for the init gate: async_entity_added fires per output,
         # but HA swallows per-entity add failures — one broken output would
@@ -587,14 +589,8 @@ class ControllerManager:
         on_ids = out_cfg.get("on_conditions", [])
         off_ids = out_cfg.get("off_conditions", [])
 
-        on_details: dict[str, bool] | None = None
-        off_details: dict[str, bool] | None = None
-        if detailed:
-            on_met, on_details = await self.engine.evaluate_detailed(on_ids, out_id)
-            off_met, off_details = await self.engine.evaluate_detailed(off_ids, out_id)
-        else:
-            on_met = await self.engine.evaluate_any(on_ids, out_id)
-            off_met = await self.engine.evaluate_any(off_ids, out_id)
+        on_met, on_details = await self.engine.evaluate_detailed(on_ids, out_id)
+        off_met, off_details = await self.engine.evaluate_detailed(off_ids, out_id)
 
         decision = "hold"
         applied = False
@@ -625,6 +621,10 @@ class ControllerManager:
             "applied": applied,
             "override": overridden,
             "readings": readings,
+            # 0.10.0 causal detail: per-condition verdicts of the evaluated
+            # chains (same code path as before — evaluate_detailed only adds
+            # the trace dict), so the decision log answers "why" per cycle.
+            "conditions": {**on_details, **off_details},
         }
 
         self.last_results[out_id] = {

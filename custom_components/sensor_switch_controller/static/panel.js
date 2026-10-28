@@ -54,7 +54,7 @@ const LANG = {
     portReset: "复位",
     trgBadgeLegacy: "全量",
     trgBadgeDead: "死",
-    trgBadgeDeadHint: "该触发器已定向但未连任何条件：它不会评估任何输出。连上条件，或保持遗留全量（删掉它的定向状态）。",
+    trgBadgeDeadHint: "该触发器已定向但未连任何条件：它不会评估任何输出。请在画布把信号线连到条件。",
     trgDeadConfirm: "有已启用但未连任何条件的定向触发器（保存后不会评估任何输出）。仍要保存吗？\n确定=保存；取消=返回修改。",
     outputs: "输出",
     lastEval: "上次评估",
@@ -103,6 +103,7 @@ const LANG = {
     query: "查询",
     time: "时间",
     readouts: "读数",
+    logConditions: "条件明细",
     all: "全部",
     saved: "已保存，控制器重载中",
     sensorEntity: "实体 ID",
@@ -120,7 +121,9 @@ const LANG = {
     triggerSun: "太阳触发",
     triggerSunEvent: "太阳事件",
     triggerStart: "HA 启动（重载也会触发）",
-    triggerEntity: "实体（留空=整个传感器池）",
+    triggerEntity: "触发实体（必填）",
+    triggerEntityHint: "支持逗号分隔多个实体",
+    triggerNEntities: "%d 个实体",
     triggerAttribute: "attribute",
     triggerFrom: "从状态（可选）",
     triggerTo: "到状态（可选）",
@@ -210,7 +213,7 @@ const LANG = {
     portReset: "reset",
     trgBadgeLegacy: "ALL",
     trgBadgeDead: "DEAD",
-    trgBadgeDeadHint: "This directed trigger has no conditions wired: it evaluates nothing. Wire a condition, or keep it legacy (clear its directed state).",
+    trgBadgeDeadHint: "This directed trigger has no conditions wired: it evaluates nothing. Wire a condition on the canvas.",
     trgDeadConfirm: "An enabled directed trigger has no conditions wired (it will evaluate nothing). Save anyway?\nOK = save; Cancel = go back.",
     outputs: "Outputs",
     lastEval: "Last evaluation",
@@ -259,6 +262,7 @@ const LANG = {
     query: "Query",
     time: "Time",
     readouts: "Readings",
+    logConditions: "Conditions",
     all: "All",
     saved: "Saved, controller reloading",
     sensorEntity: "Entity ID",
@@ -276,7 +280,9 @@ const LANG = {
     triggerSun: "Sun",
     triggerSunEvent: "Sun event",
     triggerStart: "HA start (also fires on reload)",
-    triggerEntity: "Entity (empty = whole pool)",
+    triggerEntity: "Trigger entity (required)",
+    triggerEntityHint: "Comma-separate multiple entities",
+    triggerNEntities: "%d entities",
     triggerAttribute: "attribute",
     triggerFrom: "From state (optional)",
     triggerTo: "To state (optional)",
@@ -1561,7 +1567,9 @@ class ScannerPanel extends HTMLElement {
   _triggerSummary(t) {
     let detail = "";
     if (t.type === "state") {
-      detail = t.entity_id || this.tr("triggerEntity");
+      detail = Array.isArray(t.entity_id)
+        ? this.tr("triggerNEntities").replace("%d", String(t.entity_id.length))
+        : t.entity_id || this.tr("triggerEntity");
       if (t.attribute) detail += ` · ${t.attribute}`;
     } else if (t.type === "time") {
       detail = t.at
@@ -1579,11 +1587,17 @@ class ScannerPanel extends HTMLElement {
 
   _addTriggerNode(type) {
     const ed = this._editor;
-    // born legacy (0.9.0 M4): routes key ABSENT = evaluate-everything,
-    // matching REST-created triggers and the legacy badge. Panel-created
-    // empty-coverage triggers used to be dead on arrival (routes: []).
-    const t = { id: `trg_${uidHex()}`, type, label: "", enabled: true };
-    ed.legacyTrgIds.add(t.id);
+    // 0.10.0: legacy full-sweep (routes absent) is rejected by the schema,
+    // so panel-created triggers are born directed-empty — the red badge and
+    // the save confirm point at the missing wire until one is drawn
+    // (explicit causality; supersedes the 0.9.0 M4 born-legacy choice).
+    const t = {
+      id: `trg_${uidHex()}`,
+      type,
+      label: "",
+      enabled: true,
+      routes: { conditions: [] },
+    };
     if (type === "time") t.every_seconds = 300;
     if (type === "sun") t.event = "sunrise";
     if (type === "state") t.entity_id = "";
@@ -1687,10 +1701,14 @@ class ScannerPanel extends HTMLElement {
     const ents = Object.keys(this._hass?.states || {}).sort();
     let fields = "";
     if (t.type === "state") {
+      const entVal = Array.isArray(t.entity_id)
+        ? t.entity_id.join(", ")
+        : t.entity_id ?? "";
       fields = `
         <div class="field"><span>${esc(this.tr("triggerEntity"))}</span>
-          <input class="wha-input" list="wha-trg-ents-insp" data-trgsk="entity_id" data-epick value="${esc(t.entity_id ?? "")}">
+          <input class="wha-input" list="wha-trg-ents-insp" data-trgsk="entity_id" data-epick value="${esc(entVal)}">
           <datalist id="wha-trg-ents-insp">${ents.map((e) => `<option value="${esc(e)}">`).join("")}</datalist>
+          <p class="wha-sub">${esc(this.tr("triggerEntityHint"))}</p>
         </div>
         ${fi("attribute", this.tr("triggerAttribute"), "", t.attribute ?? "")}
         ${fi("from", this.tr("triggerFrom"), "", t.from ?? "")}
@@ -2282,6 +2300,15 @@ class ScannerPanel extends HTMLElement {
         input.addEventListener("change", () => {
           const k = input.dataset.trgsk;
           let v = input.type === "checkbox" ? input.checked : input.value.trim();
+          if (k === "entity_id") {
+            // 0.10.0 multi-entity: a comma-separated input becomes a list
+            // (a single entity stays a string so existing stores round-trip)
+            const parts = String(v)
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            v = parts.length > 1 ? parts : parts[0] || "";
+          }
           if (k === "every_seconds" || k === "offset") {
             if (v === "") {
               delete t[k];
@@ -2766,6 +2793,13 @@ class ScannerPanel extends HTMLElement {
           <td>${r.applied ? "✓" : "—"}${r.override ? " ✋" : ""}</td>
           <td class="wha-sub">${esc(r.triggered_by || "—")}</td>
           <td>
+            ${r.conditions && Object.keys(r.conditions).length
+              ? `<details class="wha-json"><summary>${esc(this.tr("logConditions"))}</summary>
+                  <pre>${esc(JSON.stringify(r.conditions, null, 2))}</pre>
+                </details>`
+              : "—"}
+          </td>
+          <td>
             <details class="wha-json"><summary>${esc(this.tr("readouts"))}</summary>
               <pre>${esc(JSON.stringify(r.readings || {}, null, 2))}</pre>
             </details>
@@ -2778,7 +2812,7 @@ class ScannerPanel extends HTMLElement {
       ${rows
         ? `<table class="wha-table"><thead><tr>
             <th>${esc(this.tr("time"))}</th><th>${esc(this.tr("outputs"))}</th><th>${esc(this.tr("decision"))}</th>
-            <th>on_met</th><th>off_met</th><th>applied</th><th>${esc(this.tr("byLabel"))}</th><th>${esc(this.tr("readouts"))}</th>
+            <th>on_met</th><th>off_met</th><th>applied</th><th>${esc(this.tr("byLabel"))}</th><th>${esc(this.tr("logConditions"))}</th><th>${esc(this.tr("readouts"))}</th>
           </tr></thead><tbody>${rows}</tbody></table>`
         : `<p class="wha-sub">${esc(this.tr("logsEmpty"))}</p>`}`;
   }
