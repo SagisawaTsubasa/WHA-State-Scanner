@@ -163,6 +163,7 @@ const LANG = {
     observeUnavailable: "实时状态不可用（观察端点失败），请查看日志",
     observeUnavailableShort: "观察不可用",
     logRetryHint: "（可点「查询」重试）",
+    hassNotReady: "hass 未就绪",
     weekdaysLabel: "星期几",
     byLabel: "触发来源",
     enabledLabel: "启用",
@@ -325,7 +326,7 @@ const LANG = {
     observeUnavailable: "Live status unavailable (observe endpoint failed) — check the log",
     observeUnavailableShort: "observe unavailable",
     logRetryHint: " (click Query to retry)",
-    logRetryHint: " (click Query to retry)",
+    hassNotReady: "hass not ready",
     weekdaysLabel: "Weekdays",
     byLabel: "By",
     enabledLabel: "Enabled",
@@ -558,7 +559,7 @@ class ScannerPanel extends HTMLElement {
 
   async _api(method, path, body, timeoutMs) {
     const hass = this._hass;
-    if (!hass?.fetchWithAuth) throw new Error(" hass 未就绪");
+    if (!hass?.fetchWithAuth) throw new Error(this.tr("hassNotReady"));
     const controller = timeoutMs ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {

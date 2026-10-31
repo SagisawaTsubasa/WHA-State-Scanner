@@ -11,7 +11,7 @@
 ## 功能 / Features
 
 - **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
-- **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，试运行实时染色（绿=满足/红=不满足/输出徽章显示决策）
+- **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，试运行只读染色（绿=满足/红=不满足，不动作不写日志），「立即评估」确认后才真实动作（输出徽章显示决策）
 - **触发器可连线路由（0.7.0，0.10.0 起强制显式）** — 触发器是画布上的信号源：信号线连到条件或逻辑组的「信号」口开始评估；信号覆盖了哪些门，就沿链唤醒哪些输出；未连线=不评估，到期唤醒同样定向（逻辑组：连信号=触发合并贯通，连成员=条件判定）。0.10.0 起遗留全量评估（routes 缺省）与「留空监听整个传感器池」均废弃：routes 与触发实体（可逗号分隔多实体）必须显式声明
 - **传感器池** — 一个控制器可引用任意数量的实体；总览页有全局传感器池视图，共享传感器高亮
 - **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒），支持 `AND`/`OR`/`NOT` 嵌套组合
@@ -23,7 +23,7 @@
 ---
 
 - **Sidebar web panel** — overview / visual flow editor / decision-log viewer, fully built-in, zero CDN
-- **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; trial runs color nodes live (green=met / red=unmet, decision badges on outputs)
+- **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; trial runs color nodes read-only (green=met / red=unmet, no actuation); "evaluate now" actuates behind a confirm (decision badges on outputs)
 - **Sensor pool** — any number of entities per controller; a global pool view highlights sensors shared across controllers
 - **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), plus `AND`/`OR`/`NOT` nesting
 - **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
@@ -72,14 +72,14 @@
 | 视图 / View | 内容 / Content |
 |-------------|----------------|
 | **总览 / Overview** | 控制器卡片（输出实时状态、立即评估、启停、删除）+ 全局传感器池视图 / Controller cards with live output states + global sensor pool view |
-| **编辑器 / Editor** | Drawflow 流程画布：条件/组/输出节点拖线连线，右侧 inspector 编辑参数，顶部保存与试运行 / Flow canvas with condition/group/output nodes, inspector forms, save & trial run |
+| **编辑器 / Editor** | Drawflow 流程画布：条件/组/输出节点拖线连线，右侧 inspector 编辑参数，顶部保存、试运行（只读刷新）与立即评估（确认后动作） / Flow canvas with condition/group/output nodes, inspector forms, save & trial run (read-only refresh) & evaluate-now (actuates behind a confirm) |
 | **决策日志 / Logs** | 按控制器+日期查询 JSONL 决策记录，可按 decision 过滤，读数快照可展开 / Query JSONL records by controller+date, filter by decision, expandable readings |
 
 **编辑器节点语义 / Node semantics:**
 
 - 条件节点（九类叶子 + 逻辑组 AND/OR/NOT）→ 信号线连到普通条件或逻辑组的「信号」口（input_3；持续与输出无信号口）
 - 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
-- **试运行**与正式评估语义完全相同（会实际写输出实体、写决策日志），并把每个条件的满足结果染色到节点上
+- **试运行**是只读刷新（不写输出实体、不写决策日志），把每个条件的当前满足结果染色到节点上；真实评估走「立即评估」按钮（经确认框，会实际写输出实体、写决策日志）
 - 保存后控制器整条重载，FOR 计时器清零
 
 **REST API**（面板使用，亦可脚本调用，均需鉴权）：
@@ -217,6 +217,7 @@ MIT
 - PUT 更新控制器后清扫被删输出/类型切换遗留的注册表幽灵条目（与 DELETE 同款 best-effort）
 - NOT 组下的空组不再发「不贡献」误导告警（恒 True 语义与文档对齐）
 - binary_sensor 输出的 `manual_override` 死键保存时丢弃；面板类型切换时同步清零；触发器「死」徽章扩展覆盖「连了但到不了输出」的路由；日志错误提示文案进双语字典
+- P3 清偿（复验 R2）：README 正文三处同步试运行只读化语义；空组保存告警排除已停用组（引擎侧 disabled 恒 True，不再误报）；面板 en 字典去重、`hass 未就绪` 提示进双语字典；冷却翻转史落盘改 1 秒去抖合并写（突发翻转不再逐次全表重写）；面板卸载不再对已触发的 started 监听 unsub（消除 error_log 噪音）；补 config_flow / binary_sensor / 面板 i18n 测试钉与 F-323/F-324 判别钉
 
 **元数据**
 - `iot_class` 改为 `local_push`（0.5.0 起纯事件驱动）；`force_evaluate` 服务描述与翻译同步（不再提轮询定时器）
