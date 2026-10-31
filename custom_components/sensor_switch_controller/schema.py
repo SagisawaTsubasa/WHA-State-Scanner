@@ -34,6 +34,7 @@ inert — it never registers, WHA-F-309).
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 import uuid
@@ -92,6 +93,8 @@ CTRL_ID_RE = re.compile(r"^ctrl_[0-9a-f]{8}$")
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
 _MAX_LABEL_LEN = 100
 _MAX_TEMPLATE_LEN = 2000
+
+_LOGGER = logging.getLogger(__name__)
 
 LEAF_TYPES = (
     COND_NUMERIC_STATE,
@@ -747,8 +750,15 @@ def _validate_output(out) -> dict:
         "name": name,
         "type": otype,
         "entity_id": out_id,
-        "manual_override": _to_bool(out.get("manual_override", False), "输出的 manual_override"),
     }
+    if otype == OUTPUT_SWITCH:
+        result["manual_override"] = _to_bool(
+            out.get("manual_override", False), "输出的 manual_override"
+        )
+    # else (F-329): binary_sensor has no control surface to lock — the flag
+    # was accepted and persisted with no effect (and resurrected itself on a
+    # switch→binary→switch round-trip), so it is dropped for non-switch
+    # outputs instead of being stored dead.
     for key in ("on_conditions", "off_conditions"):
         members = out.get(key) or []
         if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
@@ -879,6 +889,193 @@ def _flag_branch_verdict(
             verdict = None
     memo[cid] = verdict
     return verdict
+
+
+def _reachable_from_chains(
+    conditions: list[dict],
+    outputs: list[dict],
+    out_ids: list[str],
+    chain_keys: tuple[str, ...],
+    include_flag_edges: bool,
+) -> dict[str, set[str]]:
+    """Per-output reachable condition ids from the named output chains.
+
+    ``include_flag_edges=False`` walks the EVALUATION edges only (group
+    members, duration start/abort): a flag's verdict is a latched read, so
+    its set/reset inputs never influence an output's own verdict and a
+    cooldown hiding in them belongs to the flag-step hazards (already
+    covered by the (b) check above), not to the output-side ones.
+    ``True`` mirrors the runtime routing index —
+    controller._build_route_index walks the same edge set — for the
+    trigger-target reachability warning, so the two can never drift.
+    """
+    by_id = {
+        c.get("id"): c
+        for c in conditions
+        if isinstance(c, dict) and isinstance(c.get("id"), str)
+    }
+    reach: dict[str, set[str]] = {}
+    for out in outputs:
+        if not isinstance(out, dict) or out.get("entity_id") not in out_ids:
+            continue
+        out_id = out["entity_id"]
+        stack: list[str] = []
+        for key in chain_keys:
+            stack.extend(m for m in out.get(key) or [] if isinstance(m, str))
+        seen: set[str] = set()
+        while stack:
+            cid = stack.pop()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            cond = by_id.get(cid)
+            if not cond:
+                continue
+            reach.setdefault(out_id, set()).add(cid)
+            stack.extend(
+                m for m in cond.get("conditions") or [] if isinstance(m, str)
+            )
+            for ref_key in (CONF_START, CONF_ABORT):
+                ref = cond.get(ref_key)
+                if isinstance(ref, str):
+                    stack.append(ref)
+            if include_flag_edges:
+                for flag_key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+                    stack.extend(
+                        m
+                        for m in cond.get(flag_key) or []
+                        if isinstance(m, str)
+                    )
+    return reach
+
+
+def _warn_static_hazards(
+    conditions: list[dict],
+    outputs: list[dict],
+    triggers: list[dict] | None,
+    by_id: dict[str, dict],
+) -> None:
+    """Save-time static hazard warnings — NEVER rejecting (the upgrade
+    compatibility rule is warn-only, same as the flag dead-branch history):
+    existing legal configs must keep saving after an upgrade. Four faces,
+    all judged on the same graph the engine will evaluate:
+
+    ① cooldown on an off-chain — the off-side polarity trap (the defect this
+    batch was filed for): with no flip history the cooldown reads True, and
+    while the output is already off an off verdict applies nothing and so
+    never records a flip — the constant True then out-ranks the on-chain
+    forever (off wins first). ② an output whose only gate is a calendar
+    (F-320): calendar boundaries raise no HA event, wakeups are best-effort.
+    ③ a trigger route wired to a condition no output can reach (F-326) —
+    silently evaluates nothing while the panel still shows it wired. ④ an
+    empty non-signal-anchor group reachable from an output chain (F-327) —
+    constant False (constant True under NOT), only the flag branch warned.
+    """
+    signal_covered = {
+        member
+        for trg in triggers or []
+        for member in (trg.get(CONF_ROUTES) or {}).get("conditions") or []
+    }
+    out_ids = [
+        out["entity_id"]
+        for out in outputs
+        if isinstance(out, dict) and out.get("entity_id")
+    ]
+    eval_chains = ("on_conditions", "off_conditions")
+    off_reach = _reachable_from_chains(
+        conditions, outputs, out_ids, ("off_conditions",), False
+    )
+    chain_reach = _reachable_from_chains(
+        conditions, outputs, out_ids, eval_chains, False
+    )
+    route_reach = _reachable_from_chains(
+        conditions, outputs, out_ids, eval_chains, True
+    )
+    wakeup_types = {
+        COND_TIME,
+        COND_SUN,
+        COND_DURATION,
+        COND_DEBOUNCE,
+        COND_COOLDOWN,
+    }
+
+    for out in outputs:
+        if not isinstance(out, dict) or not out.get("entity_id"):
+            continue
+        out_label = out.get("name") or out["entity_id"]
+        off_ids = chain_reach.get(out["entity_id"], set())
+        # ① off-chain cooldown (warn-only trap defense)
+        for cid in off_reach.get(out["entity_id"], set()):
+            cond = by_id.get(cid)
+            if not cond or cond["type"] != COND_COOLDOWN:
+                continue
+            _LOGGER.warning(
+                "输出「%s」的 off 条件链包含冷却条件「%s」：冷却在无翻转史时恒为 "
+                "True（冷启动/重启/长待机后必现），而输出已处于 off 时 off 判定不"
+                "产生新翻转记录，冷却将持续恒 True 并以 off 优先永久压制 on 链——"
+                "请勿把冷却挂到 off 链（防频翻请挂 on 链或改用持续条件）",
+                out_label,
+                cond.get("label") or cid,
+            )
+        # ② calendar as the only gate of an output (F-320)
+        cal_ids = [
+            cid
+            for cid in off_ids
+            if by_id.get(cid, {}).get("type") == COND_CALENDAR
+        ]
+        if cal_ids:
+            has_other_wakeup = any(
+                by_id.get(cid, {}).get("type") in wakeup_types
+                or cid in signal_covered
+                for cid in off_ids
+                if by_id.get(cid, {}).get("type") != COND_CALENDAR
+            )
+            if not has_other_wakeup:
+                _LOGGER.warning(
+                    "输出「%s」的条件链依赖日历条件「%s」且链上没有其他可唤醒的门："
+                    "日历事件边界不产生 HA 事件，评估只能靠周期心跳兜底（重启后或"
+                    "远期事件的翻转延迟可达心跳间隔）——建议把触发器信号线接到链上"
+                    "的状态类条件",
+                    out_label,
+                    "、".join(
+                        by_id[cid].get("label") or cid for cid in cal_ids
+                    ),
+                )
+        # ④ empty non-signal groups reachable from the chains (F-327)
+        for cid in off_ids:
+            cond = by_id.get(cid)
+            if (
+                not cond
+                or cond["type"] not in GROUP_TYPES
+                or cond.get("conditions")
+                or cid in signal_covered
+            ):
+                continue
+            _LOGGER.warning(
+                "输出「%s」的条件链引用了空逻辑组「%s」：非信号锚点的空组恒为 False"
+                "（NOT 组下反而恒为 True），不会贡献判定——请补成员或取消引用"
+                "（作为触发器信号锚点的空组不受影响）",
+                out_label,
+                cond.get("label") or cid,
+            )
+
+    # ③ trigger routes wired to unreachable conditions (F-326)
+    for trg in triggers or []:
+        routes = trg.get(CONF_ROUTES)
+        if not isinstance(routes, dict):
+            continue
+        trg_label = trg.get("label") or trg.get("id") or "?"
+        for member in routes.get("conditions") or []:
+            if any(member in ids for ids in route_reach.values()):
+                continue
+            member_label = by_id[member].get("label") or member
+            _LOGGER.warning(
+                "触发器「%s」的信号线连到了「%s」，但该条件沿条件图到不了任何"
+                "输出：触发器将不会唤醒任何输出（空转）——请把信号线改连到输出"
+                "链可达的条件",
+                trg_label,
+                member_label,
+            )
 
 
 def _check_graph(
@@ -1076,6 +1273,12 @@ def _check_graph(
                     f"触发器「{label}」的信号线连到了持续门或旗标：两者都不是"
                     "信号起点，请连到具体条件或逻辑组"
                 )
+
+    # Save-time static hazard warnings (never rejecting): the off-chain
+    # cooldown trap, calendar-only outputs, routes to unreachable
+    # conditions, and empty output-chain groups. Warnings only — existing
+    # legal configs must keep saving after an upgrade.
+    _warn_static_hazards(conditions, outputs, triggers, by_id)
 
 
 def validate_controller(data) -> dict:
