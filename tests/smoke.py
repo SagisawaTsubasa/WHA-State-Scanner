@@ -163,6 +163,12 @@ class _Store:
     async def async_save(self, data):
         pass
 
+    def async_delay_save(self, data_func, delay=0):
+        # F-339: the hub's debounced flip-history write lands here; the
+        # no-op stub discards it (same shape as async_save). Pins that must
+        # observe the payload swap in a _RecordingFlagStore.
+        pass
+
 
 ha.helpers.storage.Store = _Store
 ha.helpers.config_validation = _mod("homeassistant.helpers.config_validation")
@@ -2669,6 +2675,12 @@ async def main():
         async def async_save(self, data):
             self.saved.append(data)
 
+        def async_delay_save(self, data_func, delay=0):
+            # F-339 stand-in: flush immediately so the pin below still
+            # observes the payload the debounced write carries (the real
+            # Store merges the burst and calls data_func at write time).
+            self.saved.append(data_func())
+
         async def async_load(self):
             return None
 
@@ -2841,6 +2853,25 @@ async def main():
             f"the unreachable-route warning must NOT repeat for an output-"
             f"chained empty group: {sch_records[n_r:]}"
         )
+        # ③b a DISABLED empty group must NOT warn (F-336): the engine
+        # short-circuits disabled conditions to True, so it is not
+        # constant-False — same false-positive face the flag-side warning
+        # already excludes (F-305)
+        disabled_g = "cond_" + "9" * 32
+        n_r2 = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": disabled_g, "type": "or", "conditions": [],
+             "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1, disabled_g], "off_conditions": []},
+        ]})
+        assert len(sch_records) == n_r2, (
+            "a disabled empty group short-circuits to True in the engine — "
+            f"it must not warn (F-336): {sch_records[n_r2:]}"
+        )
         # ④ calendar as the only gate of an output → warning (the trigger is
         # re-anchored on the calendar condition itself: no other wakeup face)
         cal_id = "cond_" + "f" * 32
@@ -2887,6 +2918,102 @@ async def main():
         "the evaluate-now button must sit behind the action confirm"
     )
     print("[PASS] WHA-F-321: editor preview is read-only, evaluate is confirmed")
+
+    # ------------------------------------------------------------------
+    # WHA-F-323 (discriminating pin): a template evaluation failure warns
+    # once, stays silent inside the rate-limit window, and re-arms after it
+    # — driven through the real evaluate path, not the helper directly.
+    # ------------------------------------------------------------------
+    import logging as _logging
+    import custom_components.sensor_switch_controller.condition_engine as condition_engine_mod  # noqa: E402
+    from custom_components.sensor_switch_controller.condition_engine import (  # noqa: E402
+        _EVAL_FAILURE_WARN_INTERVAL,
+        ConditionEngine,
+    )
+
+    f323_records = []
+
+    class _F323Cap(_logging.Handler):
+        def emit(self, record):
+            f323_records.append(record.getMessage())
+
+    f323_logger = _logging.getLogger(
+        "custom_components.sensor_switch_controller.condition_engine"
+    )
+    _f323_handler = _F323Cap(level=_logging.WARNING)
+    f323_logger.addHandler(_f323_handler)
+    f323_tpl = "cond_" + "t" * 32
+
+    class _BoomTemplate:
+        def __init__(self, s, hass=None):
+            self.s = s
+
+        def async_render(self):
+            raise RuntimeError("boom")
+
+    orig_tpl = condition_engine_mod.Template
+    condition_engine_mod.Template = _BoomTemplate
+    try:
+        f323_eng = ConditionEngine(
+            _Hass(), [{"id": f323_tpl, "type": "template",
+                       "value_template": "{{ boom }}"}]
+        )
+        met, _det = await f323_eng.evaluate_detailed([f323_tpl], None)
+        assert met is False and _det[f323_tpl] is False, (met, _det)
+        assert len(f323_records) == 1 and "failed" in f323_records[0], (
+            f"the first failure must warn once (F-323): {f323_records}"
+        )
+        await f323_eng.evaluate_detailed([f323_tpl], None)
+        assert len(f323_records) == 1, (
+            f"a repeat inside the window must stay silent (F-323): {f323_records}"
+        )
+        _advance_utc(_EVAL_FAILURE_WARN_INTERVAL.total_seconds() + 1)
+        await f323_eng.evaluate_detailed([f323_tpl], None)
+        assert len(f323_records) == 2, (
+            f"the window elapsing must re-arm the warning (F-323): {f323_records}"
+        )
+    finally:
+        condition_engine_mod.Template = orig_tpl
+        f323_logger.removeHandler(_f323_handler)
+    print(
+        "[PASS] WHA-F-323: eval-failure warning fires once, rate-limited, "
+        "re-arms after the window"
+    )
+
+    # ------------------------------------------------------------------
+    # WHA-F-324 (discriminating pin): a corrupt non-dict top-level store
+    # payload passes through the migration untouched (warning, no
+    # AttributeError) so async_load's own guard can degrade it loudly.
+    # ------------------------------------------------------------------
+    f324_records = []
+
+    class _F324Cap(_logging.Handler):
+        def emit(self, record):
+            f324_records.append(record.getMessage())
+
+    f324_logger = _logging.getLogger(
+        "custom_components.sensor_switch_controller.hub"
+    )
+    _f324_handler = _F324Cap(level=_logging.WARNING)
+    f324_logger.addHandler(_f324_handler)
+    _hass_m = _Hass()
+    hub_m = ScannerHub(_hass_m)
+    corrupt = ["not", "a", "dict"]
+    try:
+        migrated = await hub_m.store._async_migrate_func(1, 0, corrupt)
+        assert migrated is corrupt, (
+            "a non-dict top-level payload must pass through untouched "
+            f"(F-324), got {migrated!r}"
+        )
+        assert any("not an object" in m for m in f324_records), (
+            f"the corrupt payload must warn (F-324): {f324_records}"
+        )
+    finally:
+        f324_logger.removeHandler(_f324_handler)
+    print(
+        "[PASS] WHA-F-324: non-dict top-level store payload passes through "
+        "with a warning, no crash"
+    )
 
 asyncio.run(main())
 print("SMOKE OK")

@@ -55,12 +55,69 @@ class _Store:
         self.kwargs = kwargs
         self.saved: list[Any] = []
         self.load_result: Any = {"controllers": {}}
+        self.delayed: list[tuple[Any, float]] = []
 
     async def async_save(self, data: Any) -> None:
         self.saved.append(data)
 
     async def async_load(self) -> Any:
         return self.load_result
+
+    def async_delay_save(self, data_func: Any, delay: float = 0) -> None:
+        """F-339: record the deferred write; the real Store merges the
+        burst in the delay window and calls data_func at write time. Tests
+        flush via ``flush_delayed()`` when they need the payload."""
+
+        self.delayed.append((data_func, delay))
+
+    def flush_delayed(self) -> None:
+        for data_func, _delay in self.delayed:
+            self.saved.append(data_func())
+        self.delayed.clear()
+
+
+class _AbortFlow(Exception):
+    """Mirror of homeassistant.data_entry_flow.AbortFlow: the real
+    ``_abort_if_unique_id_configured`` raises it and the flow manager turns
+    it into an abort result (2026.1.3 config_entries)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _StubConfigFlow:
+    """Minimal mirror of the real ``config_entries.ConfigFlow`` API surface
+    this integration's flow uses (async_set_unique_id /
+    _abort_if_unique_id_configured / async_create_entry / async_show_form;
+    abort semantics = raise AbortFlow, per the 2026.1.3 config_entries).
+    Tests inject ``_configured_ids`` to stand in for the registry-backed
+    uniqueness check."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # the integration subclasses with ``domain=DOMAIN`` — swallow it
+        # (the old lambda-class stub did the same)
+        super().__init_subclass__()
+
+    async def async_set_unique_id(self, unique_id: str) -> None:
+        self._unique_id = unique_id
+
+    def _abort_if_unique_id_configured(
+        self, error: str = "already_configured"
+    ) -> None:
+        if getattr(self, "_unique_id", None) in getattr(
+            self, "_configured_ids", ()
+        ):
+            raise _AbortFlow(error)
+
+    def async_abort(self, reason: str) -> dict:
+        return {"type": "abort", "reason": reason}
+
+    def async_create_entry(self, title: str, data: dict) -> dict:
+        return {"type": "create_entry", "title": title, "data": data}
+
+    def async_show_form(self, step_id: str) -> dict:
+        return {"type": "form", "step_id": step_id}
 
 
 if _INSTALL_STUBS:
@@ -78,12 +135,15 @@ if _INSTALL_STUBS:
     ha.config_entries = _module(
         "homeassistant.config_entries",
         ConfigEntry=MagicMock,
-        ConfigFlow=type(
-            "ConfigFlow",
-            (),
-            {"__init_subclass__": classmethod(lambda cls, **kwargs: None)},
-        ),
+        ConfigFlow=_StubConfigFlow,
         ConfigFlowResult=type("ConfigFlowResult", (), {}),
+    )
+    ha.data_entry_flow = _module(
+        "homeassistant.data_entry_flow",
+        AbortFlow=_AbortFlow,
+        FlowResultType=types.SimpleNamespace(
+            FORM="form", CREATE_ENTRY="create_entry", ABORT="abort"
+        ),
     )
     # 常量钉值照 smoke.py（其语义断言依赖这些值；真实 HA 的值即字面量，
     # __getattr__ 返回名字只适合"值无关"的常量——WHA-F-256）

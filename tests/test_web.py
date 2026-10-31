@@ -237,6 +237,39 @@ def test_started_recheck_rejudges_mode():
     assert PANEL_URL_PATH not in hass.data.get("frontend_panels", {})
 
 
+def test_unload_unsubs_pending_recheck():
+    """F-334 对照面：监听尚未触发（HA 未 started）时，unload 照常 unsub
+    ——此时监听仍在 bus 上，正常移除。"""
+    hass = make_hass()
+    _setup(hass)
+    flags = hass.data[web_mod.WEB_DATA_KEY]
+    calls: list = []
+    flags["started_recheck"] = lambda: calls.append(1)
+    web_mod.async_unload_web(hass)
+    assert calls == [1], "a pending listen_once must be unsubbed on unload"
+    assert flags.get("started_recheck") is None
+
+
+def test_unload_skips_unsub_after_recheck_fired():
+    """F-334 主钉：recheck 已触发后 unload 不得再 unsub——真实 HA 在触发
+    时已自行移除监听（_OneTimeListener.__call__ 先 self.remove()，
+    2026.1.3 core.py），再 unsub 会在 EventBus._async_remove_listener 里
+    ValueError 并把 "Unable to remove unknown job listener" 写进
+    error_log（try/except 治不了：异常在 core 内部被吞并记日志）。"""
+    hass = make_hass()
+    _setup(hass)
+    flags = hass.data[web_mod.WEB_DATA_KEY]
+    calls: list = []
+    flags["started_recheck"] = lambda: calls.append(1)
+    _event_type, recheck = hass.bus.listen_once[0]
+    recheck(None)  # fired → the callback clears the key itself
+    assert flags.get("started_recheck") is None
+    web_mod.async_unload_web(hass)
+    assert calls == [], (
+        "unload must NOT unsub an already-fired listen_once (F-334)"
+    )
+
+
 # ----------------------------------------------------------------------
 # _save_or_rollback (体检 P2-3 / 审查 R5-10, key-granular per 审查 R6-2):
 # single-key rollback + store re-read + reload + re-raise
