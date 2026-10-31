@@ -13,7 +13,7 @@
   "services": {
     "force_evaluate": {
       "name": "Force evaluate",
-      "description": "Immediately evaluate the conditions of one output entity (does not affect the polling timer).",
+      "description": "Immediately evaluate the conditions of one output entity (does not affect trigger scheduling).",
       "fields": {
         "entity_id": {
           "name": "Output entity",

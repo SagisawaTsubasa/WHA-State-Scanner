@@ -41,8 +41,10 @@ const LANG = {
     confirmTitle: "确认操作",
     confirmOk: "确定",
     confirmCancel: "取消",
-    trialDirtyConfirm: "有未保存的修改。试运行将按已保存的配置执行，未保存的修改不会生效。继续？",
+    trialDirtyConfirm: "有未保存的修改。评估与预览都按已保存的配置执行，未保存的修改不会生效。继续？",
     evaluateConfirmBody: "的输出将按当前条件立即动作。确定执行？",
+    refreshLive: "刷新状态",
+    statusRefreshed: "状态已刷新",
     logsEmpty: "该日无决策记录",
     logsTruncated: "已达单次查询上限，可缩小日期范围或调大条数",
     noControllers: "尚无控制器 — 点「新建控制器」开始",
@@ -54,7 +56,7 @@ const LANG = {
     portReset: "复位",
     trgBadgeLegacy: "全量",
     trgBadgeDead: "死",
-    trgBadgeDeadHint: "该触发器已定向但未连任何条件：它不会评估任何输出。请在画布把信号线连到条件。",
+    trgBadgeDeadHint: "该触发器唤醒不到任何输出：未连条件，或所连条件到不了任何输出。请在画布把信号线连到输出链可达的条件。",
     trgDeadConfirm: "有已启用但未连任何条件的定向触发器（保存后不会评估任何输出）。仍要保存吗？\n确定=保存；取消=返回修改。",
     outputs: "输出",
     lastEval: "上次评估",
@@ -66,7 +68,7 @@ const LANG = {
     save: "保存",
     back: "返回总览",
     trialRun: "试运行",
-    trialNeedSave: "试运行按已保存配置执行；当前有未保存的修改，先保存再试运行。",
+    trialNeedSave: "该控制器尚未保存：预览与评估都按已保存配置执行，请先保存。",
     dirtyReload: "保存后控制器将重载，FOR 计时器会清零。",
     addCondition: "添加条件",
     addOutput: "添加输出",
@@ -160,6 +162,7 @@ const LANG = {
     passthrough: "触发合并 · 贯通",
     observeUnavailable: "实时状态不可用（观察端点失败），请查看日志",
     observeUnavailableShort: "观察不可用",
+    logRetryHint: "（可点「查询」重试）",
     weekdaysLabel: "星期几",
     byLabel: "触发来源",
     enabledLabel: "启用",
@@ -200,8 +203,10 @@ const LANG = {
     confirmTitle: "Confirm",
     confirmOk: "OK",
     confirmCancel: "Cancel",
-    trialDirtyConfirm: "You have unsaved changes. The trial runs the SAVED config — unsaved changes will not apply. Continue?",
+    trialDirtyConfirm: "You have unsaved changes. Both evaluation and preview run the SAVED config — unsaved changes will not apply. Continue?",
     evaluateConfirmBody: " will act on current conditions immediately. Run it now?",
+    refreshLive: "Refresh status",
+    statusRefreshed: "Status refreshed",
     logsEmpty: "No decision records for this day",
     logsTruncated: "Query limit reached — narrow the date range or raise the limit",
     noControllers: "No controllers yet — create one to start",
@@ -213,7 +218,7 @@ const LANG = {
     portReset: "reset",
     trgBadgeLegacy: "ALL",
     trgBadgeDead: "DEAD",
-    trgBadgeDeadHint: "This directed trigger has no conditions wired: it evaluates nothing. Wire a condition on the canvas.",
+    trgBadgeDeadHint: "This trigger wakes nothing: no conditions wired, or none of them can reach an output. Wire a chain-reachable condition on the canvas.",
     trgDeadConfirm: "An enabled directed trigger has no conditions wired (it will evaluate nothing). Save anyway?\nOK = save; Cancel = go back.",
     outputs: "Outputs",
     lastEval: "Last evaluation",
@@ -225,7 +230,7 @@ const LANG = {
     save: "Save",
     back: "Back to overview",
     trialRun: "Trial run",
-    trialNeedSave: "Trial runs use the saved config; you have unsaved changes — save first.",
+    trialNeedSave: "This controller is not saved yet: preview and evaluation both run the saved config — save first.",
     dirtyReload: "Saving reloads the controller; FOR timers reset.",
     addCondition: "Add condition",
     addOutput: "Add output",
@@ -319,6 +324,8 @@ const LANG = {
     passthrough: "trigger merge · pass-through",
     observeUnavailable: "Live status unavailable (observe endpoint failed) — check the log",
     observeUnavailableShort: "observe unavailable",
+    logRetryHint: " (click Query to retry)",
+    logRetryHint: " (click Query to retry)",
     weekdaysLabel: "Weekdays",
     byLabel: "By",
     enabledLabel: "Enabled",
@@ -975,7 +982,8 @@ class ScannerPanel extends HTMLElement {
           <label class="field-inline" style="justify-content:center"><input type="checkbox" data-field="logging_enabled" ${config.logging_enabled ? "checked" : ""}> ${esc(this.tr("logging"))}</label>
           <span class="spacer" style="flex:1"></span>
           <button class="wha-btn" data-act="delete-node">${esc(this.tr("deleteSelected"))}</button>
-          <button class="wha-btn" data-act="trial" ${isNew ? "disabled" : ""}>${esc(this.tr("trialRun"))}</button>
+          <button class="wha-btn" data-act="trial" ${isNew ? "disabled" : ""}>${esc(this.tr("refreshLive"))}</button>
+          <button class="wha-btn" data-act="evaluate" ${isNew ? "disabled" : ""}>${esc(this.tr("evaluateNow"))}</button>
           <button class="wha-btn primary" data-act="save">${esc(this.tr("save"))}</button>
           <button class="wha-btn" data-act="back">${esc(this.tr("back"))}</button>
         </div>
@@ -1053,6 +1061,7 @@ class ScannerPanel extends HTMLElement {
     );
     main.querySelector('[data-act="save"]')?.addEventListener("click", () => this._saveEditor());
     main.querySelector('[data-act="trial"]')?.addEventListener("click", () => this._trialRun());
+    main.querySelector('[data-act="evaluate"]')?.addEventListener("click", () => this._evaluateNow());
     main.querySelector('[data-act="back"]')?.addEventListener("click", () => this._nav(""));
     main.querySelector('[data-act="delete-node"]')?.addEventListener("click", () => this._deleteSelected());
     main.querySelectorAll("[data-zoom] [data-z]").forEach((b) =>
@@ -1108,16 +1117,7 @@ class ScannerPanel extends HTMLElement {
           .forEach((el) => el.remove());
         // trial artifacts too, symmetric with the success path (WHA-F-232)
         if (this._editor?.trial) {
-          this._editor.trial = null;
-          this.shadowRoot
-            ?.querySelector("[data-inspector] details.wha-json")
-            ?.remove();
-          for (const nodeId of this._editor.outToNode.values()) {
-            const badge = this._editor.df?.container?.querySelector(
-              `#node-${nodeId} [data-badge]`
-            );
-            if (badge) badge.style.display = "none";
-          }
+          this._clearTrialArtifacts(this._editor);
         }
         return;
       }
@@ -1131,17 +1131,10 @@ class ScannerPanel extends HTMLElement {
 
         this._observeWarned = false;
         if (ed.trial) {
-          ed.trial = null; // fresh round supersedes trial (WHA-F-182)
-          // drop the stale trial artifacts: the details box AND the output
-          // decision badges (WHA-F-189 — the other half of the mixed state)
-          this.shadowRoot
-            ?.querySelector("[data-inspector] details.wha-json")
-            ?.remove();
-          for (const nodeId of ed.outToNode.values()) {
-            const badge = ed.df.container
-              ?.querySelector(`#node-${nodeId} [data-badge]`);
-            if (badge) badge.style.display = "none";
-          }
+          // fresh round supersedes trial (WHA-F-182): drop the stale trial
+          // artifacts — the details box AND the output decision badges
+          // (WHA-F-189 — the other half of the mixed state)
+          this._clearTrialArtifacts(ed);
         }
         this._applyObserve(r);
       } catch (err) {
@@ -1659,15 +1652,42 @@ class ScannerPanel extends HTMLElement {
     // directed-empty ("dead": wakes nothing, red). Until now only the
     // inspector hinted at the mode, and panel-created triggers defaulted to
     // the dead state invisibly.
+    // F-326: "dead" also covers a non-empty routes list whose targets can
+    // reach NO output (the graph walk below mirrors the runtime routing
+    // index) — the schema now warns on save; the badge keeps the canvas
+    // honest between saves.
     const ed = this._editor;
     if (!ed.df?.container) return;
+    const reachOuts = {};
+    for (const out of ed.controller.outputs || []) {
+      if (!out?.entity_id) continue;
+      const stack = [
+        ...(out.on_conditions || []),
+        ...(out.off_conditions || []),
+      ];
+      const seen = new Set();
+      while (stack.length) {
+        const cid = stack.pop();
+        if (seen.has(cid)) continue;
+        seen.add(cid);
+        (reachOuts[cid] ||= new Set()).add(out.entity_id);
+        const c = (ed.controller.conditions || []).find((x) => x.id === cid);
+        if (!c) continue;
+        stack.push(...(c.conditions || []));
+        if (c.start) stack.push(c.start);
+        if (c.abort) stack.push(c.abort);
+        stack.push(...(c.set_conditions || []), ...(c.reset_conditions || []));
+      }
+    }
     for (const [nid, tid] of ed.nodeToTrg) {
       const t = (ed.controller.triggers || []).find((x) => x.id === tid);
       const el = ed.df.container.querySelector(`#node-${nid}`);
       if (!el || !t) continue;
       const legacy = ed.legacyTrgIds.has(t.id);
       const dead =
-        !legacy && t.routes !== undefined && !(t.routes?.conditions || []).length;
+        !legacy &&
+        t.routes !== undefined &&
+        !(t.routes?.conditions || []).some((cid) => (reachOuts[cid] || {}).size);
       el.classList.toggle("trg-legacy", legacy);
       el.classList.toggle("trg-dead", dead);
       let badge = el.querySelector(".trg-mode-badge");
@@ -2359,6 +2379,11 @@ class ScannerPanel extends HTMLElement {
           out[k] = input.type === "checkbox" ? input.checked : input.value;
           ed.dirty = true;
           if (k === "type") {
+            // F-329: manual override is a switch-only capability — clear the
+            // stale flag on ANY type switch so it cannot resurrect when the
+            // output flips back to switch (the schema also drops it for
+            // non-switch outputs on save; this keeps the editor honest).
+            out.manual_override = false;
             // The type gates the inspector's manual-override checkbox and the
             // node head icon/tag — rebuild the inspector so the gate is
             // re-evaluated (WHA-F-264) instead of leaving a stale checkbox
@@ -2629,20 +2654,79 @@ class ScannerPanel extends HTMLElement {
   }
 
   async _trialRun() {
+    // F-321: the editor preview button is now a READ-ONLY observe refresh
+    // (the old "trial run" hit the actuating evaluate endpoint and really
+    // drove outputs with no warning). Actuation moved to the explicit
+    // "evaluate now" button (_evaluateNow) behind the confirm the overview
+    // uses.
     const ed = this._editor;
     if (ed.isNew) {
       // 从未保存过：阻断（WHA-UX-02——与 dirty 确认拆键）
       this.toast(this.tr("trialNeedSave"), true);
       return;
     }
-    if (ed.dirty) {
-      // 有未保存修改：明示"按已保存配置执行"，自绘确认（WHA-UX-01）
-      this._openConfirm(this.tr("confirmTitle"), this.tr("trialDirtyConfirm"), () => {
-        this._runTrial();
-      });
+    if (this._observeBusy) return; // previous round still in flight
+    this._observeBusy = true;
+    try {
+      const r = await this._api(
+        "GET", `/controllers/${ed.cid}/observe`, undefined, 8000
+      );
+      if (this._editor !== ed || !ed.df?.container) {
+        return; // user switched editors mid-await (WHA-F-184)
+      }
+      this._observeWarned = false;
+      if (ed.trial) {
+        this._clearTrialArtifacts(ed);
+      }
+      this._applyObserve(r);
+      this.toast(this.tr("statusRefreshed"));
+    } catch (err) {
+      this.toast(String(err.message || err), true);
+    } finally {
+      this._observeBusy = false;
+    }
+  }
+
+  _evaluateNow() {
+    // F-321: the only editor path that actuates, always behind the same
+    // action confirm the overview page uses (evaluateConfirmBody). With
+    // unsaved changes the dirty note comes first — evaluation runs the
+    // SAVED config (WHA-UX-01), then the action confirm.
+    const ed = this._editor;
+    if (ed.isNew) {
+      this.toast(this.tr("trialNeedSave"), true);
       return;
     }
-    await this._runTrial();
+    const name = ed.controller?.name || ed.cid;
+    const runConfirm = () => {
+      this._openConfirm(
+        this.tr("confirmTitle"),
+        '"' + name + '"' + this.tr("evaluateConfirmBody"),
+        () => { this._runTrial(); }
+      );
+    };
+    if (ed.dirty) {
+      this._openConfirm(this.tr("confirmTitle"), this.tr("trialDirtyConfirm"), runConfirm);
+      return;
+    }
+    runConfirm();
+  }
+
+  _clearTrialArtifacts(ed) {
+    // shared by the observe tick, the manual refresh and the trial failure
+    // path: drop the stale trial snapshot AND the output decision badges —
+    // a stale snapshot next to fresh coloring contradicts itself
+    // (WHA-F-234/F-189)
+    ed.trial = null;
+    this.shadowRoot
+      ?.querySelector("[data-inspector] details.wha-json")
+      ?.remove();
+    for (const nodeId of ed.outToNode.values()) {
+      const badge = ed.df?.container?.querySelector(
+        `#node-${nodeId} [data-badge]`
+      );
+      if (badge) badge.style.display = "none";
+    }
   }
 
   async _runTrial() {
@@ -2680,16 +2764,7 @@ class ScannerPanel extends HTMLElement {
     } catch (err) {
       // trial failure: drop the stale artifacts too (WHA-F-234) — a stale
       // snapshot next to a failure toast contradicts itself
-      ed.trial = null;
-      this.shadowRoot
-        ?.querySelector("[data-inspector] details.wha-json")
-        ?.remove();
-      for (const nodeId of ed.outToNode.values()) {
-        const badge = ed.df?.container?.querySelector(
-          `#node-${nodeId} [data-badge]`
-        );
-        if (badge) badge.style.display = "none";
-      }
+      this._clearTrialArtifacts(ed);
       this.toast(String(err.message || err), true);
     }
   }
@@ -2739,7 +2814,7 @@ class ScannerPanel extends HTMLElement {
         // UX-M-04: 失败与"该日无记录"分态展示
         box.innerHTML = `<p class="wha-sub" style="color:#c62828">${esc(
           String(err.message || err)
-        )}（可点「查询」重试）</p>`;
+        )}${esc(this.tr("logRetryHint"))}</p>`;
       }
     };
     main.querySelector('[data-lact="query"]').addEventListener("click", query);
