@@ -138,6 +138,12 @@ ha.util.dt.start_of_local_day = lambda now=None: (_clock["local"] if now is None
 )
 ha.util.dt.as_utc = lambda v: v.replace(tzinfo=None) if v and v.tzinfo is None else v
 ha.util.dt.parse_time = lambda s: datetime.strptime(s, "%H:%M:%S").time() if len(s.split(":")) == 3 else datetime.strptime(s, "%H:%M").time()
+# F-322: the persisted flip history is stored as ISO strings and parsed back
+# on manager construction — the stub clock is naive, so plain fromisoformat
+# matches the (naive) round-trip of the real path.
+ha.util.dt.parse_datetime = lambda s: (
+    datetime.fromisoformat(s) if isinstance(s, str) else None
+)
 
 ha.helpers.sun = _mod("homeassistant.helpers.sun")
 ha.helpers.sun.get_astral_event_date = lambda hass, event, day: (
@@ -989,7 +995,11 @@ assert v7_validated["triggers"][0]["routes"]["conditions"] == [v7_leaf_a], (
 try:
     validate_controller({
         **v7_disabled_pool,
-        "triggers": [{"id": v7_trg, "type": "state", "enabled": True}],
+        # F-318: the ENABLED half of the pin must carry routes — a routes-less
+        # trigger fails on the (earlier) missing-routes check, which would
+        # make this pin pass for the wrong reason
+        "triggers": [{"id": v7_trg, "type": "state", "enabled": True,
+                      "routes": {"conditions": [v7_leaf_a]}}],
     })
     raise AssertionError("ENABLED pool-empty trigger must stay rejected")
 except ControllerValidationError:
@@ -2499,6 +2509,384 @@ async def main():
         "[PASS] store/flag load guards hold on corrupt payloads"
         " (F-280/R6-5/R7-1/R7-6/R9-1)"
     )
+
+    # ------------------------------------------------------------------
+    # WHA-F-319: the missing-file / first-install None payload is the
+    # documented empty-store result — pin the SILENCE (no warning) on an
+    # EMPTY memory so a future guard cannot start log-spamming fresh
+    # installs (the populated-memory keep-warning above is the other face).
+    # ------------------------------------------------------------------
+    import logging as _logging
+
+    hub_q = ScannerHub(_Hass())
+    none_records = []
+
+    class _NoneCap(_logging.Handler):
+        def emit(self, record):
+            none_records.append(record.getMessage())
+
+    hub_logger = _logging.getLogger(
+        "custom_components.sensor_switch_controller.hub"
+    )
+    _none_handler = _NoneCap(level=_logging.WARNING)
+    hub_logger.addHandler(_none_handler)
+    try:
+        await hub_q.async_load()
+    finally:
+        hub_logger.removeHandler(_none_handler)
+    assert hub_q.controllers == {} and hub_q.invalid == {}, (
+        "an empty-memory None payload degrades to the empty state"
+    )
+    assert not none_records, (
+        f"first-install None payload must stay silent (F-311/F-319): "
+        f"{none_records}"
+    )
+    print("[PASS] WHA-F-319: first-install None payload stays silent")
+
+    # ------------------------------------------------------------------
+    # WHA-F-320: calendar gates get a directed wakeup — the (async) leaf
+    # caches the earliest future boundary (event.start - hours / event.end)
+    # and the (sync) next_wakeup offers it; a heartbeat margin covers the
+    # never-evaluated gaps. Query is one window of look-ahead so a
+    # verdict-False evaluation still caches the entry edge.
+    # ------------------------------------------------------------------
+    _hass_c = _Hass()
+    cal_cid = "cond_" + "9" * 32
+
+    class _CalEvt:
+        def __init__(self, start, end):
+            self._start = start
+            self._end = end
+
+        @property
+        def start_datetime_local(self):
+            return self._start
+
+        @property
+        def end_datetime_local(self):
+            return self._end
+
+    class _CalEntity:
+        def __init__(self, events):
+            self._events = events
+
+        async def async_get_events(self, hass, start, end):
+            return [
+                e
+                for e in self._events
+                if e.start_datetime_local < end and e.end_datetime_local > start
+            ]
+
+    cal_entity = _CalEntity(
+        # calendar edges live in the LOCAL clock domain (the leaf queries
+        # with dt_util.now()); the stub clocks run local=10:00 / utc=02:00
+        [_CalEvt(_clock["local"] + timedelta(hours=3), _clock["local"] + timedelta(hours=4))]
+    )
+    _hass_c.data["entity_components"] = {
+        "calendar": types.SimpleNamespace(
+            get_entity=lambda eid: cal_entity if eid == "calendar.x" else None
+        )
+    }
+    cal_cond = {
+        "id": cal_cid, "type": "calendar", "entity_id": "calendar.x", "hours": 2,
+    }
+    cal_eng = ConditionEngine(_hass_c, [cal_cond])
+    # t0 (local 10:00): the event starts at 13:00 — outside the verdict
+    # window [10:00, 12:00] → False, but the look-ahead (query reaches
+    # 14:00) caches its entry edge 11:00
+    verdict = await cal_eng._evaluate_id(cal_cid, set())
+    assert verdict is False, verdict
+    assert cal_eng._calendar_next.get(cal_cid) == _clock["local"] + timedelta(hours=1), (
+        "a verdict-False evaluation must still cache the entry edge "
+        "(start - hours = 11:00)"
+    )
+    # NOTE on the stub: the local/utc stub clocks differ by 8h and both
+    # offers are compared naive — under real HA both are aware UTC and the
+    # min() is a true "wake at whichever comes first". Pin the cache value
+    # directly (above) and the offer outcome as its stub-reality min.
+    from homeassistant.util import dt as _dt
+
+    pending = cal_eng.next_wakeup({cal_cid: {"ssc_out"}})
+    assert pending is not None, "calendar gate must produce a directed wakeup"
+    expiry, outs = pending
+    assert outs == {"ssc_out"}, outs
+    assert expiry == min(
+        _clock["local"] + timedelta(hours=1), _dt.utcnow() + timedelta(minutes=15)
+    ), f"the wakeup must be min(cached edge, heartbeat), got {expiry}"
+    # heartbeat tier: nothing cached (fresh engine) → next_wakeup offers the
+    # heartbeat margin so a fresh restart still wakes within the margin
+    fresh_eng = ConditionEngine(_Hass(), [cal_cond])
+    pending = fresh_eng.next_wakeup({cal_cid: {"ssc_out"}})
+    assert pending is not None, "heartbeat tier must keep calendar gates waking"
+    expiry, outs = pending
+    assert outs == {"ssc_out"}, outs
+    assert abs(
+        (expiry - _dt.utcnow() - timedelta(minutes=15)).total_seconds()
+    ) < 1, f"the heartbeat offer is now+15min, got {expiry}"
+    # verdict True once the event is inside the window; the exit edge (event
+    # end) becomes the cached boundary
+    cal_entity._events = [
+        _CalEvt(_clock["local"] + timedelta(hours=1), _clock["local"] + timedelta(hours=4))
+    ]
+    verdict = await cal_eng._evaluate_id(cal_cid, set())
+    assert verdict is True, verdict
+    # boundaries: entry edge (start-2h = 09:00, still naive-future vs the
+    # 02:0x utc stub clock) and the event end (14:00) — the cache takes the
+    # min of the future ones (stub-reality; under real HA the past edge is
+    # already behind utcnow and the end wins)
+    assert cal_eng._calendar_next.get(cal_cid) == min(
+        b
+        for b in (
+            _clock["local"] - timedelta(hours=1),
+            _clock["local"] + timedelta(hours=4),
+        )
+        if b > _dt.utcnow()
+    ), "after entering the window the cache must hold the earliest future edge"
+    pending = cal_eng.next_wakeup({cal_cid: {"ssc_out"}})
+    expiry, _outs = pending
+    assert expiry == min(
+        _clock["local"] + timedelta(hours=4), _dt.utcnow() + timedelta(minutes=15)
+    ), f"the wakeup must be min(event end, heartbeat), got {expiry}"
+    print("[PASS] WHA-F-320: calendar boundary wakeup + heartbeat tier")
+
+    # ------------------------------------------------------------------
+    # WHA-F-322 (+F-325): the cooldown flip history persists across manager
+    # rebuilds (seeded from the hub store, saved on applied flips) and the
+    # flag-store payload is snapshotted per controller — mutating the live
+    # tables after a save must not retroactively change the saved payload.
+    # ------------------------------------------------------------------
+    _hass_f = _Hass()
+    hub_f = ScannerHub(_hass_f)
+    _hass_f.data[_DOM] = hub_f
+
+    class _RecordingFlagStore:
+        """Local recording stand-in: the module-level _Store stub is a
+        no-op, but this pin must observe the persisted payloads."""
+
+        def __init__(self):
+            self.saved = []
+
+        async def async_save(self, data):
+            self.saved.append(data)
+
+        async def async_load(self):
+            return None
+
+    hub_f._flag_store = _RecordingFlagStore()
+    flip_out = "ssc_" + "1" * 32
+    flip_at = _clock["utc"]
+    await hub_f.async_save_last_flip("ctrl_ab12cd34", flip_out, flip_at)
+    assert hub_f.last_flips["ctrl_ab12cd34"][flip_out] == flip_at.isoformat()
+    saved_payload = hub_f._flag_store.saved[-1]
+    assert saved_payload["last_flip"] == {"ctrl_ab12cd34": {flip_out: flip_at.isoformat()}}
+    # F-325: mutate the live tables — the saved payload must not move
+    await hub_f.async_save_flag_states("ctrl_ab12cd34", {"cond_" + "1" * 32: True})
+    saved_payload = hub_f._flag_store.saved[-1]
+    hub_f.flag_states["ctrl_ab12cd34"]["cond_" + "1" * 32] = False
+    hub_f.flag_states["ctrl_99999999"] = {"x": True}
+    hub_f.last_flips["ctrl_99999999"] = {"y": "z"}
+    assert saved_payload["flags"] == {"ctrl_ab12cd34": {"cond_" + "1" * 32: True}}, (
+        "the saved payload must be a per-controller snapshot (F-325)"
+    )
+    assert "ctrl_99999999" not in saved_payload["flags"]
+    assert saved_payload["last_flip"] == {
+        "ctrl_ab12cd34": {flip_out: flip_at.isoformat()}
+    }
+    # a rebuilt manager seeds its cooldown history from the hub store
+    seed_cfg = _vc(json.loads(json.dumps({
+        "name": "flip-seed", "enabled": True, "logging_enabled": False,
+        "triggers": [{"id": "trg_" + "8" * 32, "type": "state",
+                      "entity_id": "switch.c",
+                      "routes": {"conditions": ["cond_" + "a" * 32]}}],
+        "sensors": [{"entity_id": "switch.c"}],
+        "conditions": [
+            {"id": "cond_" + "a" * 32, "type": "state",
+             "entity_id": "switch.c", "state": "on"},
+        ],
+        "outputs": [
+            {"name": "out-f", "type": "switch", "entity_id": flip_out,
+             "on_conditions": ["cond_" + "a" * 32], "off_conditions": []},
+        ],
+    })))
+    mgr_f = ControllerManager(_hass_f, "ctrl_ab12cd34", seed_cfg)
+    seeded = mgr_f.last_flip_at(flip_out)
+    assert seeded is not None and seeded == flip_at, (
+        f"a rebuilt manager must seed its flip history from the hub store, "
+        f"got {seeded}"
+    )
+    # drop clears both tables and persists the erasure (the F-325 noise
+    # controller above must survive — the drop is per-controller)
+    await hub_f.async_drop_flag_states("ctrl_ab12cd34")
+    assert "ctrl_ab12cd34" not in hub_f.last_flips
+    assert hub_f._flag_store.saved[-1]["last_flip"] == {
+        "ctrl_99999999": {"y": "z"}
+    }, hub_f._flag_store.saved[-1]["last_flip"]
+    print("[PASS] WHA-F-322/F-325: flip history persists+seeds, payload snapshot")
+
+    # ------------------------------------------------------------------
+    # WHA-F-316: an empty group under a NOT is constant True — it must NOT
+    # be collected as a dead flag branch (no misleading "cannot contribute"
+    # warning); an empty group in a plain branch still warns once.
+    # ------------------------------------------------------------------
+    not_g = "cond_" + "b" * 32
+    empty_g = "cond_" + "c" * 32
+    f16_flag = "cond_" + "d" * 32
+    f16_flag2 = "cond_" + "e" * 32
+    f16_eng = ConditionEngine(_Hass(), [
+        {"id": empty_g, "type": "and", "conditions": []},
+        {"id": not_g, "type": "not", "conditions": [empty_g]},
+        {"id": f16_flag, "type": "flag",
+         "set_conditions": [not_g], "reset_conditions": []},
+        {"id": f16_flag2, "type": "flag",
+         "set_conditions": [empty_g], "reset_conditions": []},
+    ])
+    eng_records = []
+
+    class _EngCap(_logging.Handler):
+        def emit(self, record):
+            eng_records.append(record.getMessage())
+
+    eng_logger = _logging.getLogger(
+        "custom_components.sensor_switch_controller.condition_engine"
+    )
+    _eng_handler = _EngCap(level=_logging.WARNING)
+    eng_logger.addHandler(_eng_handler)
+    try:
+        await f16_eng.step_flags()
+    finally:
+        eng_logger.removeHandler(_eng_handler)
+    # exactly ONE warning: the plain-branch reference (the control), not the
+    # NOT-wrapped one — the NOT inverts the empty group to constant True
+    assert len(eng_records) == 1 and "empty group" in eng_records[0], (
+        f"an empty group under NOT is constant True — only the plain-branch "
+        f"reference may warn (F-316): {eng_records}"
+    )
+    print("[PASS] WHA-F-316: empty group under NOT is not a dead branch")
+
+    # ------------------------------------------------------------------
+    # Schema save-time static hazard warnings (never rejecting):
+    # ① off-chain cooldown warns, on-chain cooldown does not; ② routes wired
+    # to an unreachable condition warn; ③ an empty non-signal group in an
+    # output chain warns; ④ the calendar-only-output warning.
+    # ------------------------------------------------------------------
+    sch_records = []
+
+    class _SchCap(_logging.Handler):
+        def emit(self, record):
+            sch_records.append(record.getMessage())
+
+    sch_logger = _logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _sch_handler = _SchCap(level=_logging.WARNING)
+    sch_logger.addHandler(_sch_handler)
+    try:
+        hz_c1 = "cond_" + "a" * 32
+        hz_c2 = "cond_" + "b" * 32
+        hz_o1 = "ssc_" + "1" * 32
+        hz_base = {
+            "name": "hazards", "sensors": [{"entity_id": "switch.c"}],
+            "conditions": [
+                {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+                 "state": "on"},
+                {"id": hz_c2, "type": "cooldown", "seconds": 30},
+            ],
+            "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                          "entity_id": "switch.c",
+                          "routes": {"conditions": [hz_c1]}}],
+        }
+        # ① off-chain cooldown → one warning; the same cooldown on the on
+        # chain (legit anti-short-cycle) → none
+        _vc({**json.loads(json.dumps(hz_base)), "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1], "off_conditions": [hz_c2]},
+        ]})
+        assert sum("off 条件链" in r for r in sch_records) == 1, sch_records
+        n_off = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c2], "off_conditions": [hz_c1]},
+        ]})
+        assert len(sch_records) == n_off, (
+            f"an on-chain cooldown is legitimate — no warning: {sch_records}"
+        )
+        # ② route to an unreachable condition → warning (a legal leaf no
+        # output chain reaches — wired on the canvas, wakes nothing)
+        orphan_c = "cond_" + "e" * 32
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": orphan_c, "type": "state", "entity_id": "switch.d",
+             "state": "on"},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1], "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": [hz_c1, orphan_c]}}]})
+        assert sum("到不了任何输出" in r for r in sch_records) == 1, sch_records
+        # ③ empty group referenced by an output chain → warning
+        empty_g2 = "cond_" + "0" * 32
+        n_r = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": empty_g2, "type": "or", "conditions": []},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1, empty_g2], "off_conditions": []},
+        ]})
+        assert sum("空逻辑组" in r for r in sch_records) == 1, sch_records
+        assert len(sch_records) == n_r + 1, (
+            f"the unreachable-route warning must NOT repeat for an output-"
+            f"chained empty group: {sch_records[n_r:]}"
+        )
+        # ④ calendar as the only gate of an output → warning (the trigger is
+        # re-anchored on the calendar condition itself: no other wakeup face)
+        cal_id = "cond_" + "f" * 32
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": cal_id, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [cal_id], "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": [cal_id]}}]})
+        assert sum("日历条件" in r for r in sch_records) == 1, sch_records
+    finally:
+        sch_logger.removeHandler(_sch_handler)
+    print(
+        "[PASS] schema static hazard warnings: off-chain cooldown, dead "
+        "route, empty group, calendar-only output"
+    )
+
+    # ------------------------------------------------------------------
+    # WHA-F-321: the editor preview button is the READ-ONLY observe path;
+    # actuation only via the explicit "evaluate now" button behind the
+    # overview's action confirm (panel.js is DOM-free in CI — pin the source
+    # text so the wiring cannot silently regress).
+    # ------------------------------------------------------------------
+    panel_src = (
+        ROOT / "custom_components" / "sensor_switch_controller" / "static" / "panel.js"
+    ).read_text(encoding="utf-8")
+    i_tr = panel_src.index("async _trialRun")
+    i_en = panel_src.index("_evaluateNow() {")
+    i_cl = panel_src.index("_clearTrialArtifacts(ed)", i_en)
+    i_rt = panel_src.index("async _runTrial")
+    assert i_tr < i_en < i_cl < i_rt, (
+        "panel method layout changed — re-check the F-321 pin anchors"
+    )
+    trial_seg = panel_src[i_tr:i_en]
+    assert "/observe" in trial_seg, "the preview button must call observe"
+    assert "/evaluate" not in trial_seg, (
+        "the preview button must NOT actuate (F-321 regression)"
+    )
+    evaluate_seg = panel_src[i_en:i_cl]
+    assert "evaluateConfirmBody" in evaluate_seg, (
+        "the evaluate-now button must sit behind the action confirm"
+    )
+    print("[PASS] WHA-F-321: editor preview is read-only, evaluate is confirmed")
 
 asyncio.run(main())
 print("SMOKE OK")
