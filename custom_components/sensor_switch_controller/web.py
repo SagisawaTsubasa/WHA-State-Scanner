@@ -168,6 +168,19 @@ class ControllerDetailView(HomeAssistantView):
                 # check-then-act raced a concurrent DELETE across the await above
                 return self.json({"ok": False, "error": "控制器不存在"}, status_code=404)
             await _save_or_rollback(hass, hub, cid, before_key)
+        # Save won — sweep registry entries orphaned by the update (F-332):
+        # dropped outputs or a switch↔binary_sensor type switch would
+        # otherwise linger as ghost "no longer provided" rows (the DELETE
+        # path sweeps, the PUT path historically only replaced the config).
+        # Best-effort, same as the DELETE sweep: a cleanup failure must not
+        # fake a failed update nor skip the reload.
+        try:
+            hub.sweep_registry_diff(cid, config["outputs"])
+        except Exception:
+            _LOGGER.exception(
+                "Registry diff sweep failed for %s; the update stays, ghost "
+                "entries clear on the next entry reload", cid,
+            )
         _schedule_reload(hass, hub)
         _LOGGER.info("Updated controller %s (%s) via web", cid, config["name"])
         return self.json({"ok": True, "id": cid})

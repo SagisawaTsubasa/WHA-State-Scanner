@@ -201,13 +201,37 @@ if _INSTALL_STUBS:
     ha.helpers.start = _module(
         "homeassistant.helpers.start", async_at_started=lambda hass, cb: lambda: None
     )
+    # Injectable entity-registry stub (mirrors _FakeDeviceRegistry below):
+    # tests append SimpleNamespace(unique_id=…, entity_id=…, domain=…)
+    # entries and read back the removals — default empty, so existing tests
+    # keep their "nothing to sweep" behaviour (F-332).
+    class _FakeEntityRegistry:
+        def __init__(self) -> None:
+            self.entries: list[Any] = []
+            self.removed: list[str] = []
+
+        def add(self, unique_id: str, entity_id: str, domain: str) -> None:
+            self.entries.append(
+                types.SimpleNamespace(
+                    unique_id=unique_id, entity_id=entity_id, domain=domain
+                )
+            )
+
+        def async_remove(self, entity_id: str) -> None:
+            self.removed.append(entity_id)
+
+    _FAKE_ENTITY_REGISTRY = _FakeEntityRegistry()
     ha.helpers.entity_registry = _module(
         "homeassistant.helpers.entity_registry",
         async_get=lambda hass: types.SimpleNamespace(
-            async_remove=lambda entity_id: None
+            async_remove=_FAKE_ENTITY_REGISTRY.async_remove
         ),
-        async_entries_for_config_entry=lambda registry, entry_id: [],
+        async_entries_for_config_entry=lambda registry, entry_id: list(
+            _FAKE_ENTITY_REGISTRY.entries
+        ),
     )
+    # exposed for tests: homeassistant.helpers.entity_registry._fake
+    ha.helpers.entity_registry._fake = _FAKE_ENTITY_REGISTRY
 
     class _FakeDeviceRegistry:
         """Injectable device-registry stub: records removals, holds devices."""

@@ -48,6 +48,18 @@ GROUP_TYPES = ("and", "or", "not")
 # Cap for the per-date sun event cache.
 _SUN_CACHE_MAX = 16
 
+# Heartbeat margin for calendar gates (F-320): a calendar verdict flips at
+# event boundaries (start - hours, event.end) that raise no HA event. After
+# each evaluation the earliest future boundary is cached and offered by
+# next_wakeup; this heartbeat covers the never-evaluated gaps (fresh
+# restart with an empty cache, far-future events beyond the query window).
+_CALENDAR_WAKE_MARGIN = timedelta(minutes=15)
+
+# Rate limit for per-condition evaluation-failure warnings (F-323): template
+# render errors and calendar entity/query failures silently degrade the
+# condition to False on a hot path — warn once per key per interval.
+_EVAL_FAILURE_WARN_INTERVAL = timedelta(minutes=10)
+
 _WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
@@ -108,6 +120,13 @@ class ConditionEngine:
         self._empty_branch_warned: set[tuple[str, str, str]] = set()
         self._template_cache: dict[str, Template] = {}
         self._sun_cache: dict[tuple[str, str], Any] = {}
+        # Earliest future calendar boundary per condition id, cached by the
+        # (async) calendar leaf evaluation and offered by the (sync)
+        # next_wakeup (F-320: calendar gates raise no HA event at their
+        # edges, so without the cache they would never wake on their own).
+        self._calendar_next: dict[str, datetime] = {}
+        # (condition key, failure kind) → last warning time (F-323).
+        self._eval_failure_warned: dict[tuple[str, str], datetime] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -301,19 +320,26 @@ class ConditionEngine:
                     dead_groups.append(cond_id)
                 return False
             verdicts: list[bool | None] = []
+            # NOT flips polarity (WHA-F-316): an empty group under a NOT is
+            # constant TRUE (the Kleene merge below already reflects it in
+            # the verdict), so it deadens nothing and must not be collected
+            # as a dead branch — pass the flipped flag down so the empty-
+            # group collector can tell the two cases apart, matching the
+            # _static_verdict docstring.
+            member_inverted = not inverted if ctype == "not" else inverted
             for member in members:
                 if isinstance(member, str):
                     verdicts.append(
                         self._static_verdict(
                             member, visited, dead_groups,
-                            inverted=inverted, in_abort=in_abort,
+                            inverted=member_inverted, in_abort=in_abort,
                         )
                     )
                 else:
                     verdicts.append(
                         self._static_cond(
                             member, visited, dead_groups,
-                            inverted=inverted, in_abort=in_abort,
+                            inverted=member_inverted, in_abort=in_abort,
                         )
                     )
             if ctype == "and":
@@ -431,6 +457,17 @@ class ConditionEngine:
                 self._offer_range_edges(cond, now_local, offer, outs)
             elif ctype == "sun":
                 self._offer_sun_edges(cond, now_local, offer, outs)
+            elif ctype == "calendar":
+                # F-320: calendar verdicts flip at event boundaries
+                # (start - hours / event.end) that raise no HA event. Two
+                # tiers: the cached boundary from the last evaluation, plus
+                # a periodic heartbeat covering a fresh restart (cache
+                # empty) and events beyond the last query window.
+                cached = self._calendar_next.get(cid)
+                if cached is not None:
+                    offer(cached, outs)
+                if outs:
+                    offer(now_utc + _CALENDAR_WAKE_MARGIN, outs)
         return best
 
     def _time_window_verdict(self, cond: dict, now_local) -> bool:
@@ -734,6 +771,27 @@ class ConditionEngine:
     # Leaf conditions
     # ------------------------------------------------------------------
 
+    def _warn_eval_failure(self, key: str, kind: str, err: Any) -> None:
+        """Warn once per (key, kind) per interval about an evaluation
+        failure that silently degrades the condition to False (F-323):
+        template render errors and calendar entity/query failures are user
+        or backend faults — at the default log level the old debug-only
+        lines left the condition looking permanently False with no trace.
+        Rate-limited because evaluation is a hot path; the engine is
+        rebuilt on every entry reload, which naturally resets the window."""
+        now = dt_util.utcnow()
+        k = (key, kind)
+        last = self._eval_failure_warned.get(k)
+        if last is not None and (now - last) < _EVAL_FAILURE_WARN_INTERVAL:
+            return
+        self._eval_failure_warned[k] = now
+        _LOGGER.warning(
+            "Condition '%s' %s failed and evaluates as False for now: %s",
+            key,
+            kind,
+            err,
+        )
+
     async def _evaluate_leaf(
         self, cond: dict, ctype: str, path: str, out_id: str | None = None
     ) -> bool:
@@ -788,6 +846,7 @@ class ConditionEngine:
                     tpl_str,
                     err,
                 )
+                self._warn_eval_failure(cond.get("id") or path, "template", err)
                 return False
 
         if ctype == "time":
@@ -816,15 +875,54 @@ class ConditionEngine:
             entity = component.get_entity(eid) if component else None
             if entity is None:
                 _LOGGER.debug("Calendar entity %s not found; False", eid)
+                self._warn_eval_failure(
+                    cond.get("id") or eid or path, "calendar entity missing", eid
+                )
                 return False
             start = dt_util.now()
             end = start + timedelta(hours=hours)
             try:
-                events = await entity.async_get_events(self.hass, start, end)
+                # One query with a one-window look-ahead: the verdict counts
+                # only events intersecting [now, now+hours] (unchanged
+                # semantics), while the boundary cache below also sees events
+                # that ENTER the window later — their `start - hours` edge is
+                # still future, and without the look-ahead a verdict-False
+                # evaluation would cache nothing and fall back to the
+                # heartbeat (F-320).
+                events = await entity.async_get_events(
+                    self.hass, start, end + timedelta(hours=hours)
+                )
             except Exception as err:  # noqa: BLE001 — calendar backends may raise anything
                 _LOGGER.debug("Calendar query for %s failed: %s", eid, err)
+                self._warn_eval_failure(
+                    cond.get("id") or eid or path, "calendar query", err
+                )
                 return False
-            return bool(events)
+            # F-320: cache the earliest future flip instant — events enter
+            # the verdict window at `start - hours` and leave at `end`.
+            # CalendarEvent.start_datetime_local/end_datetime_local normalize
+            # both plain and all-day events (date objects) to aware local
+            # datetimes (2026.1.3 wheel), so edges compare directly against
+            # utcnow().
+            now_utc = dt_util.utcnow()
+            in_window = False
+            boundaries: list[datetime] = []
+            for ev in events or ():
+                ev_start = getattr(ev, "start_datetime_local", None)
+                ev_end = getattr(ev, "end_datetime_local", None)
+                if ev_start is None or ev_end is None:
+                    # exotic backend payload: cannot judge the window — skip
+                    continue
+                if ev_start < end and ev_end > start:
+                    in_window = True
+                boundaries.append(ev_start - timedelta(hours=hours))
+                boundaries.append(ev_end)
+            future = [b for b in boundaries if b > now_utc]
+            if future:
+                self._calendar_next[cond.get("id") or path] = min(future)
+            else:
+                self._calendar_next.pop(cond.get("id") or path, None)
+            return in_window
 
         _LOGGER.debug("Unknown condition type '%s' at %s", ctype, path)
         return False

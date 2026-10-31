@@ -10,6 +10,7 @@ import asyncio
 import copy
 import logging
 import uuid
+from typing import Any
 
 from homeassistant.const import CONF_ENTITY_ID
 from homeassistant.core import HomeAssistant
@@ -26,6 +27,7 @@ from .const import (
     CTRL_ID_PREFIX,
     DOMAIN,
     DURATION_MAX,
+    OUTPUT_SWITCH,
     STORE_KEY,
     STORE_VERSION,
     TRG_STATE,
@@ -360,6 +362,17 @@ class _MigratingStore(Store):
         # three parameters remove all doubt — F-128)
         if old_major_version >= STORE_VERSION:
             return old_data
+        if old_data is not None and not isinstance(old_data, dict):
+            # F-324: a corrupt top-level payload must not AttributeError
+            # through the migration and kill the whole entry setup — hand
+            # it back untouched so async_load's own non-dict guard degrades
+            # it loudly to the empty state instead.
+            _LOGGER.warning(
+                "Stored %s payload is not an object (%r); migration skipped",
+                STORE_KEY,
+                type(old_data).__name__,
+            )
+            return old_data
         raw = (old_data or {}).get(CONF_CONTROLLERS)
         if isinstance(raw, dict):
             steps = {
@@ -426,6 +439,12 @@ class ScannerHub:
         # Runtime-only (not part of the controller config): the hub object
         # survives entry reloads, the store below survives HA restarts.
         self.flag_states: dict[str, dict[str, bool]] = {}
+        # Last applied flip (ISO string) per output, per controller — the
+        # cooldown conditions' flip history, persisted with the same store
+        # payload as the flag latches so it survives reloads/restarts
+        # (F-322: the old in-memory-only dict went empty on every rebuild,
+        # fail-open for compressor/pump-style cooldown gates).
+        self.last_flips: dict[str, dict[str, str]] = {}
         self._flag_store = Store(hass, 1, STORE_KEY + "_flags")
         # Serializes web CRUD (snapshot → mutate → save → rollback) and the
         # reload-time store re-read (审查 R6-2): the whole-table save must
@@ -559,14 +578,19 @@ class ScannerHub:
         if not isinstance(raw, dict):
             # First setup (missing file → data None) is the documented empty
             # result, not corruption — stay silent (WHA-F-311); a present
-            # payload with an unusable 'flags' value still degrades loudly.
-            if data is not None and raw is not None:
+            # payload with an unusable 'flags' value — key missing, null or
+            # a non-object (F-317: the missing/null faces used to vanish
+            # silently, unlike the controllers guards) — degrades loudly.
+            # The whole payload is untrustworthy, so the flip history goes
+            # with it.
+            if data is not None:
                 _LOGGER.warning(
                     "Stored %s_flags 'flags' payload is not an object (%r); ignored",
                     STORE_KEY,
                     type(raw).__name__,
                 )
             self.flag_states = {}
+            self.last_flips = {}
             return
         states: dict[str, dict[str, bool]] = {}
         for cid, value in raw.items():
@@ -598,16 +622,85 @@ class ScannerHub:
                     type(value).__name__,
                 )
         self.flag_states = states
+        # Cooldown flip history rides the same payload (F-322). A missing
+        # 'last_flip' key is the pre-0.11 normal shape — stay silent; only
+        # a present-but-unusable value warns.
+        raw_flips = (data or {}).get("last_flip")
+        if not isinstance(raw_flips, dict):
+            if data is not None and raw_flips is not None:
+                _LOGGER.warning(
+                    "Stored %s_flags 'last_flip' payload is not an object (%r); ignored",
+                    STORE_KEY,
+                    type(raw_flips).__name__,
+                )
+            self.last_flips = {}
+        else:
+            flips: dict[str, dict[str, str]] = {}
+            for cid, value in raw_flips.items():
+                # same per-controller guard as the flag states: a
+                # non-object value would explode dict() in the managers
+                if isinstance(cid, str) and isinstance(value, dict):
+                    clean = {
+                        k: v
+                        for k, v in value.items()
+                        if isinstance(k, str) and isinstance(v, str)
+                    }
+                    if len(clean) != len(value):
+                        _LOGGER.warning(
+                            "Dropping %d malformed last-flip entries for "
+                            "controller %s (values must be ISO strings)",
+                            len(value) - len(clean),
+                            cid,
+                        )
+                    flips[cid] = clean
+                else:
+                    _LOGGER.warning(
+                        "Dropping malformed last-flip state for controller "
+                        "%r (%s)",
+                        cid,
+                        type(value).__name__,
+                    )
+            self.last_flips = flips
+
+    @staticmethod
+    def _flag_store_payload(flag_states: dict, last_flips: dict) -> dict:
+        """Snapshot both runtime tables for the store write (F-325): the
+        Store keeps the payload reference alive across await points (the
+        write lock), so hand it per-controller copies — the same discipline
+        as the controllers save (``payload = dict(self.controllers)``) —
+        instead of letting the serialization race a concurrent controller's
+        flip. (Verified against the 2026.1.3 wheel: with the default
+        ``serialize_in_event_loop=True`` the JSON pass itself is a
+        synchronous event-loop walk, so this is a state-semantics
+        hardening, not a RuntimeError fix.)"""
+        return {
+            "flags": {c: dict(v) for c, v in flag_states.items()},
+            "last_flip": {c: dict(v) for c, v in last_flips.items()},
+        }
 
     async def async_save_flag_states(self, cid: str, states: dict) -> None:
         """Persist one controller's flag states (called on flag flips)."""
         self.flag_states[cid] = dict(states)
-        await self._flag_store.async_save({"flags": self.flag_states})
+        await self._flag_store.async_save(
+            self._flag_store_payload(self.flag_states, self.last_flips)
+        )
+
+    async def async_save_last_flip(self, cid: str, out_id: str, when: Any) -> None:
+        """Persist one applied output flip — the cooldown history that must
+        survive reloads/restarts (F-322)."""
+        self.last_flips.setdefault(cid, {})[out_id] = when.isoformat()
+        await self._flag_store.async_save(
+            self._flag_store_payload(self.flag_states, self.last_flips)
+        )
 
     async def async_drop_flag_states(self, cid: str) -> None:
-        """Forget and persist-erase one controller's flag states."""
+        """Forget and persist-erase one controller's flag states (and its
+        cooldown flip history — the controller is gone either way)."""
         self.flag_states.pop(cid, None)
-        await self._flag_store.async_save({"flags": self.flag_states})
+        self.last_flips.pop(cid, None)
+        await self._flag_store.async_save(
+            self._flag_store_payload(self.flag_states, self.last_flips)
+        )
 
     # ------------------------------------------------------------------
     # Controllers CRUD (web API; caller schedules the entry reload)
@@ -695,6 +788,35 @@ class ScannerHub:
         device = device_registry.async_get_device(identifiers={(DOMAIN, cid)})
         if device is not None:
             device_registry.async_remove_device(device.id)
+
+    def sweep_registry_diff(self, cid: str, new_outputs: list) -> None:
+        """Remove registry entries orphaned by an update (F-332): outputs a
+        PUT dropped, or ones whose type switched switch↔binary_sensor (the
+        old platform's registry entry outlives the entity and would linger
+        as a ghost "no longer provided" row — the DELETE path sweeps by
+        prefix, the PUT path historically replaced the config only).
+
+        Expected state is rebuilt from the validated new config: an entry
+        whose unique_id is no longer expected, or whose domain no longer
+        matches the output's type, is removed. Best-effort by contract —
+        the web layer wraps the call so a cleanup failure never fakes a
+        failed save. Call only after the PUT's store save succeeded."""
+        if not self.entry_id:
+            return
+        registry = er.async_get(self.hass)
+        expected: dict[str, str] = {
+            f"{cid}_{out['entity_id']}": out.get("type", OUTPUT_SWITCH)
+            for out in new_outputs
+            if isinstance(out, dict) and isinstance(out.get("entity_id"), str)
+        }
+        prefix = f"{cid}_"
+        for entry in er.async_entries_for_config_entry(registry, self.entry_id):
+            if not entry.unique_id.startswith(prefix):
+                continue
+            otype = expected.get(entry.unique_id)
+            if otype is not None and entry.domain == otype:
+                continue
+            registry.async_remove(entry.entity_id)
 
     def _fresh_id(self) -> str:
         while True:

@@ -76,6 +76,28 @@ class ControllerManager:
         saved_flags = (
             hub.flag_states.get(controller_id, {}) if hub is not None else {}
         )
+        # Seed the cooldown flip history from the hub store (F-322): the
+        # previous in-memory-only dict reset to empty on every manager
+        # rebuild (panel save, entry reload, HA restart), fail-open for
+        # cooldown gates. Stored as ISO strings — parse defensively, a
+        # malformed entry is dropped loudly instead of poisoning the gate.
+        saved_last_flip: dict[str, Any] = {}
+        if hub is not None:
+            for out_id, raw in (hub.last_flips.get(controller_id) or {}).items():
+                try:
+                    parsed = dt_util.parse_datetime(raw)
+                except (TypeError, ValueError):
+                    parsed = None
+                if parsed is None:
+                    _LOGGER.warning(
+                        "Controller %s: dropping malformed last-flip entry "
+                        "for output %s (%r)",
+                        controller_id,
+                        out_id,
+                        raw,
+                    )
+                    continue
+                saved_last_flip[out_id] = parsed
         self.engine = ConditionEngine(
             hass, self.conditions, manager=self, flag_states=saved_flags
         )
@@ -162,7 +184,9 @@ class ControllerManager:
         self._init_fallback_unsub = None
 
         # Last applied flip (utc) per output id — feeds cooldown conditions.
-        self._last_flip: dict[str, Any] = {}
+        # Seeded from the hub store (see __init__, F-322); applied flips are
+        # persisted back via _persist_last_flip.
+        self._last_flip: dict[str, Any] = saved_last_flip
 
         # Latest evaluation result per output, served to the web panel.
         self.last_results: dict[str, dict] = {}
@@ -564,6 +588,29 @@ class ControllerManager:
                 "Failed persisting flag states for %s", self.controller_id
             )
 
+    async def _persist_last_flip(self, out_id: str) -> None:
+        """Persist one applied flip via the hub (cooldown history, F-322).
+
+        Same teardown guard as _persist_flag_states: a dead manager must
+        not write its flip back into the hub store (审查 R5-5). A failed
+        save never breaks the evaluation cycle — the in-memory value stays
+        authoritative and the next applied flip retries the write."""
+        if self._stopped:
+            return
+        hub = self.hass.data.get(DOMAIN)
+        if hub is None:
+            return
+        try:
+            await hub.async_save_last_flip(
+                self.controller_id, out_id, self._last_flip[out_id]
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Failed persisting last-flip for %s/%s",
+                self.controller_id,
+                out_id,
+            )
+
     async def _async_evaluate_output(
         self, out_cfg: dict, readings: dict[str, Any], detailed: bool = False
     ) -> tuple[dict, dict | None]:
@@ -612,6 +659,7 @@ class ControllerManager:
 
         if applied:
             self._last_flip[out_id] = dt_util.utcnow()
+            await self._persist_last_flip(out_id)
 
         record = {
             "output": out_cfg.get("name"),

@@ -684,3 +684,100 @@ def test_put_repair_racing_delete_answers_404():
     assert "ctrl_ab12cd34" not in hub.controllers, (
         "a controller deleted concurrently must not be resurrected"
     )
+
+
+# ----------------------------------------------------------------------
+# F-332: the PUT path sweeps registry entries orphaned by the update
+# (dropped outputs / switch↔binary_sensor type switches) — after the
+# durable save only, best-effort, scoped to the controller's unique_id
+# prefix and the validated output set.
+# ----------------------------------------------------------------------
+
+
+def _put_request(hass, body):
+    req = _make_request(hass)
+
+    async def _json():
+        return body
+
+    req.json = _json
+    return req
+
+
+def test_put_view_sweeps_orphaned_registry_entries():
+    """PUT 保存成功后 diff 清扫：被删输出与类型切换的 registry 条目移除，
+    保留输出与其它控制器的条目不动（DELETE 有 sweep，PUT 自 0.11.0 起同款）。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    from homeassistant.helpers import entity_registry as _er
+
+    fake = _er._fake
+    fake.entries.clear()
+    fake.removed.clear()
+    o1 = "ssc_" + "1" * 32
+    o3 = "ssc_" + "3" * 32
+    fake.add(f"ctrl_ab12cd34_{o1}", "switch.o1", "switch")  # kept
+    fake.add("ctrl_ab12cd34_ssc_dead", "switch.o2", "switch")  # dropped
+    fake.add(f"ctrl_ab12cd34_{o3}", "switch.o3", "switch")  # type-switched
+    fake.add("ctrl_99999999_ssc_9", "switch.other", "switch")  # other cid
+    hub.controllers["ctrl_ab12cd34"] = {"name": "x"}
+    body = {
+        "name": "x",
+        "outputs": [
+            {"name": "o1", "type": "switch", "entity_id": o1},
+            {"name": "o3", "type": "binary_sensor", "entity_id": o3},
+        ],
+    }
+    real_validate = web_mod.validate_controller
+    web_mod.validate_controller = lambda b: dict(b)
+    try:
+        resp = asyncio.run(
+            web_mod.ControllerDetailView().put(_put_request(hass, body), "ctrl_ab12cd34")
+        )
+    finally:
+        web_mod.validate_controller = real_validate
+    assert resp.status == 200, resp
+    assert hub.store.saved, "the update must be durable before the sweep"
+    assert sorted(fake.removed) == [
+        "switch.o2",
+        "switch.o3",
+    ], fake.removed
+    # reload still scheduled after the sweep
+    assert hass.data.get(web_mod.WEB_DATA_KEY + "_reload_pending")
+
+
+def test_put_view_skips_sweep_when_save_fails():
+    """保存失败（rollback 上抛 500）：不可逆的 registry 清扫不得执行。"""
+    hass = _hass_with_config_entries()
+    hub = _make_crud_hub(hass)
+    from homeassistant.helpers import entity_registry as _er
+
+    _er._fake.entries.clear()
+    _er._fake.removed.clear()
+    hub.controllers["ctrl_ab12cd34"] = {"name": "x"}
+    calls: list = []
+
+    def _sweep(cid, outs):
+        calls.append(cid)
+
+    hub.sweep_registry_diff = _sweep
+    real_save = hub.store.async_save
+
+    async def _fail(data):
+        raise OSError("disk full")
+
+    hub.store.async_save = _fail
+    body = {"name": "x", "outputs": []}
+    real_validate = web_mod.validate_controller
+    web_mod.validate_controller = lambda b: dict(b)
+    try:
+        with pytest.raises(OSError):
+            asyncio.run(
+                web_mod.ControllerDetailView().put(
+                    _put_request(hass, body), "ctrl_ab12cd34"
+                )
+            )
+    finally:
+        web_mod.validate_controller = real_validate
+        hub.store.async_save = real_save
+    assert calls == [], "the sweep must not run before the save wins"
