@@ -1048,6 +1048,11 @@ def _warn_static_hazards(
                 not cond
                 or cond["type"] not in GROUP_TYPES
                 or cond.get("conditions")
+                # a disabled group short-circuits to True in the engine
+                # (condition_engine) — it is NOT constant False, so it must
+                # not warn (F-336, same false-positive face as flag-side
+                # F-305); enabled defaults to on (None/missing ≠ disabled)
+                or cond.get("enabled") is False
                 or cid in signal_covered
             ):
                 continue

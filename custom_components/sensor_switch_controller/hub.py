@@ -687,10 +687,23 @@ class ScannerHub:
 
     async def async_save_last_flip(self, cid: str, out_id: str, when: Any) -> None:
         """Persist one applied output flip — the cooldown history that must
-        survive reloads/restarts (F-322)."""
+        survive reloads/restarts (F-322).
+
+        F-339: the write goes through ``Store.async_delay_save`` instead of
+        an immediate full-table ``async_save`` — an applied flip used to
+        serialize a whole-table rewrite inside the eval lock, so one flag
+        flip fanning out to N outputs in a single cycle meant N sequential
+        full-table writes held open. The 1 s delay window merges the burst
+        into one write; Store's final-write listener persists the payload
+        on HA shutdown, so at most the last second of history can be lost
+        to a crash (the trade-off R2 accepted). The F-325 snapshot
+        discipline is unchanged: ``data_func`` runs on the event loop and
+        hands the Store a fresh per-controller copy via
+        ``_flag_store_payload``."""
         self.last_flips.setdefault(cid, {})[out_id] = when.isoformat()
-        await self._flag_store.async_save(
-            self._flag_store_payload(self.flag_states, self.last_flips)
+        self._flag_store.async_delay_save(
+            lambda: self._flag_store_payload(self.flag_states, self.last_flips),
+            1,
         )
 
     async def async_drop_flag_states(self, cid: str) -> None:

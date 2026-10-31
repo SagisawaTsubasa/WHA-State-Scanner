@@ -569,6 +569,15 @@ async def async_setup_web(hass: HomeAssistant) -> None:
 def _make_started_recheck(hass: HomeAssistant, flags: dict):
     @callback
     def _recheck(event: Event) -> None:
+        # F-334: once fired, HA has already removed the listener from the
+        # bus (_OneTimeListener.__call__ removes itself first — verified
+        # against the 2026.1.3 core.py). Clear our key so async_unload_web
+        # skips the unsub: calling it now hits the ValueError branch inside
+        # EventBus._async_remove_listener, which logs "Unable to remove
+        # unknown job listener" into the error log (on-box 2026-10-30
+        # occurrence). A try/except around unsub() cannot fix that — the
+        # exception is caught and logged inside HA core.
+        flags.pop("started_recheck", None)
         _LOGGER.debug("HA started: re-checking panel registration mode")
         _register_page(hass, flags)
 
