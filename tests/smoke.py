@@ -3151,6 +3151,68 @@ async def main():
             "a state with a non-zero `for` self-wakes via _for_timers — "
             f"must not warn (R2#4): {sch_records[n_for:]}"
         )
+        # ④h R3#1 pin: a wall-clock gate (time) inside a DISABLED group
+        # still wakes the chain — next_wakeup walks the flat condition
+        # table and computes time edges from pure clock math, so the
+        # wakeup arm must accept it from the topological set, not the
+        # live set. Red before the R3#1 wall-clock split (live_ids pruned
+        # the disabled group's members → false alarm), green after.
+        n_wall = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "1" * 32, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "2" * 32, "type": "time", "after": "08:00"},
+            {"id": "cond_" + "a" * 32, "type": "and",
+             "conditions": ["cond_" + "2" * 32], "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "1" * 32, "cond_" + "a" * 32],
+             "off_conditions": []},
+        ], "triggers": []})
+        assert len(sch_records) == n_wall, (
+            "a time gate inside a disabled group still wakes via "
+            "next_wakeup's flat-table wall-clock edges — must not warn "
+            f"(R3#1): {sch_records[n_wall:]}"
+        )
+        # ④i R3#2 pin: a cooldown buried in a DISABLED group's members is
+        # never evaluated (the group short-circuits to True) — the
+        # off-chain polarity trap cannot exist there, so face ① must NOT
+        # warn. respect_enabled keeps the disabled node reachable and
+        # prunes only its outgoing edges. Red before (chain_reach walked
+        # the dead members), green after.
+        n_dead_cool = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "b" * 32, "type": "cooldown", "seconds": 60},
+            {"id": "cond_" + "a" * 32, "type": "and",
+             "conditions": ["cond_" + "b" * 32], "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [],
+             "off_conditions": ["cond_" + "a" * 32]},
+        ], "triggers": []})
+        assert len(sch_records) == n_dead_cool, (
+            "a cooldown behind a disabled group is never evaluated — its "
+            "off-chain trap cannot exist, must not warn "
+            f"(R3#2): {sch_records[n_dead_cool:]}"
+        )
+        # ④j R3#2 pin: an empty group behind a DISABLED group is likewise
+        # dead — face ④ must NOT warn about the inner one (the outer group
+        # itself has members and is exempt from the empty check). Red
+        # before (the dead member was judged), green after.
+        n_dead_empty = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "e" * 32, "type": "and", "conditions": []},
+            {"id": "cond_" + "a" * 32, "type": "and",
+             "conditions": ["cond_" + "e" * 32], "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "a" * 32],
+             "off_conditions": []},
+        ], "triggers": []})
+        assert len(sch_records) == n_dead_empty, (
+            "an empty group behind a disabled group is never evaluated — "
+            f"must not warn (R3#2): {sch_records[n_dead_empty:]}"
+        )
     finally:
         sch_logger.removeHandler(_sch_handler)
     print(

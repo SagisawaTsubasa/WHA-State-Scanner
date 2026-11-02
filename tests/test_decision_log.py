@@ -4,7 +4,8 @@ The ``bad_lines`` warning branch in ``decision_log._read_day_records_sync``
 previously had zero test coverage — deleting the branch or reverting the
 counter to a bare ``pass`` left every gate green. These pins assert:
 
-- a torn line warns exactly once AND the good lines still parse;
+- two torn lines warn exactly once per file — aggregated into a single
+  message that carries the count (R3#3) — AND the good lines still parse;
 - a clean file stays silent (the warning must not move into the loop and
   spam one line per record).
 """
@@ -49,7 +50,12 @@ def test_bad_line_warns_once_and_good_lines_still_parse(tmp_path, caplog):
     _write_day(
         tmp_path,
         CTRL_A,
-        [json.dumps(good), "{broken json", json.dumps(good2), ""],
+        [
+            json.dumps(good),
+            "{broken json",
+            json.dumps(good2),
+            "{also broken",
+        ],
     )
     with caplog.at_level(
         logging.WARNING, logger=decision_log._LOGGER.name
@@ -67,6 +73,10 @@ def test_bad_line_warns_once_and_good_lines_still_parse(tmp_path, caplog):
         if r.levelno >= logging.WARNING and "无法解析" in r.getMessage()
     ]
     assert len(warns) == 1, caplog.records
+    # R3#3: the count is aggregated per file and travels inside the one
+    # message — pin both faces, so neither the per-line spam shape (one
+    # warn per bad line) nor a message without the count can slip through.
+    assert "有 2 行无法解析" in warns[0].getMessage(), warns
 
 
 def test_clean_file_is_silent(tmp_path, caplog):

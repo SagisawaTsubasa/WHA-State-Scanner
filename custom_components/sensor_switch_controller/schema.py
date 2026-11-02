@@ -916,8 +916,9 @@ def _reachable_from_chains(
     flags and disabled conditions short-circuit in _evaluate_id, so a
     disabled flag's set/reset chain, a disabled group's members and a
     disabled gate's start/abort chain are never evaluated — dead branches
-    wake nothing. The wakeup/dependency face needs this live view (R2#1);
-    the topological faces keep the full edge set.
+    wake nothing. The wakeup/dependency and chain faces need this live
+    view (R2#1/R3#2); only the pure topological faces keep the full edge
+    set.
     """
     by_id = {
         c.get("id"): c
@@ -971,11 +972,13 @@ def _warn_static_hazards(
     compatibility rule is warn-only, same as the flag dead-branch history):
     existing legal configs must keep saving after an upgrade. Four faces,
     each judged on the graph its claim needs (they are NOT one shared
-    graph, R2#1): face ④ the evaluation-edge set, face ① its OFF-chain
-    subset, face ③ the topological routing set, face ② both — the
-    topological set for the signal-coverage arm (wiring is topology) and
-    the live set (disabled subtrees pruned) for the dependency/timer arms
-    (dead branches wake nothing). Details at each face:
+    graph, R2#1): face ④ the live evaluation-edge set, face ① its OFF-chain
+    subset (both R3#2 — disabled subtrees pruned, direct chains still
+    warn), face ③ the topological routing set, face ② both — the
+    topological set for the signal-coverage arm (wiring is topology) and,
+    in the wakeup arm, wall-clock gates from the topological set
+    (pure clock/state computations, R3#1) versus evaluation-born timers
+    from the live set (dead branches start nothing). Details at each face:
 
     ① cooldown on an off-chain — the off-side polarity trap (the defect this
     batch was filed for): with no flip history the cooldown reads True, and
@@ -1012,34 +1015,45 @@ def _warn_static_hazards(
         if isinstance(out, dict) and out.get("entity_id")
     ]
     eval_chains = ("on_conditions", "off_conditions")
+    # off_reach/chain_reach judge the LIVE view too (R3#2): a member behind
+    # a DISABLED group is never evaluated (the group short-circuits to
+    # True), so warning about it judges a dead branch. respect_enabled
+    # keeps the disabled node itself reachable and prunes only its outgoing
+    # edges — a cooldown or empty group chained DIRECTLY to an output is
+    # still reached and still warns exactly as before (faces ①/④), while
+    # members buried in a disabled subtree stop being judged.
     off_reach = _reachable_from_chains(
-        conditions, outputs, out_ids, ("off_conditions",), False
+        conditions, outputs, out_ids, ("off_conditions",), False,
+        respect_enabled=True,
     )
     chain_reach = _reachable_from_chains(
-        conditions, outputs, out_ids, eval_chains, False
+        conditions, outputs, out_ids, eval_chains, False,
+        respect_enabled=True,
     )
     route_reach = _reachable_from_chains(
         conditions, outputs, out_ids, eval_chains, True
     )
-    # live_reach (R2#1): the routing edge set with disabled subtrees
-    # pruned — the DEPENDENCY view. A disabled flag's set/reset chain, a
-    # disabled group's members and a disabled gate's start chain are never
-    # evaluated (step_flags skips disabled flags; disabled conditions
-    # short-circuit to True), so they wake nothing: the calendar and
-    # timer arms of face ② must judge this live view, not route_reach.
-    # The signal arm below keeps route_reach — triggering is topological
+    # live_reach (R2#1, refined R3#1): the routing edge set with disabled
+    # subtrees pruned — the EVALUATION view. It is the right graph for
+    # evaluation-born wakeups ONLY: a duration/`for` timer exists because
+    # its gate was actually evaluated (_apply_for / _duration_timers), so
+    # a gate inside a disabled subtree starts nothing. Wall-clock gates
+    # (time/sun/debounce/cooldown) are the exception — next_wakeup walks
+    # the flat condition table and computes their edges from pure
+    # clock/state timestamps (condition_engine :442-459), so a wall-clock
+    # gate inside a disabled group still wakes the chain and the wakeup
+    # arm below must accept it from route_reach, not live_ids.
+    # The signal arm keeps route_reach — triggering is topological
     # (the routing index ignores enabled; every fire re-evaluates the
     # chain), which is exactly what ④c pinned.
     live_reach = _reachable_from_chains(
         conditions, outputs, out_ids, eval_chains, True, respect_enabled=True
     )
-    wakeup_types = {
-        COND_TIME,
-        COND_SUN,
-        COND_DURATION,
-        COND_DEBOUNCE,
-        COND_COOLDOWN,
-    }
+    # wall-clock wakeup types (R3#1): computed by next_wakeup from pure
+    # clock/state timestamps, no evaluation-time timer involved. COND_DURATION
+    # and `for` gates are deliberately absent — they are evaluation-born
+    # (see the wakeup arm below and live_reach above).
+    wall_clock_types = {COND_TIME, COND_SUN, COND_DEBOUNCE, COND_COOLDOWN}
 
     for out in outputs:
         if not isinstance(out, dict) or not out.get("entity_id"):
@@ -1061,25 +1075,35 @@ def _warn_static_hazards(
                 out_label,
                 cond.get("label") or cid,
             )
-        # ② calendar as the only gate of an output (F-320). Two graphs:
-        # the dependency/timer arms judge the LIVE edge set (live_reach —
-        # routing edges with disabled subtrees pruned), because a disabled
-        # flag's set/reset chain, a disabled group's members and a
-        # disabled gate's start chain are never evaluated (step_flags
-        # skips disabled flags; disabled conditions short-circuit to
-        # True) and a calendar reachable only through them is dead wiring
-        # (R2#1 — both faces: the false alarm [flag(disabled, set=
-        # [calendar])] and the missed alarm [calendar, flag(disabled,
-        # set=[duration])]). The signal arm keeps the topological set:
+        # ② calendar as the only gate of an output (F-320). The wakeup arm
+        # splits by wakeup kind (R3#1 — the R2#1 live-graph split is only
+        # valid for evaluation-born wakeups). Timer wakeups (duration,
+        # `for`) judge the LIVE edge set (live_reach — routing edges with
+        # disabled subtrees pruned), because such a timer exists only if
+        # its gate was actually evaluated (_apply_for /
+        # _duration_timers): a disabled flag's set/reset chain, a
+        # disabled group's members and a disabled gate's start chain are
+        # never evaluated (step_flags skips disabled flags; disabled
+        # conditions short-circuit to True) and a timer reachable only
+        # through them is dead wiring (R2#1 — both faces: the false alarm
+        # [flag(disabled, set=[calendar])] and the missed alarm
+        # [calendar, flag(disabled, set=[duration])]). Wall-clock gates
+        # (time/sun/debounce/cooldown) are the exception: next_wakeup
+        # offers their edges from pure clock/state computations
+        # (condition_engine :442-459) and walks the FLAT condition table —
+        # a wall-clock gate inside a disabled group still wakes the chain
+        # — so they are accepted from the topological set (wakeup_ids).
+        # The signal arm keeps the topological set:
         # the routing index ignores enabled, so every trigger fire wakes
         # the chain (R1#1 ④c) — but only ENABLED triggers ever register a
-        # listener, hence wakeup_covered (R2#2). Within the live arms
+        # listener, hence wakeup_covered (R2#2). Within the wakeup arm
         # enabled still filters: a DISABLED calendar is not a gate (no
         # warning) and a disabled timer gate never self-wakes
         # (next_wakeup skips it) (F-346, mirrors the F-336 disabled-group
-        # fix on face ④; face ④ keeps the evaluation-edge set because a
-        # flag's verdict is a latched read — its own members never
-        # influence the output's own verdict, see _reachable_from_chains).
+        # fix on face ④; face ④ keeps the live evaluation-edge set
+        # (R3#2) because a flag's verdict is a latched read — its own
+        # members never influence the output's own verdict, see
+        # _reachable_from_chains).
         # A non-zero `for` counts beside the timing gates (R2#4):
         # next_wakeup offers _for_timers right beside _duration_timers,
         # and validation normalizes `for` to a non-zero
@@ -1095,11 +1119,18 @@ def _warn_static_hazards(
             and by_id.get(cid, {}).get("enabled") is not False
         ]
         if cal_ids:
+            # two-tier wakeup acceptance (R3#1): wall-clock gates qualify
+            # from the topological set alone (their edges are pure
+            # clock/state math — no evaluation needed, so a disabled
+            # subtree containing one still wakes); duration/`for` gates
+            # qualify only from the live set (a timer exists only if its
+            # gate was evaluated). Enabled still filters both tiers.
             has_other_wakeup = any(
-                (cid in live_ids
-                 and by_id.get(cid, {}).get("enabled") is not False
-                 and (by_id.get(cid, {}).get("type") in wakeup_types
-                      or by_id.get(cid, {}).get("for")))
+                by_id.get(cid, {}).get("enabled") is not False
+                and (by_id.get(cid, {}).get("type") in wall_clock_types
+                     or (cid in live_ids
+                         and (by_id.get(cid, {}).get("type") == COND_DURATION
+                              or by_id.get(cid, {}).get("for"))))
                 or cid in wakeup_covered
                 for cid in wakeup_ids
                 if by_id.get(cid, {}).get("type") != COND_CALENDAR
