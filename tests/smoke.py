@@ -3058,6 +3058,99 @@ async def main():
             "a flag's duration member is a wakeup source via the routing "
             f"index — must not warn (R1#1): {sch_records[n_cov:]}"
         )
+        # ④e R2#1 live-graph pins (both directions of the adjacency
+        # regression): the wakeup face must judge the LIVE edge set
+        # (disabled subtrees pruned), not the raw routing set.
+        # ④e-A false alarm: a disabled flag's set=[calendar] chain is dead
+        # wiring — step_flags skips disabled flags, so the calendar is
+        # never evaluated and must NOT warn. Red before the R2#1
+        # live_reach split (route_reach walked the set edge), green after.
+        n_live = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "1" * 32, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "c" * 32, "type": "flag",
+             "set_conditions": ["cond_" + "1" * 32],
+             "reset_conditions": [], "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "c" * 32], "off_conditions": []},
+        ], "triggers": []})
+        assert len(sch_records) == n_live, (
+            "a calendar behind a disabled flag's set edge is dead wiring — "
+            f"must not warn (R2#1): {sch_records[n_live:]}"
+        )
+        # ④e-B missed alarm (the dangerous half): [calendar,
+        # flag(disabled, set=[duration])] — the routing set reaches the
+        # duration through the flag edge and would silence the warning,
+        # but the disabled flag never steps, the duration never starts,
+        # and the chain's only real gate is the calendar. MUST warn. Red
+        # before the R2#1 split (wakeup_types saw the dead duration),
+        # green after.
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "1" * 32, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "2" * 32, "type": "state", "entity_id": "switch.d",
+             "state": "on"},
+            {"id": "cond_" + "3" * 32, "type": "duration", "seconds": 5,
+             "start": "cond_" + "2" * 32, "abort": None},
+            {"id": "cond_" + "c" * 32, "type": "flag",
+             "set_conditions": ["cond_" + "3" * 32],
+             "reset_conditions": [], "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "1" * 32, "cond_" + "c" * 32],
+             "off_conditions": []},
+        ], "triggers": []})
+        assert len(sch_records) == n_live + 1, (
+            "a duration behind a disabled flag never starts — the calendar "
+            f"is the only gate and must warn (R2#1): {sch_records[n_live:]}"
+        )
+        # ④f R2#2 pin: signal coverage by a DISABLED trigger wakes
+        # nothing (TriggerManager.async_setup skips disabled triggers — no
+        # listener ever fires), so the wakeup face must count ENABLED
+        # triggers only. Red before the wakeup_covered split (the raw
+        # signal_covered set counted the dead line), green after.
+        n_cov2 = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "1" * 32, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "2" * 32, "type": "state", "entity_id": "switch.c",
+             "state": "on", "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "1" * 32, "cond_" + "2" * 32],
+             "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "2" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": ["cond_" + "2" * 32]},
+                         "enabled": False}]})
+        assert len(sch_records) == n_cov2 + 1, (
+            "a state covered only by a disabled trigger never wakes the "
+            f"chain — must warn (R2#2): {sch_records[n_cov2:]}"
+        )
+        # ④g R2#4 pin: a leaf's non-zero `for` is an independent wakeup
+        # source — next_wakeup offers _for_timers beside _duration_timers,
+        # and validation normalizes `for` to a non-zero
+        # {hours,minutes,seconds} dict or drops the key — so
+        # [state(for=…), calendar] with no signal coverage must NOT warn.
+        # Red before the wakeup arm extension, green after.
+        n_for = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": "cond_" + "1" * 32, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "2" * 32, "type": "state", "entity_id": "switch.d",
+             "state": "on",
+             "for": {"hours": 0, "minutes": 5, "seconds": 0}},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "1" * 32, "cond_" + "2" * 32],
+             "off_conditions": []},
+        ], "triggers": []})
+        assert len(sch_records) == n_for, (
+            "a state with a non-zero `for` self-wakes via _for_timers — "
+            f"must not warn (R2#4): {sch_records[n_for:]}"
+        )
     finally:
         sch_logger.removeHandler(_sch_handler)
     print(

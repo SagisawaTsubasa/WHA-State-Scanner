@@ -897,6 +897,7 @@ def _reachable_from_chains(
     out_ids: list[str],
     chain_keys: tuple[str, ...],
     include_flag_edges: bool,
+    respect_enabled: bool = False,
 ) -> dict[str, set[str]]:
     """Per-output reachable condition ids from the named output chains.
 
@@ -908,6 +909,15 @@ def _reachable_from_chains(
     ``True`` mirrors the runtime routing index —
     controller._build_route_index walks the same edge set — for the
     trigger-target reachability warning, so the two can never drift.
+
+    ``respect_enabled=True`` prunes every DISABLED condition's outgoing
+    edges (the node itself stays reachable — the engine short-circuits it
+    to True, a constant rather than a gate): step_flags skips disabled
+    flags and disabled conditions short-circuit in _evaluate_id, so a
+    disabled flag's set/reset chain, a disabled group's members and a
+    disabled gate's start/abort chain are never evaluated — dead branches
+    wake nothing. The wakeup/dependency face needs this live view (R2#1);
+    the topological faces keep the full edge set.
     """
     by_id = {
         c.get("id"): c
@@ -932,6 +942,8 @@ def _reachable_from_chains(
             if not cond:
                 continue
             reach.setdefault(out_id, set()).add(cid)
+            if respect_enabled and cond.get("enabled") is False:
+                continue
             stack.extend(
                 m for m in cond.get("conditions") or [] if isinstance(m, str)
             )
@@ -958,7 +970,12 @@ def _warn_static_hazards(
     """Save-time static hazard warnings — NEVER rejecting (the upgrade
     compatibility rule is warn-only, same as the flag dead-branch history):
     existing legal configs must keep saving after an upgrade. Four faces,
-    all judged on the same graph the engine will evaluate:
+    each judged on the graph its claim needs (they are NOT one shared
+    graph, R2#1): face ④ the evaluation-edge set, face ① its OFF-chain
+    subset, face ③ the topological routing set, face ② both — the
+    topological set for the signal-coverage arm (wiring is topology) and
+    the live set (disabled subtrees pruned) for the dependency/timer arms
+    (dead branches wake nothing). Details at each face:
 
     ① cooldown on an off-chain — the off-side polarity trap (the defect this
     batch was filed for): with no flip history the cooldown reads True, and
@@ -976,6 +993,19 @@ def _warn_static_hazards(
         for trg in triggers or []
         for member in (trg.get(CONF_ROUTES) or {}).get("conditions") or []
     }
+    # wakeup_covered (R2#2) filters to ENABLED triggers only:
+    # TriggerManager.async_setup skips disabled triggers — they never
+    # register a listener, so their lines cannot wake anything and must
+    # not count as a wakeup source. Face ④ below still uses the raw
+    # signal_covered: an anchor's coverage is a wiring fact (a disabled
+    # trigger's line must still empty-group-exempt its target, else a
+    # disable→save would falsely warn an empty anchor group).
+    wakeup_covered = {
+        member
+        for trg in triggers or []
+        if trg.get("enabled", True) is not False
+        for member in (trg.get(CONF_ROUTES) or {}).get("conditions") or []
+    }
     out_ids = [
         out["entity_id"]
         for out in outputs
@@ -990,6 +1020,18 @@ def _warn_static_hazards(
     )
     route_reach = _reachable_from_chains(
         conditions, outputs, out_ids, eval_chains, True
+    )
+    # live_reach (R2#1): the routing edge set with disabled subtrees
+    # pruned — the DEPENDENCY view. A disabled flag's set/reset chain, a
+    # disabled group's members and a disabled gate's start chain are never
+    # evaluated (step_flags skips disabled flags; disabled conditions
+    # short-circuit to True), so they wake nothing: the calendar and
+    # timer arms of face ② must judge this live view, not route_reach.
+    # The signal arm below keeps route_reach — triggering is topological
+    # (the routing index ignores enabled; every fire re-evaluates the
+    # chain), which is exactly what ④c pinned.
+    live_reach = _reachable_from_chains(
+        conditions, outputs, out_ids, eval_chains, True, respect_enabled=True
     )
     wakeup_types = {
         COND_TIME,
@@ -1019,32 +1061,46 @@ def _warn_static_hazards(
                 out_label,
                 cond.get("label") or cid,
             )
-        # ② calendar as the only gate of an output (F-320). Judged on the
-        # RUNTIME edge set (route_reach mirrors _build_route_index), not the
-        # evaluation-edge off_ids face ④ keeps: the wakeup face is
-        # topological — add_chain ignores enabled and walks the flag
-        # set/reset edges, and next_wakeup aims a directed wakeup at a
-        # flag's timer members — so a disabled-but-signal-covered condition
-        # still wakes the chain and a [flag(set=duration), calendar] chain
-        # has a wakeup source (R1#1). Within the arms enabled still
-        # filters: a DISABLED calendar is not a gate (no warning) and a
-        # disabled timer gate never self-wakes (next_wakeup skips it)
-        # (F-346, mirrors the F-336 disabled-group fix on face ④; face ④
-        # keeps the evaluation-edge set because a flag's verdict is a
-        # latched read — its own members never influence the output's own
-        # verdict, see _reachable_from_chains).
+        # ② calendar as the only gate of an output (F-320). Two graphs:
+        # the dependency/timer arms judge the LIVE edge set (live_reach —
+        # routing edges with disabled subtrees pruned), because a disabled
+        # flag's set/reset chain, a disabled group's members and a
+        # disabled gate's start chain are never evaluated (step_flags
+        # skips disabled flags; disabled conditions short-circuit to
+        # True) and a calendar reachable only through them is dead wiring
+        # (R2#1 — both faces: the false alarm [flag(disabled, set=
+        # [calendar])] and the missed alarm [calendar, flag(disabled,
+        # set=[duration])]). The signal arm keeps the topological set:
+        # the routing index ignores enabled, so every trigger fire wakes
+        # the chain (R1#1 ④c) — but only ENABLED triggers ever register a
+        # listener, hence wakeup_covered (R2#2). Within the live arms
+        # enabled still filters: a DISABLED calendar is not a gate (no
+        # warning) and a disabled timer gate never self-wakes
+        # (next_wakeup skips it) (F-346, mirrors the F-336 disabled-group
+        # fix on face ④; face ④ keeps the evaluation-edge set because a
+        # flag's verdict is a latched read — its own members never
+        # influence the output's own verdict, see _reachable_from_chains).
+        # A non-zero `for` counts beside the timing gates (R2#4):
+        # next_wakeup offers _for_timers right beside _duration_timers,
+        # and validation normalizes `for` to a non-zero
+        # {hours,minutes,seconds} dict or drops the key entirely
+        # (_validate_for), so a truthy value is exactly "a live FOR timer
+        # can exist here".
         wakeup_ids = route_reach.get(out["entity_id"], set())
+        live_ids = live_reach.get(out["entity_id"], set())
         cal_ids = [
             cid
-            for cid in wakeup_ids
+            for cid in live_ids
             if by_id.get(cid, {}).get("type") == COND_CALENDAR
             and by_id.get(cid, {}).get("enabled") is not False
         ]
         if cal_ids:
             has_other_wakeup = any(
-                (by_id.get(cid, {}).get("enabled") is not False
-                 and by_id.get(cid, {}).get("type") in wakeup_types)
-                or cid in signal_covered  # coverage is topological: no enabled
+                (cid in live_ids
+                 and by_id.get(cid, {}).get("enabled") is not False
+                 and (by_id.get(cid, {}).get("type") in wakeup_types
+                      or by_id.get(cid, {}).get("for")))
+                or cid in wakeup_covered
                 for cid in wakeup_ids
                 if by_id.get(cid, {}).get("type") != COND_CALENDAR
             )

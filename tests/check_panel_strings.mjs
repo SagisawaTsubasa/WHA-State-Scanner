@@ -9,10 +9,11 @@
 //   3. no CJK characters inside string literals OUTSIDE the LANG
 //      dictionary (F-338 regression: hardcoded client copy leaks into the
 //      en UI; comments are ignored)
-//   4. every tr("key") literal and every value of the three label maps
+//   4. every tr("key")/trk("key") literal (both translation aliases) and
+//      every value of the three label maps
 //      (TYPE_LABEL_KEY / TRIGGER_LABEL_KEY / _PORT_LABELS) exists in
 //      zh-Hans (R1#4: deleting a LANG key while usages remain renders the
-//      raw key in the UI)
+//      raw key in the UI; R2#3 adds the trk alias face)
 //
 // Usage: node tests/check_panel_strings.mjs   (exit 0 = pass, 1 = fail)
 
@@ -74,13 +75,19 @@ if (enOnly.length) errors.push(`keys missing in zh-Hans: ${enOnly.join(", ")}`);
 // through to the key itself) — deleting LANG keys while usages remain is
 // exactly the failure mode this guards. Also checked: the three label maps
 // whose VALUES are LANG keys consumed as this.tr(MAP[kind]).
+// (R2#3) panel.js has a second translation entry — the `trk` alias
+// (conditionSummary: `const trk = tr || ((k) => k)`, _condFieldsHtml:
+// `const trk = (k) => this.tr(k)`); every registered alias is scanned the
+// same way. A NEW alias in panel.js MUST be added to TR_FNS here or its
+// literal refs go unchecked.
+const TR_FNS = ["tr", "trk"];
 function collectLangRefs(marker) {
   const i0 = lines.findIndex((l) => l.includes(marker));
   if (i0 < 0) throw new Error(`LANG-key map not found: ${marker}`);
   const refs = [];
   for (let i = i0; i < lines.length; i++) {
     for (const m of lines[i].matchAll(/:\s*["']([A-Za-z0-9_]+)["']/g)) {
-      refs.push({ key: m[1], line: i + 1 });
+      refs.push({ key: m[1], line: i + 1, fn: "map" });
     }
     if (lines[i].trimEnd().endsWith("};")) break;
   }
@@ -88,8 +95,11 @@ function collectLangRefs(marker) {
 }
 const directRefs = [];
 for (let i = 0; i < lines.length; i++) {
-  for (const m of lines[i].matchAll(/\btr\("([A-Za-z0-9_]+)"\)/g)) {
-    directRefs.push({ key: m[1], line: i + 1 });
+  for (const fn of TR_FNS) {
+    const re = new RegExp(`\\b${fn}\\("([A-Za-z0-9_]+)"\\)`, "g");
+    for (const m of lines[i].matchAll(re)) {
+      directRefs.push({ key: m[1], line: i + 1, fn });
+    }
   }
 }
 const indirectRefs = [
@@ -100,7 +110,7 @@ const indirectRefs = [
 for (const ref of [...directRefs, ...indirectRefs]) {
   if (!zhKeys.has(ref.key)) {
     errors.push(
-      `line ${ref.line}: LANG key "${ref.key}" referenced but missing from zh-Hans`,
+      `line ${ref.line}: LANG key "${ref.key}" referenced via ${ref.fn} but missing from zh-Hans`,
     );
   }
 }
@@ -286,7 +296,9 @@ if (errors.length) {
   for (const e of errors) console.error(`  - ${e}`);
   process.exit(1);
 }
+const trRefCount = directRefs.filter((r) => r.fn === "tr").length;
+const trkRefCount = directRefs.filter((r) => r.fn === "trk").length;
 console.log(
   `panel strings OK: zh=${zhKeys.size} keys, en=${enKeys.size} keys, sets equal, no dupes, ` +
-    `${directRefs.length} tr() refs + ${indirectRefs.length} map-value refs resolve, no CJK outside LANG`,
+    `${trRefCount} tr() refs + ${trkRefCount} trk() refs + ${indirectRefs.length} map-value refs resolve, no CJK outside LANG`,
 );
