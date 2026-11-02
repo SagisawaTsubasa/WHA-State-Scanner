@@ -180,7 +180,13 @@ details.wha-json pre {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 190px 1fr 320px;
+  /* 360px (was 320px): the entity-picker popover opens at the inspector
+     field's own width (frontend 20260107.2 pins --body-width to the host
+     offsetWidth and clamps ::part(body) to max(var(--body-width), 250px);
+     two shadow layers block any wider override from out here), so the
+     readable dropdown width IS this column width — see plan §2 overlay
+     probe. 190px palette + 360px inspector keeps the canvas usable. */
+  grid-template-columns: 190px 1fr 360px;
   gap: 8px;
 }
 .wha-palette {

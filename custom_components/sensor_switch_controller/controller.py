@@ -1,4 +1,4 @@
-"""Controller manager – orchestrates triggers, sensors, conditions, outputs.
+"""Controller manager – orchestrates triggers, conditions, outputs.
 
 Since 0.5.0 evaluation is trigger-driven: the controller's TriggerManager
 fires on configured events (state changes / time / sun / HA start), the
@@ -40,7 +40,6 @@ from .const import (
     CONF_OUTPUTS,
     CONF_RESET_CONDITIONS,
     CONF_ROUTES,
-    CONF_SENSORS,
     CONF_SET_CONDITIONS,
     CONF_START,
     CONF_TRIGGERS,
@@ -67,7 +66,6 @@ class ControllerManager:
         self.name = config.get("name", controller_id)
         self.enabled = config.get("enabled", True)
         self.triggers = config.get(CONF_TRIGGERS, [])
-        self.sensors = config.get(CONF_SENSORS, [])
         self.conditions = config.get(CONF_CONDITIONS, [])
         self.outputs = config.get(CONF_OUTPUTS, [])
         self.logging_enabled = config.get(CONF_LOGGING, False)
@@ -140,7 +138,6 @@ class ControllerManager:
         }
         self._added_out_ids: set[str] = set()
         self._first_eval_pending = True
-        self._warned_bad_sensors = False
 
         # Debounced trigger firings (trigger ids + log descriptions).
         self._debounce_unsub = None
@@ -437,24 +434,6 @@ class ControllerManager:
     # Evaluation
     # ------------------------------------------------------------------
 
-    def _async_read_sensors(self) -> dict[str, Any]:
-        """Collect current states of the configured sensor pool."""
-        readings: dict[str, Any] = {}
-        for sensor_cfg in self.sensors:
-            if not isinstance(sensor_cfg, dict):
-                continue
-            eid = sensor_cfg.get("entity_id")
-            if not eid:
-                if not self._warned_bad_sensors:
-                    self._warned_bad_sensors = True
-                    _LOGGER.warning(
-                        "Sensor entry without entity_id is skipped: %r", sensor_cfg
-                    )
-                continue
-            state = self.hass.states.get(eid)
-            readings[eid] = state.state if state else None
-        return readings
-
     def _stack_targets(self, targets: set[str] | None) -> None:
         """Accumulate a swallowed run's scope. ``None`` = full sweep and
         absorbs any directed set already stacked; directed sets union."""
@@ -529,7 +508,6 @@ class ControllerManager:
         # looked retired (审查 R5-2).
         if targets is None and self._expected_out_ids <= self._added_out_ids:
             self._first_eval_pending = False
-        readings = self._async_read_sensors()
         flipped = await self.engine.step_flags()
         if flipped:
             await self._persist_flag_states()
@@ -550,7 +528,7 @@ class ControllerManager:
             if targets is not None and out_id not in targets:
                 continue
             try:
-                record, _details = await self._async_evaluate_output(out_cfg, readings)
+                record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:
                 _LOGGER.exception(
                     "Error evaluating output '%s'", out_cfg.get("name", "<unknown>")
@@ -612,7 +590,7 @@ class ControllerManager:
             )
 
     async def _async_evaluate_output(
-        self, out_cfg: dict, readings: dict[str, Any], detailed: bool = False
+        self, out_cfg: dict, detailed: bool = False
     ) -> tuple[dict, dict | None]:
         """Evaluate one output and apply its action.
 
@@ -668,10 +646,11 @@ class ControllerManager:
             "off_met": off_met,
             "applied": applied,
             "override": overridden,
-            "readings": readings,
             # 0.10.0 causal detail: per-condition verdicts of the evaluated
             # chains (same code path as before — evaluate_detailed only adds
             # the trace dict), so the decision log answers "why" per cycle.
+            # 0.12.0: the full-pool "readings" snapshot is retired with the
+            # sensor-pool mechanism itself (old log files keep theirs).
             "conditions": {**on_details, **off_details},
         }
 
@@ -723,7 +702,6 @@ class ControllerManager:
             return await self._async_evaluate_with_details_locked()
 
     async def _async_evaluate_with_details_locked(self) -> dict:
-        readings = self._async_read_sensors()
         flipped = await self.engine.step_flags()
         if flipped:
             await self._persist_flag_states()
@@ -735,7 +713,7 @@ class ControllerManager:
                 continue
             try:
                 record, details = await self._async_evaluate_output(
-                    out_cfg, readings, detailed=True
+                    out_cfg, detailed=True
                 )
             except Exception:
                 _LOGGER.exception(
@@ -753,7 +731,7 @@ class ControllerManager:
             await self.logger.log_cycle(records)
 
         self._rearm_for_wakeup()
-        return {"readings": readings, "outputs": outputs, "conditions": conditions}
+        return {"outputs": outputs, "conditions": conditions}
 
     async def async_observe_conditions(self) -> dict:
         """Read-only evaluation for the panel's live status display.
@@ -763,7 +741,6 @@ class ControllerManager:
         consistent), but applies nothing: no flips, no log, no last_flip.
         """
         async with self._eval_lock:
-            readings = self._async_read_sensors()
             all_ids: list[str] = []
             seen: set[str] = set()
             stack: list[str] = []
@@ -827,7 +804,7 @@ class ControllerManager:
             # (WHA-F-130) — re-arming from a GET would let merely opening
             # the editor derive a real evaluation (and actuation). Any
             # trigger/real cycle re-arms anyway.
-            return {"readings": readings, "conditions": results}
+            return {"conditions": results}
 
     async def async_evaluate_output(self, out_id: str) -> None:
         """Evaluate only the output identified by its internal id (service API)."""
@@ -842,13 +819,12 @@ class ControllerManager:
         if out_cfg is None:
             _LOGGER.warning("Unknown output id '%s'; nothing to evaluate", out_id)
             return
-        readings = self._async_read_sensors()
         async with self._eval_lock:
             flipped = await self.engine.step_flags()
             if flipped:
                 await self._persist_flag_states()
             try:
-                record, _details = await self._async_evaluate_output(out_cfg, readings)
+                record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:
                 _LOGGER.exception(
                     "Error evaluating output '%s'", out_cfg.get("name", out_id)

@@ -1017,16 +1017,25 @@ def _warn_static_hazards(
                 out_label,
                 cond.get("label") or cid,
             )
-        # ② calendar as the only gate of an output (F-320)
+        # ② calendar as the only gate of an output (F-320). The engine treats
+        # a disabled condition as constant True that never wakes up on its
+        # own (next_wakeup skips it), so a DISABLED calendar is not a gate
+        # (no warning) and a disabled non-calendar condition is not an
+        # "other wakeup" source either — both faces filter on enabled
+        # (F-346, mirrors the F-336 disabled-group fix on face ④).
         cal_ids = [
             cid
             for cid in off_ids
             if by_id.get(cid, {}).get("type") == COND_CALENDAR
+            and by_id.get(cid, {}).get("enabled") is not False
         ]
         if cal_ids:
             has_other_wakeup = any(
-                by_id.get(cid, {}).get("type") in wakeup_types
-                or cid in signal_covered
+                by_id.get(cid, {}).get("enabled") is not False
+                and (
+                    by_id.get(cid, {}).get("type") in wakeup_types
+                    or cid in signal_covered
+                )
                 for cid in off_ids
                 if by_id.get(cid, {}).get("type") != COND_CALENDAR
             )
@@ -1295,20 +1304,14 @@ def validate_controller(data) -> dict:
     if not name:
         _fail("控制器名称不能为空")
 
-    sensors: list[dict] = []
-    seen_sensors: set[str] = set()
-    raw_sensors = data.get("sensors") or []
-    if not isinstance(raw_sensors, list):
-        _fail("传感器池必须是列表")
-    for raw in raw_sensors:
-        if not isinstance(raw, dict):
-            _fail("传感器池条目必须是对象")
-        entity_id = _validate_entity_id(raw.get("entity_id"), "传感器池实体")
-        if entity_id in seen_sensors:
-            continue
-        seen_sensors.add(entity_id)
-        sensors.append(
-            {"entity_id": entity_id, "alias": _optional_str(raw.get("alias"), "传感器别名")}
+    if "sensors" in data:
+        # 0.12.0: the sensor-pool field is retired (stored configs had the
+        # key stripped by the v8 migration, so this only fires on external
+        # payloads — e.g. replaying a pre-0.12.0 config export). Accept and
+        # drop loudly instead of 400-ing the whole replay.
+        _LOGGER.warning(
+            "控制器配置携带已退役的 sensors 字段（传感器池机制已于 0.12.0 下"
+            "线）：接受并丢弃该字段；存量决策日志中的 readings 快照保留只读"
         )
 
     raw_conditions = data.get("conditions") or []
@@ -1329,7 +1332,6 @@ def validate_controller(data) -> dict:
         "enabled": _to_bool(data.get("enabled", True), "控制器 enabled"),
         "logging_enabled": _to_bool(data.get("logging_enabled", False), "控制器 logging_enabled"),
         "triggers": triggers,
-        "sensors": sensors,
         "conditions": conditions,
         "outputs": outputs,
     }

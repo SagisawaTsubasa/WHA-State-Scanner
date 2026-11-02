@@ -8,7 +8,7 @@ ENTRY_TITLE = "HA 全屋状态扫描"
 # Storage (single config entry, all controllers in one Store)
 # ------------------------------------------------------------------
 STORE_KEY = DOMAIN
-STORE_VERSION = 7
+STORE_VERSION = 8
 CONF_CONTROLLERS = "controllers"
 CTRL_ID_PREFIX = "ctrl_"
 
@@ -38,7 +38,6 @@ HUB_PAGE_ORDER = 40
 # ------------------------------------------------------------------
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_LOGGING = "logging_enabled"
-CONF_SENSORS = "sensors"
 CONF_CONDITIONS = "conditions"
 CONF_OUTPUTS = "outputs"
 CONF_ENABLED = "enabled"

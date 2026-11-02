@@ -15,8 +15,10 @@ LOG_DIR_NAME = "sensor_switch_controller_logs"
 LOG_FILE_PREFIX = "log_"
 LOG_RETENTION_DAYS = 30
 READ_LIMIT_MAX = 5000
-# Records carry full sensor-pool snapshots; never read more than the tail
-# of a day file (records beyond this simply cannot match a sane limit).
+# Records used to carry full sensor-pool snapshots (pre-0.12.0 log files
+# still do — the pool retired in 0.12.0 leaves no readings key in new
+# records); never read more than the tail of a day file (records beyond
+# this simply cannot match a sane limit).
 _TAIL_MAX_BYTES = 4 * 1024 * 1024
 
 

@@ -46,6 +46,8 @@ jobs:
         run: python tests/smoke.py
       - name: Syntax-check panel.js (no build step, node --check)
         run: node --check custom_components/sensor_switch_controller/static/panel.js
+      - name: Check panel i18n strings
+        run: node tests/check_panel_strings.mjs
       - name: Import under real HA
         run: |
           pip install homeassistant==2026.1.3

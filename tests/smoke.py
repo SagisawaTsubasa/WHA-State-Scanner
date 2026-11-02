@@ -339,6 +339,7 @@ from custom_components.sensor_switch_controller.hub import (  # noqa: E402
     _migrate_controller_v2,
     _migrate_controller_v4,
     _migrate_controller_v7,
+    _migrate_controller_v8,
     _strip_duration_coverage,
 )
 from custom_components.sensor_switch_controller.const import COND_DURATION  # noqa: E402
@@ -1012,6 +1013,68 @@ except ControllerValidationError:
     pass
 print("[PASS] WHA-F-309: disabled pool listener on empty pool stays valid+inert")
 
+# v7→v8 (0.12.0): the sensor pool is retired — the migration strips the
+# stored "sensors" key (logged, not silent) while the v7-materialized
+# trigger surfaces stay untouched.
+v8_after_v7 = _copy.deepcopy(v7_disabled_pool)  # still carries "sensors": []
+assert "sensors" in v8_after_v7
+_migrate_controller_v8(v8_after_v7)
+assert "sensors" not in v8_after_v7
+assert v8_after_v7["triggers"][0]["entity_id"] == [], (
+    v8_after_v7["triggers"][0]
+)
+_v8_validated = validate_controller(v8_after_v7)
+assert "sensors" not in _v8_validated
+# a payload still carrying the legacy key validates clean too (accept-drop)
+assert "sensors" not in validate_controller(v7_disabled_pool)
+print("[PASS] v7→v8 migration: retired sensors key stripped, v7 surface kept")
+
+# 0.12.0: external payloads carrying the retired "sensors" key are accepted
+# and dropped with a warning (legacy export replay must not 400) — while a
+# clean payload stays warning-free.
+import logging as _put_logging
+
+_put_records = []
+
+
+class _PutCap(_put_logging.Handler):
+    def emit(self, record):
+        _put_records.append(record.getMessage())
+
+
+_put_logger = _put_logging.getLogger(
+    "custom_components.sensor_switch_controller.schema"
+)
+_put_handler = _PutCap(level=_put_logging.WARNING)
+_put_logger.addHandler(_put_handler)
+try:
+    _replayed = validate_controller(v7_disabled_pool)  # carries "sensors": []
+    assert "sensors" not in _replayed
+    assert any("sensors" in m for m in _put_records), _put_records
+    _put_records.clear()
+    _clean = {
+        "name": "put-clean",
+        "triggers": [
+            {"id": v7_trg, "type": "state", "enabled": False,
+             "entity_id": ["switch.c"], "routes": {"conditions": [v7_leaf_a]}}
+        ],
+        "conditions": [
+            {"id": v7_leaf_a, "type": "state", "entity_id": "switch.c",
+             "state": "on"}
+        ],
+        "outputs": [],
+    }
+    validate_controller(_clean)
+    # pin is sensors-specific: other static-hazard warnings may fire on this
+    # shape, but the retired-key warning must not
+    assert not any("sensors" in m for m in _put_records), _put_records
+finally:
+    _put_logger.removeHandler(_put_handler)
+print(
+    "[PASS] retired sensors key on external payloads: accepted, dropped, "
+    "warned once per payload"
+)
+
 # WHA-F-310: pre-0.5 stores (no triggers key) — the mapped scan-interval
 # trigger is born DIRECTED: routes materialize the same signal-leaf set the
 # v7 migration uses, the shape passes validate_trigger, the id is derived
@@ -1219,7 +1282,6 @@ async def main():
             {"id": "trg_" + "5" * 32, "type": "time", "every_seconds": 3600,
              "routes": {"conditions": [ga]}},
         ],
-        "sensors": [],
         "conditions": [
             {"id": ga, "type": "state", "entity_id": "switch.c", "state": "on"},
             {"id": gb, "type": "state", "entity_id": "switch.d", "state": "on"},
@@ -1257,7 +1319,6 @@ async def main():
         "enabled": True,
         "logging_enabled": False,
         "triggers": [],
-        "sensors": [],
         "conditions": [
             {"id": cond_b, "type": "state", "entity_id": "switch.c", "state": "on"},
             {"id": cond_ab, "type": "state", "entity_id": "switch.d", "state": "on"},
@@ -1413,7 +1474,14 @@ async def main():
     obs = await mgr_obs.async_observe_conditions()
     # eng_cfg's condition ids: cond_b/CID_B-style ids reused from section 4
     assert set(obs["conditions"]) >= {cond_a, cond_b}, obs["conditions"]
-    assert obs["readings"]["switch.c"] == "on"
+    # 0.12.0: the sensor pool is retired — neither the observe response nor
+    # new decision records carry the readings snapshot anymore.
+    assert "readings" not in obs, obs.keys()
+    rec, _det = await mgr_obs._async_evaluate_output(
+        {"name": "obs-out", "type": "switch", "entity_id": out_a,
+         "on_conditions": [], "off_conditions": []}
+    )
+    assert rec and "readings" not in rec, rec.keys()
     assert _obs_lines() == before, "observe must not write decision logs"
     assert ent_o.is_on is False, "observe must not apply actions"
     assert mgr_obs.last_flip_at(out_a) is None
@@ -1442,7 +1510,6 @@ async def main():
     flag_cfg = {
         "name": "flag-smoke", "enabled": True, "logging_enabled": False,
         "triggers": [],
-        "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
             set_leaf, rst_leaf, dis_leaf,
             {"id": flag_a, "type": "flag",
@@ -1666,7 +1733,6 @@ async def main():
     latch_cfg = {
         "name": "self-latch", "enabled": True, "logging_enabled": False,
         "triggers": [],
-        "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
             {"id": latch_set, "type": "state",
              "entity_id": "switch.c", "state": "on"},
@@ -1781,7 +1847,7 @@ async def main():
     de_flag = "cond_" + "e" * 32
     dis_empty_cfg = {
         "name": "flag-dis-empty", "enabled": True, "logging_enabled": False,
-        "triggers": [], "sensors": [{"entity_id": "switch.c"}],
+        "triggers": [],
         "conditions": [
             {"id": dis_empty_grp, "type": "or", "conditions": [],
              "enabled": False},
@@ -1891,7 +1957,6 @@ async def main():
             "id": "trg_" + "1" * 32, "type": "homeassistant", "enabled": True,
             "routes": {"conditions": [x_id]},
         }],
-        "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
             {"id": x_id, "type": "state", "entity_id": "switch.c", "state": "on"},
             {"id": dir_flag, "type": "flag",
@@ -1958,7 +2023,6 @@ async def main():
     for_flag_cfg = {
         "name": "flag-for-reset", "enabled": True, "logging_enabled": False,
         "triggers": [],
-        "sensors": [{"entity_id": "switch.c"}, {"entity_id": "switch.d"}],
         "conditions": [
             {"id": s_leaf_id, "type": "state", "entity_id": "switch.c",
              "state": "on", "for": {"hours": 0, "minutes": 1, "seconds": 0}},
@@ -2009,7 +2073,6 @@ async def main():
         "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
                       "entity_id": "switch.c",
                       "routes": {"conditions": [x2_id]}}],
-        "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
             {"id": x2_id, "type": "state", "entity_id": "switch.c", "state": "on"},
             {"id": y2_id, "type": "state", "entity_id": "switch.d", "state": "on"},
@@ -2069,7 +2132,6 @@ async def main():
         "triggers": [{"id": "trg_" + "7" * 32, "type": "state",
                       "entity_id": "switch.c",
                       "routes": {"conditions": [u_cond]}}],
-        "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
             {"id": u_cond, "type": "state", "entity_id": "switch.c",
              "state": "on", "for": {"hours": 0, "minutes": 1, "seconds": 0}},
@@ -2138,7 +2200,7 @@ async def main():
 
     rst_cfg = {
         "name": "restore", "enabled": True, "logging_enabled": False,
-        "triggers": [], "sensors": [],
+        "triggers": [],
         "conditions": [
             {"id": "cond_" + "b" * 32, "type": "state",
              "entity_id": "switch.c", "state": "on"},
@@ -2287,7 +2349,6 @@ async def main():
             "entity_id": ["switch.c", "switch.d"],
             "routes": {"conditions": [ce_b]},
         }],
-        "sensors": [{"entity_id": "sensor.a"}, {"entity_id": "switch.c"}],
         "conditions": [
             {"id": ce_a, "type": "numeric_state", "entity_id": "sensor.a", "above": 20},
             {"id": ce_b, "type": "state", "entity_id": "switch.c", "state": "on"},
@@ -2353,7 +2414,7 @@ async def main():
     rid = "ctrl_ab12cd34"
     hub_t.controllers[rid] = _vc({
         "name": "sweep-me", "enabled": False, "logging_enabled": False,
-        "triggers": [], "sensors": [], "conditions": [],
+        "triggers": [], "conditions": [],
         "outputs": [],
     })
     # the R1-11 pin must be non-vacuous: seed flag states first (R5-10)
@@ -2667,19 +2728,30 @@ async def main():
 
     class _RecordingFlagStore:
         """Local recording stand-in: the module-level _Store stub is a
-        no-op, but this pin must observe the persisted payloads."""
+        no-op, but this pin must observe the persisted payloads AND the
+        call shape (F-343: a regression back to synchronous per-write
+        async_save must fail the pin, not just land the same payload)."""
 
         def __init__(self):
             self.saved = []
+            self.calls = []  # ("delay", delay) | ("save", None)
+            self.pending = None  # data_func of the last delayed write
 
         async def async_save(self, data):
+            self.calls.append(("save", None))
             self.saved.append(data)
 
         def async_delay_save(self, data_func, delay=0):
-            # F-339 stand-in: flush immediately so the pin below still
-            # observes the payload the debounced write carries (the real
-            # Store merges the burst and calls data_func at write time).
-            self.saved.append(data_func())
+            # F-339 stand-in: record the deferral and hold data_func — the
+            # payload is only observed after flush(), like the real Store
+            # merging the burst and calling data_func at write time.
+            self.calls.append(("delay", delay))
+            self.pending = data_func
+
+        def flush(self):
+            if self.pending is not None:
+                self.saved.append(self.pending())
+                self.pending = None
 
         async def async_load(self):
             return None
@@ -2689,6 +2761,13 @@ async def main():
     flip_at = _clock["utc"]
     await hub_f.async_save_last_flip("ctrl_ab12cd34", flip_out, flip_at)
     assert hub_f.last_flips["ctrl_ab12cd34"][flip_out] == flip_at.isoformat()
+    # F-343 discriminating pin: the flip-history write must have gone
+    # through the debounced path ONLY — a regression back to the old
+    # per-write async_save would append ("save", None) here instead.
+    assert hub_f._flag_store.calls == [("delay", 1)], (
+        hub_f._flag_store.calls
+    )
+    hub_f._flag_store.flush()
     saved_payload = hub_f._flag_store.saved[-1]
     assert saved_payload["last_flip"] == {"ctrl_ab12cd34": {flip_out: flip_at.isoformat()}}
     # F-325: mutate the live tables — the saved payload must not move
@@ -2710,7 +2789,6 @@ async def main():
         "triggers": [{"id": "trg_" + "8" * 32, "type": "state",
                       "entity_id": "switch.c",
                       "routes": {"conditions": ["cond_" + "a" * 32]}}],
-        "sensors": [{"entity_id": "switch.c"}],
         "conditions": [
             {"id": "cond_" + "a" * 32, "type": "state",
              "entity_id": "switch.c", "state": "on"},
@@ -2797,7 +2875,7 @@ async def main():
         hz_c2 = "cond_" + "b" * 32
         hz_o1 = "ssc_" + "1" * 32
         hz_base = {
-            "name": "hazards", "sensors": [{"entity_id": "switch.c"}],
+            "name": "hazards",
             "conditions": [
                 {"id": hz_c1, "type": "state", "entity_id": "switch.c",
                  "state": "on"},
@@ -2885,6 +2963,40 @@ async def main():
                          "entity_id": "switch.c",
                          "routes": {"conditions": [cal_id]}}]})
         assert sum("日历条件" in r for r in sch_records) == 1, sch_records
+        # ④b F-346 discriminating pins: a DISABLED calendar is not a gate
+        # (the engine treats it as constant True that never self-wakes) →
+        # no warning; an ENABLED calendar whose only companion gate is
+        # disabled still warns (that gate cannot wake the chain either).
+        n_cal = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": cal_id, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2, "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [cal_id], "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": [cal_id]}}]})
+        assert len(sch_records) == n_cal, (
+            "a disabled calendar is constant True in the engine — it must "
+            f"not warn (F-346): {sch_records[n_cal:]}"
+        )
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": cal_id, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "d" * 32, "type": "time", "after": "08:00",
+             "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [cal_id, "cond_" + "d" * 32],
+             "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": [cal_id]}}]})
+        assert len(sch_records) == n_cal + 1, (
+            "an enabled calendar whose only companion gate is disabled must "
+            f"still warn (F-346): {sch_records[n_cal:]}"
+        )
     finally:
         sch_logger.removeHandler(_sch_handler)
     print(

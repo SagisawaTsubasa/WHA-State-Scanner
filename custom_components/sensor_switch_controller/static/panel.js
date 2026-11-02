@@ -29,8 +29,6 @@ const LANG = {
     navLogs: "决策日志",
     createController: "新建控制器",
     refresh: "刷新",
-    controllerPool: "传感器池总览",
-    controllerPoolHint: "哪些传感器在喂养哪些控制器；蓝色行表示同一传感器被多个控制器共用。",
     edit: "编辑",
     logs: "日志",
     evaluateNow: "立即评估",
@@ -61,13 +59,11 @@ const LANG = {
     outputs: "输出",
     lastEval: "上次评估",
     never: "从未",
-    sensors: "传感器池",
     logging: "决策日志",
     enabled: "启用",
     controllerName: "控制器名称",
     save: "保存",
     back: "返回总览",
-    trialRun: "试运行",
     trialNeedSave: "该控制器尚未保存：预览与评估都按已保存配置执行，请先保存。",
     dirtyReload: "保存后控制器将重载，FOR 计时器会清零。",
     addCondition: "添加条件",
@@ -108,9 +104,6 @@ const LANG = {
     logConditions: "条件明细",
     all: "全部",
     saved: "已保存，控制器重载中",
-    sensorEntity: "实体 ID",
-    sensorAlias: "别名（可选）",
-    addSensor: "添加传感器",
     savedOk: "已保存",
     deleteOk: "已删除",
     evalDone: "评估完成",
@@ -192,8 +185,6 @@ const LANG = {
     navLogs: "Decision logs",
     createController: "New controller",
     refresh: "Refresh",
-    controllerPool: "Sensor pool overview",
-    controllerPoolHint: "Which sensors feed which controllers; blue rows share sensors across controllers.",
     edit: "Edit",
     logs: "Logs",
     evaluateNow: "Evaluate now",
@@ -224,13 +215,11 @@ const LANG = {
     outputs: "Outputs",
     lastEval: "Last evaluation",
     never: "never",
-    sensors: "Sensor pool",
     logging: "Decision log",
     enabled: "Enabled",
     controllerName: "Controller name",
     save: "Save",
     back: "Back to overview",
-    trialRun: "Trial run",
     trialNeedSave: "This controller is not saved yet: preview and evaluation both run the saved config — save first.",
     dirtyReload: "Saving reloads the controller; FOR timers reset.",
     addCondition: "Add condition",
@@ -271,9 +260,6 @@ const LANG = {
     logConditions: "Conditions",
     all: "All",
     saved: "Saved, controller reloading",
-    sensorEntity: "Entity ID",
-    sensorAlias: "Alias (optional)",
-    addSensor: "Add sensor",
     savedOk: "Saved",
     deleteOk: "Deleted",
     evalDone: "Evaluation done",
@@ -537,7 +523,12 @@ class ScannerPanel extends HTMLElement {
   }
 
   tr(key) {
-    const lang = this._hass?.language || "zh-Hans";
+    // F-342: the hassNotReady branch throws BEFORE _hass exists, so
+    // falling back to zh-Hans alone still leaks Chinese to en users —
+    // try the browser language too when hass is not attached yet.
+    const nav = String(navigator.language || "").toLowerCase();
+    const lang =
+      this._hass?.language || (nav.startsWith("zh") ? "zh-Hans" : "en");
     const dict = LANG[lang] || LANG[String(lang).split("-")[0]] || LANG["zh-Hans"];
     return dict[key] ?? LANG["zh-Hans"][key] ?? key;
   }
@@ -793,34 +784,8 @@ class ScannerPanel extends HTMLElement {
       })
       .join("");
 
-    // global sensor pool view
-    const pool = new Map();
-    for (const cid of cids) {
-      const c = controllers[cid];
-      for (const s of c.sensors || []) {
-        if (!pool.has(s.entity_id)) pool.set(s.entity_id, { alias: s.alias, cids: [] });
-        pool.get(s.entity_id).cids.push(c.name);
-      }
-    }
-    const poolRows = [...pool.entries()]
-      .sort((a, b) => a[1].cids.length - b[1].cids.length)
-      .map(
-        ([eid, info]) => `
-        <tr class="${info.cids.length > 1 ? "overlap" : ""}">
-          <td>${esc(eid)}</td>
-          <td class="wha-sub">${esc(this._friendlyName(eid))}</td>
-          <td>${esc(info.cids.join(", "))}</td>
-        </tr>`
-      )
-      .join("");
-
     main.innerHTML = `
-      ${cids.length === 0 ? `<div class="wha-card"><p class="wha-sub">${esc(this.tr("noControllers"))}</p></div>` : `<div class="wha-grid">${rows}</div>`}
-      <div class="wha-card">
-        <h2>${esc(this.tr("controllerPool"))}</h2>
-        <p class="wha-sub">${esc(this.tr("controllerPoolHint"))}</p>
-        ${poolRows ? `<table class="wha-table"><thead><tr><th>${esc(this.tr("sensorEntity"))}</th><th>${esc(this.tr("label"))}</th><th>${esc(this.tr("sensors"))}</th></tr></thead><tbody>${poolRows}</tbody></table>` : `<p class="wha-sub">—</p>`}
-      </div>`;
+      ${cids.length === 0 ? `<div class="wha-card"><p class="wha-sub">${esc(this.tr("noControllers"))}</p></div>` : `<div class="wha-grid">${rows}</div>`}`;
 
     main.querySelectorAll("[data-cid]").forEach((card) => {
       const cid = card.dataset.cid;
@@ -941,7 +906,6 @@ class ScannerPanel extends HTMLElement {
         enabled: true,
         logging_enabled: true,
         triggers: [],
-        sensors: [],
         conditions: [],
         outputs: [],
       };
@@ -988,10 +952,6 @@ class ScannerPanel extends HTMLElement {
           <button class="wha-btn primary" data-act="save">${esc(this.tr("save"))}</button>
           <button class="wha-btn" data-act="back">${esc(this.tr("back"))}</button>
         </div>
-        <details class="wha-card wha-edit-only" style="flex:none">
-          <summary>${esc(this.tr("sensors"))} (${config.sensors.length})</summary>
-          <div data-sensors></div>
-        </details>
         <div class="wha-editor-body">
           <div class="wha-palette">
             <h3>${esc(this.tr("addTrigger"))}</h3>
@@ -1028,8 +988,6 @@ class ScannerPanel extends HTMLElement {
         </div>
         <div class="wha-sub wha-reload-note" style="padding:4px 2px">${esc(this.tr("dirtyReload"))}</div>
       </div>`;
-
-    this._renderSensorPool(main.querySelector("[data-sensors]"));
 
     // head field bindings
     main.querySelectorAll("[data-field]").forEach((input) => {
@@ -1285,16 +1243,13 @@ class ScannerPanel extends HTMLElement {
       }
       // entity id from the SAVED config snapshot (F-199: the editor object
       // may hold unsaved edits that would mismatch the observed verdict);
-      // the value prefers the observe readings and falls back to hass.states
-      // for entities outside the sensor pool (WHA-F-200)
+      // the live value reads hass.states directly (the observe readings
+      // snapshot retired with the sensor pool in 0.12.0, WHA-F-200)
       const savedCond = this._data?.controllers?.[ed.cid]?.conditions?.find(
         (c) => c.id === condId
       );
       const eid = savedCond?.entity_id;
-      let st = eid ? r.readings?.[eid] : undefined;
-      if (st === undefined && eid) {
-        st = this._hass?.states?.[eid]?.state;
-      }
+      let st = eid ? this._hass?.states?.[eid]?.state : undefined;
       const live =
         eid && st !== undefined && st !== null
           ? ` · ${String(st).slice(0, 24)}`
@@ -1513,49 +1468,6 @@ class ScannerPanel extends HTMLElement {
     if (replaced) {
       root.querySelectorAll("datalist").forEach((d) => d.remove());
     }
-  }
-
-  _renderSensorPool(container) {
-    const sensors = this._editor.controller.sensors;
-    const entities = Object.keys(this._hass?.states || {}).sort();
-    container.innerHTML = `
-      <table class="wha-table">
-        <thead><tr><th>${esc(this.tr("sensorEntity"))}</th><th>${esc(this.tr("sensorAlias"))}</th><th></th></tr></thead>
-        <tbody>
-          ${sensors
-            .map(
-              (s, i) => `
-            <tr>
-              <td><input class="wha-input" list="wha-entities" data-si="${i}" data-sk="entity_id" data-epick value="${esc(s.entity_id)}" style="width:100%"></td>
-              <td><input class="wha-input" data-si="${i}" data-sk="alias" value="${esc(s.alias || "")}" style="width:120px"></td>
-              <td><button class="wha-btn danger" data-sdel="${i}">✕</button></td>
-            </tr>`
-            )
-            .join("")}
-        </tbody>
-      </table>
-      <datalist id="wha-entities">${entities.map((e) => `<option value="${esc(e)}">${esc(this._friendlyName(e))}</option>`).join("")}</datalist>
-      <button class="wha-btn" data-sadd style="margin-top:8px">＋ ${esc(this.tr("addSensor"))}</button>`;
-
-    container.querySelectorAll("[data-si]").forEach((input) => {
-      input.addEventListener("change", () => {
-        sensors[Number(input.dataset.si)][input.dataset.sk] = input.value.trim();
-        this._editor.dirty = true;
-      });
-    });
-    container.querySelectorAll("[data-sdel]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        sensors.splice(Number(btn.dataset.sdel), 1);
-        this._editor.dirty = true;
-        this._renderSensorPool(container);
-      });
-    });
-    container.querySelector("[data-sadd]")?.addEventListener("click", () => {
-      sensors.push({ entity_id: "", alias: "" });
-      this._editor.dirty = true;
-      this._renderSensorPool(container);
-    });
-    this._upgradeEntityPickers(container);
   }
 
   _triggerSummary(t) {
@@ -2527,7 +2439,7 @@ class ScannerPanel extends HTMLElement {
     const t = this._editor.trial;
     return `
       <details class="wha-json">
-        <summary>readings / results</summary>
+        <summary>results</summary>
         <pre>${esc(JSON.stringify(t, null, 2))}</pre>
       </details>`;
   }
@@ -2876,9 +2788,11 @@ class ScannerPanel extends HTMLElement {
               : "—"}
           </td>
           <td>
-            <details class="wha-json"><summary>${esc(this.tr("readouts"))}</summary>
-              <pre>${esc(JSON.stringify(r.readings || {}, null, 2))}</pre>
-            </details>
+            ${r.readings && Object.keys(r.readings).length
+              ? `<details class="wha-json"><summary>${esc(this.tr("readouts"))}</summary>
+                  <pre>${esc(JSON.stringify(r.readings, null, 2))}</pre>
+                </details>`
+              : "—"}
           </td>
         </tr>`;
       })

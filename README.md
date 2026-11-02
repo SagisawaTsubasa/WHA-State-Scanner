@@ -1,8 +1,8 @@
 # HA 全屋状态扫描 / HA Whole-House State Scanner
 
-> **零 YAML 全屋状态扫描器：可视化流程图编辑中间层决策，传感器池 + 条件规则 + 多路输出 + 独立决策日志。**
+> **零 YAML 全屋状态扫描器：可视化流程图编辑中间层决策，条件规则 + 多路输出 + 独立决策日志。**
 >
-> A zero-YAML whole-house state scanner: edit your sensor→decision middle layer as a visual flow graph — sensor pools, condition rules, multiple outputs, and an independent decision log.
+> A zero-YAML whole-house state scanner: edit your sensor→decision middle layer as a visual flow graph — condition rules, multiple outputs, and an independent decision log.
 
 > **Programmer:** [Kimi](https://kimi.moonshot.cn) (Moonshot AI) · **Author:** [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)
 
@@ -11,23 +11,21 @@
 ## 功能 / Features
 
 - **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
-- **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，试运行只读染色（绿=满足/红=不满足，不动作不写日志），「立即评估」确认后才真实动作（输出徽章显示决策）
+- **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，刷新状态只读染色（绿=满足/红=不满足，不动作不写日志），「立即评估」确认后才真实动作（输出徽章显示决策）
 - **触发器可连线路由（0.7.0，0.10.0 起强制显式）** — 触发器是画布上的信号源：信号线连到条件或逻辑组的「信号」口开始评估；信号覆盖了哪些门，就沿链唤醒哪些输出；未连线=不评估，到期唤醒同样定向（逻辑组：连信号=触发合并贯通，连成员=条件判定）。0.10.0 起遗留全量评估（routes 缺省）与「留空监听整个传感器池」均废弃：routes 与触发实体（可逗号分隔多实体）必须显式声明
-- **传感器池** — 一个控制器可引用任意数量的实体；总览页有全局传感器池视图，共享传感器高亮
 - **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒），支持 `AND`/`OR`/`NOT` 嵌套组合
 - **多路输出** — 一个控制器可生成多个开关或二进制传感器；`off_conditions` 优先于 `on_conditions`（防抖动）
-- **决策日志** — 每周期逐输出写入独立 JSONL（含传感器读数快照、触发源实体与状态变化、逐条件求值明细、applied/override 标记），面板内可直接查询
+- **决策日志** — 每周期逐输出写入独立 JSONL（触发源实体与状态变化、逐条件求值明细、applied/override 标记；0.11.0 及以前的旧记录另含全池读数快照），面板内可直接查询
 - **手动覆盖** — 开关类型支持可选的手动强制控制
 - **零构建前端** — 集成自带全部静态资源（vendored Drawflow），无 Node 工具链、无外网依赖
 
 ---
 
 - **Sidebar web panel** — overview / visual flow editor / decision-log viewer, fully built-in, zero CDN
-- **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; trial runs color nodes read-only (green=met / red=unmet, no actuation); "evaluate now" actuates behind a confirm (decision badges on outputs)
-- **Sensor pool** — any number of entities per controller; a global pool view highlights sensors shared across controllers
+- **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; the read-only status refresh colors nodes (green=met / red=unmet, no actuation); "evaluate now" actuates behind a confirm (decision badges on outputs)
 - **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), plus `AND`/`OR`/`NOT` nesting
 - **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
-- **Decision log** — per-cycle JSONL with sensor readings, firing entity + state change, per-condition verdicts, applied/override flags; queryable in the panel
+- **Decision log** — per-cycle JSONL with firing entity + state change, per-condition verdicts, applied/override flags (records up to 0.11.0 also carry a full-pool readings snapshot); queryable in the panel
 - **Manual override** — optional per-switch manual control lock
 - **Zero-build frontend** — all static assets vendored (Drawflow); no Node toolchain, no external requests
 
@@ -71,15 +69,15 @@
 
 | 视图 / View | 内容 / Content |
 |-------------|----------------|
-| **总览 / Overview** | 控制器卡片（输出实时状态、立即评估、启停、删除）+ 全局传感器池视图 / Controller cards with live output states + global sensor pool view |
-| **编辑器 / Editor** | Drawflow 流程画布：条件/组/输出节点拖线连线，右侧 inspector 编辑参数，顶部保存、试运行（只读刷新）与立即评估（确认后动作） / Flow canvas with condition/group/output nodes, inspector forms, save & trial run (read-only refresh) & evaluate-now (actuates behind a confirm) |
-| **决策日志 / Logs** | 按控制器+日期查询 JSONL 决策记录，可按 decision 过滤，读数快照可展开 / Query JSONL records by controller+date, filter by decision, expandable readings |
+| **总览 / Overview** | 控制器卡片（输出实时状态、立即评估、启停、删除） / Controller cards with live output states, evaluate-now, enable/disable, delete |
+| **编辑器 / Editor** | Drawflow 流程画布：条件/组/输出节点拖线连线，右侧 inspector 编辑参数，顶部保存、刷新状态（只读）与立即评估（确认后动作） / Flow canvas with condition/group/output nodes, inspector forms, save & refresh status (read-only) & evaluate-now (actuates behind a confirm) |
+| **决策日志 / Logs** | 按控制器+日期查询 JSONL 决策记录，可按 decision 过滤，旧记录的读数快照可展开 / Query JSONL records by controller+date, filter by decision, expandable readings in pre-0.12.0 records |
 
 **编辑器节点语义 / Node semantics:**
 
 - 条件节点（九类叶子 + 逻辑组 AND/OR/NOT）→ 信号线连到普通条件或逻辑组的「信号」口（input_3；持续与输出无信号口）
 - 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
-- **试运行**是只读刷新（不写输出实体、不写决策日志），把每个条件的当前满足结果染色到节点上；真实评估走「立即评估」按钮（经确认框，会实际写输出实体、写决策日志）
+- **刷新状态**是只读观察（不写输出实体、不写决策日志），把每个条件的当前满足结果染色到节点上；真实评估走「立即评估」按钮（经确认框，会实际写输出实体、写决策日志）
 - 保存后控制器整条重载，FOR 计时器清零
 
 **REST API**（面板使用，亦可脚本调用，均需鉴权）：
@@ -107,13 +105,13 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 **示例记录 / Example record：**
 
 ```json
-{"timestamp":"2026-10-05T14:30:00+08:00","controller":"浴室湿度控制","output":"湿度控制使能","decision":"off","on_met":false,"off_met":true,"applied":true,"override":false,"triggered_by":"湿度达标 [switch.shi_du: off→on]","conditions":{"cond_1a2b…":false},"readings":{"sensor.shi_du_chai_zhi":"8.2"}}
+{"timestamp":"2026-10-05T14:30:00+08:00","controller":"浴室湿度控制","output":"湿度控制使能","decision":"off","on_met":false,"off_met":true,"applied":true,"override":false,"triggered_by":"湿度达标 [switch.shi_du: off→on]","conditions":{"cond_1a2b…":false}}
 ```
 
 - `decision` 为条件判定结果（on/off/hold，hold 也记录——"为什么没动作"同样有据可查）
 - `applied` 表示判定是否实际写入实体；`override` 表示该写入被手动覆盖拦截
 - `triggered_by` 记录触发来源（触发器标签 + 触发实体及其状态变化）；`conditions` 是本周期输出链逐条件求值明细（条件 id → 布尔结果）
-- `readings` 是本周期传感器池的完整读数快照
+- 0.11.0 及以前的旧记录另有 `readings` 键（当时的全池读数快照）；0.12.0 起新记录不再携带，面板仅对旧记录展开显示
 
 ---
 
@@ -134,7 +132,7 @@ Config Entry（单一条目 / single entry）
 | 文件 / File | 职责 / Purpose |
 |-------------|----------------|
 | `hub.py` | 域级单例：Store 读写、控制器 CRUD、运行时快照 / Domain singleton: store, controller CRUD, snapshots |
-| `controller.py` | 触发调度、定向路由评估（含 applied/override 记录）、试运行 API / Trigger scheduling, directed evaluation, trial-run API |
+| `controller.py` | 触发调度、定向路由评估（含 applied/override 记录）、评估/观察 API / Trigger scheduling, directed evaluation, evaluate/observe API |
 | `condition_engine.py` | 递归条件评估（九类叶子 + AND/OR/NOT 嵌套 + 计时账本 + 定向唤醒）/ Recursive evaluator |
 | `schema.py` | 共享校验（Web API 与 config flow 同源）/ Shared validation |
 | `web.py` | REST views、面板注册、静态资源 / REST views, panel & static registration |
@@ -170,11 +168,11 @@ target:
 - **⏱ 翻转冷却（cooldown）= 闭锁门**：输出翻转一次后 N 秒内拒绝再次翻转。翻转史持久化（0.11.0 起）；**只挂 on 链**——挂 off 链会在无翻转史时恒为 True 并以 off 优先永久压制 on 链（保存时会告警）。
 - **输出 = 执行器**：只有「是 / 否」两个口——on 门（input_1，绿）/ off 门（input_2，红，优先），由条件链决定；触发器不直连输出（0.7.0 起 routes.outputs 被拒绝，存量经 v4 迁移自动折算为其条件链覆盖）。
 
-**到期也定向**：掐表门到点、静默门放行、冷却结束、时间范围进/出点、日出日落时刻——引擎只在那个精确瞬间唤醒这些时刻**能影响到的输出**，其余输出保持沉默。手动评估与试运行始终全量。
+**到期也定向**：掐表门到点、静默门放行、冷却结束、时间范围进/出点、日出日落时刻——引擎只在那个精确瞬间唤醒这些时刻**能影响到的输出**，其余输出保持沉默。手动评估与刷新状态始终全量。
 
 **升级兼容**：存量配置自动迁移（0.5.x 走 v2→v3→v4→v6,0.6.x 走 v3→v4→v6,0.7.0/0.7.2 走 v4/v5→v6：剥离持续覆盖、把有成员的组覆盖展开为叶子集——成员+信号共存的组会被拒绝,画布上二选一）——带 `for` 的条件拆出独立「持续」节点并改写连线、条件型 `at` 降级为时间范围（每日时刻请改用触发器）；触发器路由改为「信号覆盖的条件」（v3→v4：原直连输出自动折算为其条件链覆盖，`routes.outputs` 键删除，此后画布/接口都拒绝直连）。
 
-0.7.1（v5）已展开为纯叶子覆盖的存量保持不变；0.7.0/0.7.2 存量升级时剥离持续覆盖并把有成员的组覆盖展开为叶子集（v5→v6）。两点 0.7.0 时代的可观测差异需要知晓：① 0.6.x 中把触发器**只直连到部分输出**的存量，若这些输出与其它输出共享条件，折算后信号覆盖会沿共享链扩展到同链输出（v4 的条件载体无法无损表达「只唤其中一半」）；如需收窄，在画布上把信号线改连到更靠近该输出的条件门。② **没有任何条件**的空输出（开/关链皆空）不再进入触发器驱动的定向评估与日志（实体状态本就不受影响；初始评估/立即评估/试运行等全量扫描仍会记一条 hold），如需恢复请给它接条件。
+0.7.1（v5）已展开为纯叶子覆盖的存量保持不变；0.7.0/0.7.2 存量升级时剥离持续覆盖并把有成员的组覆盖展开为叶子集（v5→v6）。两点 0.7.0 时代的可观测差异需要知晓：① 0.6.x 中把触发器**只直连到部分输出**的存量，若这些输出与其它输出共享条件，折算后信号覆盖会沿共享链扩展到同链输出（v4 的条件载体无法无损表达「只唤其中一半」）；如需收窄，在画布上把信号线改连到更靠近该输出的条件门。② **没有任何条件**的空输出（开/关链皆空）不再进入触发器驱动的定向评估与日志（实体状态本就不受影响；初始评估/立即评估等全量扫描仍会记一条 hold——试运行已改为只读观察不写日志，0.12.0 起记录也不再携带全池 readings 快照），如需恢复请给它接条件。
 
 **0.10.0（v7 迁移，因果显式化）**：遗留全量触发器（routes 缺省）物化 `routes.conditions` 为其输出链可达的全部合法信号起点——叶子条件（持续门/旗标/逻辑组不是信号起点，叶子经组的成员边、持续的 start/abort、旗标的 set/reset 边天然可达）；物化后的定向唤醒集覆盖原全量扫描中每个可能改变状态的输出。池监听 state 触发器（entity_id 缺省）物化 `entity_id` 为传感器池全部实体列表（等价原监听面）。此后 schema **拒绝** routes 缺省与触发实体留空：新建触发器必须显式连线、显式声明实体（面板支持逗号分隔多实体，单实体保持字符串形态）。传感器池为空的池监听触发器迁移后实体列表为空：启用的触发器落 invalid 可见修复（该触发器原本就永不触发），停用的触发器保持合法惰性（运行时本就不注册）；pre-0.5.0 无触发器列表的远古存量映射出的扫描触发器自动物化 routes（与 v7 同一套信号叶子集，行为等价原全量评估面）、触发器 id 由配置确定性派生（跨重载稳定），无需重建。
 
@@ -201,6 +199,19 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.12.0（2026-11-03）— 传感器池机制下线、实体下拉可读性修复、P3 清偿
+
+**行为变更（存量自动迁移，语义不变）**
+- **传感器池机制下线**：`sensors` 配置字段退役——存储迁移 v7→v8 剥离存量 `sensors` 键（首次加载日志可见）；REST 载荷携带 `sensors` 键接受即弃并 warning（存量导出可重放，不静默）；决策记录不再携带全池 `readings` 快照（旧日志文件原样保留，面板仅对旧记录展开读数列）；总览页传感器池总览视图与编辑器池编辑面移除。条件/输出/触发器语义不变（条件实体本就直读 HA 状态，池只是决策日志的快照载体）
+- 镜像布尔 input_boolean 配置层本版不动（按既定计划切换后退役）
+
+**修复**
+- **实体下拉可读性**：编辑器检查器列 320px→360px——HA 前端 2026.1 的 picker 浮层宽度跟随字段容器（`--body-width` 由 JS 内联锁定，两重 shadow 无法从面板侧覆盖），拉宽宿主列是唯一纯 CSS 通道；各处实体输入下拉浮层随之达标
+- P3 清偿（复验 R3）：README 试运行措辞残留 + `trialRun` 孤儿键；无 hass 时 `tr()` 补浏览器语言兜底（en 界面不再透出中文）；冷却翻转史去抖 stub 改判别钉（回退同步写不再全绿）；`check_panel_strings.mjs` 接入 CI（面板 i18n 防线生效）；日历告警面过滤 disabled 条件（恒 True 的 disabled 日历不再误报，disabled 非日历门不再虚增「其他可唤醒」判定）
+
+**内部**
+- 存储版本 v7→v8（`_migrate_controller_v8` 挂入全部迁移链）；smoke 新增 v8 剥键、PUT 容忍+warning、observe/决策记录无 readings 断言与 F-346 双判别钉；`_async_evaluate_output` 签名去 readings 参数
 
 ### 0.11.0（2026-10-31）— cooldown 关侧陷阱防御、日历门唤醒、翻转史持久化、编辑器预览只读化
 

@@ -238,6 +238,27 @@ def _migrate_controller_v7(cfg: dict) -> dict:
     return cfg
 
 
+def _migrate_controller_v8(cfg: dict) -> dict:
+    """v7→v8 (0.12.0): the sensor-pool mechanism is retired.
+
+    Strips the stored ``sensors`` key from every controller config. The
+    pool no longer feeds anything at runtime (the decision-log readings
+    snapshot and the panel pool view are gone with it); state-trigger
+    entity surfaces were already materialized from the pool by v7, so
+    dropping the key is behavior-neutral for stores that survived the
+    v7 pass. Logged, not silent — the strip is visible in the log on
+    the first load after the upgrade.
+    """
+    if "sensors" in cfg:
+        _LOGGER.info(
+            "Controller %s: dropping the retired 'sensors' key from the "
+            "stored config (sensor pool offline since 0.12.0)",
+            cfg.get("name", "?"),
+        )
+        del cfg["sensors"]
+    return cfg
+
+
 def _migrate_controller_v2(cfg: dict) -> dict:
     """Migrate one controller config from v2 (0.5.x) to v3, in place.
 
@@ -346,7 +367,7 @@ def _migrate_controller_v2(cfg: dict) -> dict:
 
 
 class _MigratingStore(Store):
-    """Store with the v2/v3/v4/v5/v6→7 migrations wired in.
+    """Store with the v2/v3/v4/v5/v6/v7→8 migrations wired in.
 
     ``Store`` has no ``migrate_func=`` constructor argument; a subclass
     overrides ``_async_migrate_func(old_major_version, old_minor_version,
@@ -382,24 +403,29 @@ class _MigratingStore(Store):
                     _strip_duration_coverage,
                     _flatten_group_coverage,
                     _migrate_controller_v7,
+                    _migrate_controller_v8,
                 ),
                 3: (
                     _migrate_controller_v4,
                     _strip_duration_coverage,
                     _flatten_group_coverage,
                     _migrate_controller_v7,
+                    _migrate_controller_v8,
                 ),
                 4: (
                     _strip_duration_coverage,
                     _flatten_group_coverage,
                     _migrate_controller_v7,
+                    _migrate_controller_v8,
                 ),
                 5: (
                     _strip_duration_coverage,
                     _flatten_group_coverage,
                     _migrate_controller_v7,
+                    _migrate_controller_v8,
                 ),
-                6: (_migrate_controller_v7,),
+                6: (_migrate_controller_v7, _migrate_controller_v8),
+                7: (_migrate_controller_v8,),
             }
             chain = steps.get(old_major_version, ())
             for cid, cfg in raw.items():
@@ -412,7 +438,8 @@ class _MigratingStore(Store):
                     raw[cid] = migrated
                 except Exception:
                     # keep the ORIGINAL untouched object, as advertised. Note
-                    # the whole payload is still saved back as version 7, so
+                    # the whole payload is still saved back as the current
+                    # store version, so
                     # the automatic migration will not re-run for this
                     # controller; the legacy config then fails validate and
                     # lands in `invalid` (visible + round-tripped, no data
@@ -909,7 +936,6 @@ class ScannerHub:
                 "name": raw_name or cid,
                 "enabled": False,
                 "triggers": [],
-                "sensors": [],
                 "conditions": [],
                 "outputs": [],
                 "active": False,
