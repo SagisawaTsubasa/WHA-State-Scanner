@@ -529,8 +529,13 @@ class ScannerPanel extends HTMLElement {
     const nav = String(navigator.language || "").toLowerCase();
     const lang =
       this._hass?.language || (nav.startsWith("zh") ? "zh-Hans" : "en");
-    const dict = LANG[lang] || LANG[String(lang).split("-")[0]] || LANG["zh-Hans"];
-    return dict[key] ?? LANG["zh-Hans"][key] ?? key;
+    // R1#3: the final fallback follows the language FAMILY — de/fr/es must
+    // fall back to en, not the Chinese dict (zh-Hant/zh-TW keep falling
+    // back to zh-Hans, the only zh variant shipped).
+    const base = String(lang).split("-")[0].toLowerCase();
+    const fallback = base === "zh" ? LANG["zh-Hans"] : LANG["en"];
+    const dict = LANG[lang] || LANG[base] || fallback;
+    return dict[key] ?? fallback[key] ?? key;
   }
 
   /* ---------------- data ---------------- */

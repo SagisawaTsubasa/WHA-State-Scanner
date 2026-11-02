@@ -161,6 +161,7 @@ def _read_day_records_sync(
         return [], False
 
     records: list[dict] = []
+    bad_lines = 0
     for line in raw.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -168,9 +169,20 @@ def _read_day_records_sync(
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            bad_lines += 1
             continue
         if decision and record.get("decision") != decision:
             continue
         records.append(record)
+    if bad_lines:
+        # A corrupt line means a torn write (crash mid-append / disk full /
+        # manual edit) — the exact moment that needs exposure. Silent skips
+        # would be indistinguishable from "no records that day" (R1#5).
+        # Safe in the executor thread: logging is thread-safe.
+        _LOGGER.warning(
+            "决策日志 %s 有 %d 行无法解析（已跳过；通常是上次写入中断、磁盘满或手改所致）",
+            path,
+            bad_lines,
+        )
     truncated = dropped_head or len(records) > limit
     return records[-limit:], truncated

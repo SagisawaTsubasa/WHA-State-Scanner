@@ -9,6 +9,10 @@
 //   3. no CJK characters inside string literals OUTSIDE the LANG
 //      dictionary (F-338 regression: hardcoded client copy leaks into the
 //      en UI; comments are ignored)
+//   4. every tr("key") literal and every value of the three label maps
+//      (TYPE_LABEL_KEY / TRIGGER_LABEL_KEY / _PORT_LABELS) exists in
+//      zh-Hans (R1#4: deleting a LANG key while usages remain renders the
+//      raw key in the UI)
 //
 // Usage: node tests/check_panel_strings.mjs   (exit 0 = pass, 1 = fail)
 
@@ -64,6 +68,42 @@ const zhOnly = [...zhKeys].filter((k) => !enKeys.has(k));
 const enOnly = [...enKeys].filter((k) => !zhKeys.has(k));
 if (zhOnly.length) errors.push(`keys missing in en: ${zhOnly.join(", ")}`);
 if (enOnly.length) errors.push(`keys missing in zh-Hans: ${enOnly.join(", ")}`);
+
+// ------------------------------ tr("key") reference existence (R1#4)
+// tr() renders the raw key when it is missing from LANG (panel.js falls
+// through to the key itself) — deleting LANG keys while usages remain is
+// exactly the failure mode this guards. Also checked: the three label maps
+// whose VALUES are LANG keys consumed as this.tr(MAP[kind]).
+function collectLangRefs(marker) {
+  const i0 = lines.findIndex((l) => l.includes(marker));
+  if (i0 < 0) throw new Error(`LANG-key map not found: ${marker}`);
+  const refs = [];
+  for (let i = i0; i < lines.length; i++) {
+    for (const m of lines[i].matchAll(/:\s*["']([A-Za-z0-9_]+)["']/g)) {
+      refs.push({ key: m[1], line: i + 1 });
+    }
+    if (lines[i].trimEnd().endsWith("};")) break;
+  }
+  return refs;
+}
+const directRefs = [];
+for (let i = 0; i < lines.length; i++) {
+  for (const m of lines[i].matchAll(/\btr\("([A-Za-z0-9_]+)"\)/g)) {
+    directRefs.push({ key: m[1], line: i + 1 });
+  }
+}
+const indirectRefs = [
+  ...collectLangRefs("const TYPE_LABEL_KEY = {"),
+  ...collectLangRefs("const TRIGGER_LABEL_KEY = {"),
+  ...collectLangRefs("static _PORT_LABELS = {"),
+];
+for (const ref of [...directRefs, ...indirectRefs]) {
+  if (!zhKeys.has(ref.key)) {
+    errors.push(
+      `line ${ref.line}: LANG key "${ref.key}" referenced but missing from zh-Hans`,
+    );
+  }
+}
 
 // --------------------------------------------- CJK outside the LANG dict
 // Minimal scanner: skips // and /* */ comments, walks ' " ` strings and
@@ -247,5 +287,6 @@ if (errors.length) {
   process.exit(1);
 }
 console.log(
-  `panel strings OK: zh=${zhKeys.size} keys, en=${enKeys.size} keys, sets equal, no dupes, no CJK outside LANG`,
+  `panel strings OK: zh=${zhKeys.size} keys, en=${enKeys.size} keys, sets equal, no dupes, ` +
+    `${directRefs.length} tr() refs + ${indirectRefs.length} map-value refs resolve, no CJK outside LANG`,
 );

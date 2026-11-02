@@ -1004,6 +1004,8 @@ def _warn_static_hazards(
             continue
         out_label = out.get("name") or out["entity_id"]
         off_ids = chain_reach.get(out["entity_id"], set())
+        # naming trap: off_ids (face ④, whole-chain reach) vs off_reach
+        # (face ①, OFF-chain-only reach) — one word apart, keep them straight.
         # ① off-chain cooldown (warn-only trap defense)
         for cid in off_reach.get(out["entity_id"], set()):
             cond = by_id.get(cid)
@@ -1017,26 +1019,33 @@ def _warn_static_hazards(
                 out_label,
                 cond.get("label") or cid,
             )
-        # ② calendar as the only gate of an output (F-320). The engine treats
-        # a disabled condition as constant True that never wakes up on its
-        # own (next_wakeup skips it), so a DISABLED calendar is not a gate
-        # (no warning) and a disabled non-calendar condition is not an
-        # "other wakeup" source either — both faces filter on enabled
-        # (F-346, mirrors the F-336 disabled-group fix on face ④).
+        # ② calendar as the only gate of an output (F-320). Judged on the
+        # RUNTIME edge set (route_reach mirrors _build_route_index), not the
+        # evaluation-edge off_ids face ④ keeps: the wakeup face is
+        # topological — add_chain ignores enabled and walks the flag
+        # set/reset edges, and next_wakeup aims a directed wakeup at a
+        # flag's timer members — so a disabled-but-signal-covered condition
+        # still wakes the chain and a [flag(set=duration), calendar] chain
+        # has a wakeup source (R1#1). Within the arms enabled still
+        # filters: a DISABLED calendar is not a gate (no warning) and a
+        # disabled timer gate never self-wakes (next_wakeup skips it)
+        # (F-346, mirrors the F-336 disabled-group fix on face ④; face ④
+        # keeps the evaluation-edge set because a flag's verdict is a
+        # latched read — its own members never influence the output's own
+        # verdict, see _reachable_from_chains).
+        wakeup_ids = route_reach.get(out["entity_id"], set())
         cal_ids = [
             cid
-            for cid in off_ids
+            for cid in wakeup_ids
             if by_id.get(cid, {}).get("type") == COND_CALENDAR
             and by_id.get(cid, {}).get("enabled") is not False
         ]
         if cal_ids:
             has_other_wakeup = any(
-                by_id.get(cid, {}).get("enabled") is not False
-                and (
-                    by_id.get(cid, {}).get("type") in wakeup_types
-                    or cid in signal_covered
-                )
-                for cid in off_ids
+                (by_id.get(cid, {}).get("enabled") is not False
+                 and by_id.get(cid, {}).get("type") in wakeup_types)
+                or cid in signal_covered  # coverage is topological: no enabled
+                for cid in wakeup_ids
                 if by_id.get(cid, {}).get("type") != COND_CALENDAR
             )
             if not has_other_wakeup:

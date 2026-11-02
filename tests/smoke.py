@@ -950,6 +950,11 @@ assert m7["triggers"][0]["entity_id"] == [
     "switch.c", "switch.d", "switch.e", "sensor.a"
 ]
 validate_controller(m7)
+# R1#2: the (6,…) chain is 6→7→8 — the retirement strip must ride the REAL
+# upgrade path too, not only the direct-call pin below; deleting
+# _migrate_controller_v8 from this chain stays all-green otherwise
+# (validate_controller itself accepts-and-drops the key).
+assert "sensors" not in m7, m7
 # pool-empty store: materializes to an empty list and lands invalid (visible
 # fix-up) — the trigger was a never-firing registration error in v6 anyway
 v7_empty_pool = {
@@ -1027,6 +1032,17 @@ _v8_validated = validate_controller(v8_after_v7)
 assert "sensors" not in _v8_validated
 # a payload still carrying the legacy key validates clean too (accept-drop)
 assert "sensors" not in validate_controller(v7_disabled_pool)
+# R1#2: dispatch the (7,…) chain too — the real 0.11.0 upgrade path. Its only
+# regression net must not be the direct-call pin above; same shape as the
+# steps[5] net (WHA-F-125).
+migrated8 = asyncio.run(
+    store._async_migrate_func(
+        7, 1, {"controllers": {"ctrl_x": _copy.deepcopy(v7_disabled_pool)}}
+    )
+)
+assert "sensors" not in migrated8["controllers"]["ctrl_x"], migrated8[
+    "controllers"
+]["ctrl_x"]
 print("[PASS] v7→v8 migration: retired sensors key stripped, v7 surface kept")
 
 # 0.12.0: external payloads carrying the retired "sensors" key are accepted
@@ -2996,6 +3012,51 @@ async def main():
         assert len(sch_records) == n_cal + 1, (
             "an enabled calendar whose only companion gate is disabled must "
             f"still warn (F-346): {sch_records[n_cal:]}"
+        )
+        # ④c R1#1 third face: coverage is TOPOLOGICAL — a DISABLED condition
+        # the signal line still covers wakes the chain on every trigger fire
+        # (the routing index ignores enabled), so the enabled calendar beside
+        # it must NOT warn. Red before the R1#1 arm split, green after.
+        n_cov = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": cal_id, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "5" * 32, "type": "state", "entity_id": "switch.c",
+             "state": "on", "enabled": False},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [cal_id, "cond_" + "5" * 32],
+             "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": ["cond_" + "5" * 32]}}]})
+        assert len(sch_records) == n_cov, (
+            "a disabled signal-covered condition still wakes the chain — "
+            f"must not warn (R1#1): {sch_records[n_cov:]}"
+        )
+        # ④d R1#1 flag-edge face: the routing index walks the flag set/reset
+        # edges and next_wakeup aims a directed wakeup at a flag's timer
+        # members — [flag(set=duration), calendar] HAS a wakeup source and
+        # must NOT warn. Red before the R1#1 route_reach switch, green after.
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": cal_id, "type": "calendar",
+             "entity_id": "calendar.x", "hours": 2},
+            {"id": "cond_" + "6" * 32, "type": "state", "entity_id": "switch.d",
+             "state": "on"},
+            {"id": "cond_" + "7" * 32, "type": "duration", "seconds": 5,
+             "start": "cond_" + "6" * 32, "abort": None},
+            {"id": "cond_" + "8" * 32, "type": "flag",
+             "set_conditions": ["cond_" + "7" * 32], "reset_conditions": []},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": ["cond_" + "8" * 32, cal_id],
+             "off_conditions": []},
+        ], "triggers": [{"id": "trg_" + "1" * 32, "type": "state",
+                         "entity_id": "switch.c",
+                         "routes": {"conditions": ["cond_" + "6" * 32]}}]})
+        assert len(sch_records) == n_cov, (
+            "a flag's duration member is a wakeup source via the routing "
+            f"index — must not warn (R1#1): {sch_records[n_cov:]}"
         )
     finally:
         sch_logger.removeHandler(_sch_handler)
