@@ -2181,6 +2181,68 @@ async def main():
             )
     print("[PASS] data-node schema: disabled-node clemency, self-ref & data-node routes rejected (R2-3/4/7)")
 
+    # R5-3: DIRECT snapshot self-reference rejected (capture=[self] never
+    # fires — the gate reads "a snapshot exists", permanently False while
+    # empty; clear=[self] empties one cycle after capturing)
+    for bad_key in ("capture", "clear"):
+        dn_self_snap = json.loads(json.dumps(dn_cfg))
+        dn_self_snap["conditions"] = [
+            c if c["id"] != sn_num else {**c, bad_key: [sn_num]}
+            for c in dn_self_snap["conditions"]
+        ]
+        try:
+            _vc(dn_self_snap)
+        except _CVE:
+            pass
+        else:
+            raise AssertionError(
+                f"schema accepted a snapshot self-reference ({bad_key}=[self], R5-3)"
+            )
+    # R5-4: an oversized int literal is rejected at the schema (the 400
+    # face) — math.isfinite raises OverflowError on it, the plain check
+    # would have surfaced as a web 500
+    dn_huge = json.loads(json.dumps(dn_cfg))
+    dn_huge["conditions"] = [
+        c if c["id"] != lit_25 else {**c, "value": 10 ** 400}
+        for c in dn_huge["conditions"]
+    ]
+    try:
+        _vc(dn_huge)
+    except _CVE:
+        pass
+    else:
+        raise AssertionError("schema accepted an oversized int literal (R5-4)")
+    # R5-2: literal+for is only PROVABLY true WITHOUT the for — a NOT over
+    # a held literal stays saveable (the old True verdict rejected it) and
+    # latches the flag on the FIRST cycle (literal False → NOT True)
+    lf_leaf = "cond_" + "34" * 16   # literal number 5, for 60s
+    lf_seed = "cond_" + "37" * 16   # plain state leaf (routes target —
+                                    # data nodes are not route targets, R2-7)
+    lf_not = "cond_" + "35" * 16    # NOT over it
+    lf_flag = "cond_" + "36" * 16
+    lf_cfg = {
+        "name": "lit-for", "enabled": True, "logging_enabled": False,
+        "triggers": [{"id": "trg_" + "3" * 31 + "1", "type": "state",
+                      "entity_id": "switch.c",
+                      "routes": {"conditions": [lf_seed]}}],
+        "conditions": [
+            {"id": lf_leaf, "type": "literal", "value_type": "number",
+             "value": 5, "for": {"hours": 0, "minutes": 1, "seconds": 0}},
+            {"id": lf_seed, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": lf_not, "type": "not", "conditions": [lf_leaf]},
+            {"id": lf_flag, "type": "flag", "set_conditions": [lf_not],
+             "reset_conditions": [], "initial": False},
+        ],
+        "outputs": [],
+    }
+    lf_valid = _vc(json.loads(json.dumps(lf_cfg)))  # must NOT raise
+    eng_lf = ConditionEngine(_Hass(), json.loads(json.dumps(lf_valid["conditions"])))
+    assert await eng_lf.step_flags() == [lf_flag], (
+        "NOT(literal+for) must latch the flag on the first cycle (R5-2)"
+    )
+    print("[PASS] data-node schema: self-snap rejected, oversized int 400-face, literal+for verdict (R5-2/3/4)")
+
     # engine faces via the manager (hub-seeded persistence path included)
     from custom_components.sensor_switch_controller.hub import ScannerHub as _SH
     hass_dn = _Hass()
@@ -2379,6 +2441,29 @@ async def main():
         for r in _cap4.records
     ) == 1, [r.getMessage() for r in _cap4.records]
     print("[PASS] data-node compare: bool attribute end is visible False + WARN (R4-4)")
+
+    # R5-4 engine face: an oversized int attribute parses to None (the
+    # OverflowError from float() is caught) and reads as a STRING end —
+    # no per-cycle exception logging, no fake numeric comparison
+    hass_r5 = _Hass()
+    hass_r5.states._attrs["sensor.a"] = {"gauge": 10 ** 400}
+    r5_eq = "cond_" + "fe" * 16 + "0"
+    eng_r5 = ConditionEngine(
+        hass_r5,
+        [
+            {"id": lit_on, "type": "literal", "value_type": "state",
+             "value": "on"},
+            {"id": r5_eq, "type": "compare", "op": "not_equal",
+             "a": {"kind": "entity", "entity_id": "sensor.a",
+                   "attribute": "gauge"},
+             "b": {"kind": "literal", "cond": lit_on}},
+        ],
+    )
+    assert await eng_r5.evaluate_any([r5_eq]) is True, (
+        "an oversized-int attribute is a string end: not_equal against a "
+        "state literal compares the raw value (R5-4)"
+    )
+    print("[PASS] data-node compare: oversized-int attribute is a string end (R5-4)")
 
     # six numeric operators against one shared literal (reuse pin)
     six_ids = [f"cond_{i:032x}" for i in range(6)]
@@ -2637,6 +2722,52 @@ async def main():
         _slg4.removeHandler(_scap4)
     print("[PASS] data-node hazards: calendar arm credits the entity join (R4-1)")
 
+    # R5-6 (closes the data-node hazard ledger item): an output whose live
+    # chain has NO wakeup source at all warns once — the pure
+    # compare(entity, nobody listening) shape froze silently before
+    def _frozen_cfg(listen):
+        return {
+            "name": "r5-frozen", "enabled": True, "logging_enabled": False,
+            "triggers": [{
+                "id": "trg_" + "4" * 31 + ("1" if listen else "0"),
+                "type": "state",
+                "entity_id": "sensor.a" if listen else "sensor.z",
+                # empty coverage on purpose — a pure compare chain has no
+                # legal route target (R2-7); the ONLY wakeup is the join
+                "routes": {"conditions": []},
+            }],
+            "conditions": [
+                {"id": r4c_lit, "type": "literal", "value_type": "number",
+                 "value": 5},
+                {"id": r4c_cmp, "type": "compare", "op": "above",
+                 "a": {"kind": "entity", "entity_id": "sensor.a"},
+                 "b": {"kind": "literal", "cond": r4c_lit}},
+            ],
+            "outputs": [
+                {"name": "r5f", "type": "switch", "entity_id": r4c_out,
+                 "on_conditions": [r4c_cmp], "off_conditions": []},
+            ],
+        }
+
+    _scap5 = _Cap()
+    _slg5 = _logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _slg5.addHandler(_scap5)
+    try:
+        _vc(_frozen_cfg(True))  # listened: join covers it → no warning
+        assert not any(
+            "没有任何可唤醒源" in r.getMessage() for r in _scap5.records
+        ), [r.getMessage() for r in _scap5.records]
+        _scap5.records.clear()
+        _vc(_frozen_cfg(False))  # nobody listens → the freeze warns
+        assert any(
+            "没有任何可唤醒源" in r.getMessage() for r in _scap5.records
+        ), [r.getMessage() for r in _scap5.records]
+    finally:
+        _slg5.removeHandler(_scap5)
+    print("[PASS] data-node hazards: no-wakeup-source freeze warns, join silences it (R5-6)")
+
     # hub store: three tables in one payload; pre-0.13 payloads (no
     # snapshots key) load silently; bool-poisoned values drop loudly
     class _SnapStore:
@@ -2769,6 +2900,23 @@ async def main():
         )
         assert any("captured from 'sensor.old'" in m for m in _hub_cap.records), (
             _hub_cap.records
+        )
+        # R5-1: the stale latch's gate seed re-arms (forced False) and the
+        # hub tables drop the stale entry — the next true cycle captures
+        # the NEW source even while the gate stays high (the old behavior
+        # kept prev=True and never re-captured)
+        assert mgr_stale.engine.snapshot_gates().get(sn_num) is False, (
+            "a dropped latch must re-arm its edge detector (R5-1)"
+        )
+        hub_stale = hass_stale.data["sensor_switch_controller"]
+        assert sn_num not in hub_stale.snapshot_states.get("ctrl_dnsmk2", {}), (
+            "the hub table must drop the stale latch entry (R5-1)"
+        )
+        assert hub_stale.snapshot_gates["ctrl_dnsmk2"][sn_num] is False
+        ev_stale = await mgr_stale.engine.step_snapshots()
+        # switch.c is on (gate high) AND prev was forced False → capture
+        assert ev_stale == {sn_num: {"event": "capture", "value": 16.7}}, (
+            ev_stale
         )
         mgr_stale.async_unload()
         _hub_cap.records.clear()

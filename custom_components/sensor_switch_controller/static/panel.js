@@ -2093,9 +2093,11 @@ class ScannerPanel extends HTMLElement {
         continue;
       }
       if (cond.type === "compare") {
-        // a/b live-sync: a wire overrides the form's entity fields; losing
-        // the wire falls back to the entity end (whose entity_id/attribute
-        // are kept in the model — _exportGraph re-merges both sources)
+        // a/b live-sync: a wire REPLACES the end's shape — the previous
+        // entity_id/attribute are NOT kept (R5-5, accepted UX); after
+        // unwiring, the form starts from an empty entity and the source
+        // must be re-picked before saving (the schema rejects an empty
+        // entity end)
         const nid = ed.condToNode.get(cond.id);
         if (nid === undefined) continue;
         const inputs = data[String(nid)]?.inputs || {};

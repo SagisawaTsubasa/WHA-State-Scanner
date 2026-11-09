@@ -108,12 +108,20 @@ class ControllerManager:
         # source entity; a latch captured from a DIFFERENT entity than the
         # config now names is dropped loudly (the old value would keep
         # driving compare chains invisibly). Legacy bare scalars (pre-R2
-        # payloads) carry no origin and are kept once.
+        # payloads) carry no origin and are kept once. A dropped latch also
+        # re-arms its edge detector (R5-1): the stale gate seed (True from
+        # the OLD source's tenure) would swallow the first rising edge, so
+        # it is forced to False — the new source re-captures on the very
+        # next true cycle while the gate is high — and both hub tables are
+        # cleaned so no gate-only write resurrects the stale entry.
         saved_snapshots: dict[str, Any] = {}
+        saved_gates: dict[str, bool] = dict(
+            hub.snapshot_gates.get(controller_id, {}) if hub is not None else {}
+        )
         if hub is not None:
-            for sid, entry in (
-                hub.snapshot_states.get(controller_id) or {}
-            ).items():
+            for sid, entry in list(
+                (hub.snapshot_states.get(controller_id) or {}).items()
+            ):
                 cfg_src = next(
                     (
                         c.get(CONF_ENTITY_ID)
@@ -134,6 +142,13 @@ class ControllerManager:
                             src,
                             cfg_src,
                         )
+                        saved_gates[sid] = False  # re-arm the edge (R5-1)
+                        hub.snapshot_states.setdefault(controller_id, {}).pop(
+                            sid, None
+                        )
+                        hub.snapshot_gates.setdefault(controller_id, {})[
+                            sid
+                        ] = False
                         continue
                     value = entry.get("value")
                 else:
@@ -151,9 +166,7 @@ class ControllerManager:
             # would treat a still-high gate as a fresh rising edge and
             # overwrite the latched value with the CURRENT reading.
             snapshot_values=saved_snapshots,
-            snapshot_gates=(
-                hub.snapshot_gates.get(controller_id, {}) if hub is not None else {}
-            ),
+            snapshot_gates=saved_gates,
         )
         # trigger-logic groups: groups named by any trigger's signal coverage.
         # Coverage is topological (0.7.3 F-151 resolution, superseding the

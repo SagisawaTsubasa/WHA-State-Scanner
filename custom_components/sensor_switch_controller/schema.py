@@ -775,6 +775,17 @@ def _validate_condition(cond) -> dict:
                 _fail(f"快照条件的 {key} 必须是条件 id 字符串列表")
             if len(set(members)) != len(members):
                 _fail(f"快照条件的 {key} 成员不能重复")
+            if cid in members:
+                # R5-3, same shape as the flag self-reference rule (R2-4):
+                # capture=[self] reads "a snapshot exists" — permanently
+                # False while empty, so it never fires; clear=[self]
+                # clears one cycle after capturing and stays empty while
+                # the gate holds. Both are dead configs.
+                _fail(
+                    "快照条件不能直接以自身作为拍下/清空条件：自拍的门=快照存在"
+                    "（无快照恒假、永不拍下），自清会在拍下一拍后清空且门保持期间"
+                    "不再拍摄；请经其他条件驱动"
+                )
             result[key] = list(dict.fromkeys(members))
         if not result[CONF_CAPTURE] and not result[CONF_CLEAR]:
             _fail("快照条件必须提供 capture 或 clear")
@@ -787,10 +798,16 @@ def _validate_condition(cond) -> dict:
             _fail("常量条件的 value_type 必须是 number 或 state")
         value = cond.get(CONF_VALUE)
         if vt == "number":
+            # oversized ints raise OverflowError from isfinite (R5-4) —
+            # the 400 face must catch them, not the web 500 handler
+            try:
+                finite = math.isfinite(value)
+            except (OverflowError, TypeError):
+                finite = False
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
-                or not math.isfinite(value)
+                or not finite
             ):
                 _fail("常量条件的 value 必须是有限数字")
             result[CONF_VALUE] = float(value)
@@ -976,7 +993,10 @@ def _flag_branch_verdict(
         elif ctype == COND_FLAG:
             verdict = None  # latched read; non-self callers already failed
         elif ctype == COND_LITERAL:
-            verdict = True  # constant node — the engine mirror returns True
+            # constant node — but a `for` makes the first N seconds False
+            # (the generic _apply_for path), so it is only PROVABLY true
+            # without one (R5-2: NOT(literal+for) must stay saveable)
+            verdict = None if cond.get("for") else True
         elif ctype in GROUP_TYPES:
             members = cond.get("conditions") or []
             if not members:
@@ -1358,6 +1378,49 @@ def _warn_static_hazards(
                 out_label,
                 cond.get("label") or cid,
             )
+        # ⑤ no-wakeup-source face (R5-6, closes the data-node hazard
+        # ledger item): the output's chain carries nothing that can ever
+        # flip on its own or be woken — no wall-clock gate, no live
+        # duration/`for` timer, no enabled trigger's signal coverage, no
+        # entity-end join, no enabled snapshot capture/clear gate. The
+        # output evaluates once at startup and then only on manual
+        # evaluate. Same two-tier set discipline as face ② (R3#1):
+        # wall-clock/calendar gates qualify from the TOPOLOGICAL set (a
+        # disabled subtree still wakes the chain), duration/`for` timers
+        # only from the live set. Calendars count as a (heartbeat-backed)
+        # source here — their dedicated face ② already warns about the
+        # heartbeat lag. Only outputs whose LIVE chain has at least one
+        # ENABLED node warn — a chain wholly behind a disabled group is
+        # dead wiring (R3#2's face), not a frozen output. Warn-only.
+        live_active = {
+            cid for cid in live_ids
+            if by_id.get(cid, {}).get("enabled") is not False
+        }
+        if live_active:
+            has_wake = any(
+                (by_id.get(cid, {}).get("enabled") is not False
+                 and (by_id.get(cid, {}).get("type") in wall_clock_types
+                      or by_id.get(cid, {}).get("type") == COND_CALENDAR))
+                or (cid in live_ids
+                    and by_id.get(cid, {}).get("enabled") is not False
+                    and (by_id.get(cid, {}).get("type") == COND_DURATION
+                         or by_id.get(cid, {}).get("for")))
+                or cid in wakeup_covered
+                or cid in entity_end_covered
+                or (by_id.get(cid, {}).get("type") == COND_SNAPSHOT
+                    and by_id.get(cid, {}).get("enabled") is not False
+                    and (by_id.get(cid, {}).get(CONF_CAPTURE)
+                         or by_id.get(cid, {}).get(CONF_CLEAR)))
+                for cid in wakeup_ids
+            )
+            if not has_wake:
+                _LOGGER.warning(
+                    "输出「%s」的条件链上没有任何可唤醒源（壁钟门/计时门/触发器"
+                    "信号覆盖/求值实体监听/快照拍清门）：该输出只会在初始评估或手动"
+                    "「立即评估」时更新——请把触发器信号线连到链上条件，或让 state "
+                    "触发器监听求值读取的实体",
+                    out_label,
+                )
 
     # ③ trigger routes wired to unreachable conditions (F-326)
     for trg in triggers or []:

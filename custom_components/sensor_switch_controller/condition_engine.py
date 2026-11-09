@@ -81,10 +81,11 @@ _CAPTURE_FAILED = object()
 
 def _parse_finite_float(raw: Any) -> float | None:
     """float(raw) when it parses to a finite number, else None (NaN/inf
-    excluded — same gate as the literal validation, schema)."""
+    excluded — same gate as the literal validation, schema). Oversized
+    ints raise OverflowError from float() and count as non-numeric (R5-4)."""
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return value if math.isfinite(value) else None
 
@@ -519,7 +520,10 @@ class ConditionEngine:
         if ctype == COND_FLAG:
             return None  # latched read — not statically decidable
         if ctype == COND_LITERAL:
-            return True  # constant node: always satisfied (engine mirror)
+            # constant node — but a `for` makes the first N seconds False
+            # (the generic _apply_for path), so it is only PROVABLY true
+            # without one (R5-2, mirrors the schema judge)
+            return None if cond.get("for") else True
         if ctype == "duration":
             start_v = self._static_verdict(
                 cond.get(CONF_START), visited, dead_groups,
