@@ -1210,6 +1210,34 @@ def _warn_static_hazards(
     # and `for` gates are deliberately absent — they are evaluation-born
     # (see the wakeup arm below and live_reach above).
     wall_clock_types = {COND_TIME, COND_SUN, COND_DEBOUNCE, COND_COOLDOWN}
+    # R4-1 entity-coverage join: compare nodes whose entity end an ENABLED
+    # state trigger listens to — the runtime routing index pulls their
+    # outputs into that trigger's dispatch targets (controller
+    # ._build_route_index); the static hazard faces must credit the same
+    # wakeup source.
+    listened_entities = {
+        eid
+        for trg in triggers or []
+        if trg.get("type") == TRG_STATE and trg.get("enabled", True) is not False
+        for eid in (
+            [trg.get("entity_id")]
+            if isinstance(trg.get("entity_id"), str)
+            else trg.get("entity_id") or []
+        )
+        if isinstance(eid, str)
+    }
+    entity_end_covered = {
+        cid
+        for cid, cond in by_id.items()
+        if cond.get("type") == COND_COMPARE
+        and cond.get("enabled") is not False
+        and any(
+            isinstance(cond.get(k), dict)
+            and cond[k].get("kind") == "entity"
+            and cond[k].get("entity_id") in listened_entities
+            for k in (CONF_INPUT_A, CONF_INPUT_B)
+        )
+    }
 
     for out in outputs:
         if not isinstance(out, dict) or not out.get("entity_id"):
@@ -1281,6 +1309,11 @@ def _warn_static_hazards(
             # subtree containing one still wakes); duration/`for` gates
             # qualify only from the live set (a timer exists only if its
             # gate was evaluated). Enabled still filters both tiers.
+            # R4-1 third tier: the entity-coverage join — a compare whose
+            # entity end an ENABLED state trigger listens to is woken by
+            # that trigger (the runtime routing index does the same join,
+            # controller._build_route_index); the heartbeat-only warning
+            # must not fire for a chain the join already covers.
             has_other_wakeup = any(
                 by_id.get(cid, {}).get("enabled") is not False
                 and (by_id.get(cid, {}).get("type") in wall_clock_types
@@ -1288,6 +1321,7 @@ def _warn_static_hazards(
                          and (by_id.get(cid, {}).get("type") == COND_DURATION
                               or by_id.get(cid, {}).get("for"))))
                 or cid in wakeup_covered
+                or cid in entity_end_covered
                 for cid in wakeup_ids
                 if by_id.get(cid, {}).get("type") != COND_CALENDAR
             )

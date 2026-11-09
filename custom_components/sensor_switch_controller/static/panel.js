@@ -54,8 +54,8 @@ const LANG = {
     portReset: "复位",
     trgBadgeLegacy: "全量",
     trgBadgeDead: "死",
-    trgBadgeDeadHint: "该触发器唤醒不到任何输出：未连条件，或所连条件到不了任何输出。请在画布把信号线连到输出链可达的条件。",
-    trgDeadConfirm: "有已启用但未连任何条件的定向触发器（保存后不会评估任何输出）。仍要保存吗？\n确定=保存；取消=返回修改。",
+    trgBadgeDeadHint: "该触发器唤醒不到任何输出：未连条件、所连条件到不了任何输出，且它监听的实体也没有被任何求值读取。请把信号线连到输出链可达的条件，或让它监听某个求值读取的实体。",
+    trgDeadConfirm: "有已启用的定向触发器唤醒不到任何输出（未连条件、所连条件到不了任何输出、且监听实体未被求值读取——保存后这些触发器不会评估任何输出）。仍要保存吗？\n确定=保存；取消=返回修改。",
     outputs: "输出",
     lastEval: "上次评估",
     never: "从未",
@@ -246,8 +246,8 @@ const LANG = {
     portReset: "reset",
     trgBadgeLegacy: "ALL",
     trgBadgeDead: "DEAD",
-    trgBadgeDeadHint: "This trigger wakes nothing: no conditions wired, or none of them can reach an output. Wire a chain-reachable condition on the canvas.",
-    trgDeadConfirm: "An enabled directed trigger has no conditions wired (it will evaluate nothing). Save anyway?\nOK = save; Cancel = go back.",
+    trgBadgeDeadHint: "This trigger wakes nothing: no conditions wired, none of the wired ones can reach an output, and no compare reads an entity it listens to. Wire a chain-reachable condition, or listen to an entity some compare reads.",
+    trgDeadConfirm: "An enabled directed trigger wakes nothing (no conditions wired, none reachable to an output, and no compare reads its entities — it will evaluate nothing). Save anyway?\nOK = save; Cancel = go back.",
     outputs: "Outputs",
     lastEval: "Last evaluation",
     never: "never",
@@ -1676,18 +1676,15 @@ class ScannerPanel extends HTMLElement {
     this._refreshTriggerBadges();
   }
 
-  _refreshTriggerBadges() {
-    // M4 (0.9.0): three trigger modes must be visible on the node itself —
-    // legacy (routes absent = evaluate-everything, amber), directed-n, and
-    // directed-empty ("dead": wakes nothing, red). Until now only the
-    // inspector hinted at the mode, and panel-created triggers defaulted to
-    // the dead state invisibly.
-    // F-326: "dead" also covers a non-empty routes list whose targets can
-    // reach NO output (the graph walk below mirrors the runtime routing
-    // index) — the schema now warns on save; the badge keeps the canvas
-    // honest between saves.
+  _triggerCoverage() {
+    // R4-1 shared coverage predicate: what a trigger can wake =
+    // routes-reachable outputs ∪ entity join (a compare reading an entity
+    // an enabled state trigger listens to). Mirrors the runtime routing
+    // index (controller._build_route_index) — the canvas badge, the save
+    // confirm and the runtime must never drift apart. The walk now follows
+    // the data-node edges too (snapshot capture/clear, compare a/b), the
+    // same edge set add_chain uses.
     const ed = this._editor;
-    if (!ed.df?.container) return;
     const reachOuts = {};
     for (const out of ed.controller.outputs || []) {
       if (!out?.entity_id) continue;
@@ -1707,17 +1704,63 @@ class ScannerPanel extends HTMLElement {
         if (c.start) stack.push(c.start);
         if (c.abort) stack.push(c.abort);
         stack.push(...(c.set_conditions || []), ...(c.reset_conditions || []));
+        stack.push(...(c.capture || []), ...(c.clear || []));
+        if (c.a?.cond) stack.push(c.a.cond);
+        if (c.b?.cond) stack.push(c.b.cond);
       }
     }
+    const compareEntityEnds = new Set();
+    for (const c of ed.controller.conditions || []) {
+      if (c.type !== "compare" || !(reachOuts[c.id] || new Set()).size) continue;
+      for (const side of [c.a, c.b]) {
+        if (side?.kind === "entity" && side.entity_id) {
+          compareEntityEnds.add(side.entity_id);
+        }
+      }
+    }
+    return { reachOuts, compareEntityEnds };
+  }
+
+  _triggerIsDead(t, cov) {
+    // R4-1: alive = routes reach an output OR the entity join covers it
+    // (state trigger listening to an entity some output-reachable compare
+    // reads; disabled triggers never register, no join credit).
+    const ed = this._editor;
+    if (ed.legacyTrgIds.has(t.id) || t.routes === undefined) return false;
+    if ((t.routes?.conditions || []).some((cid) => (cov.reachOuts[cid] || new Set()).size)) {
+      return false;
+    }
+    if (t.type === "state" && t.enabled !== false) {
+      const listen = Array.isArray(t.entity_id)
+        ? t.entity_id
+        : t.entity_id
+          ? [t.entity_id]
+          : [];
+      if (listen.some((e) => cov.compareEntityEnds.has(e))) return false;
+    }
+    return true;
+  }
+
+  _refreshTriggerBadges() {
+    // M4 (0.9.0): three trigger modes must be visible on the node itself —
+    // legacy (routes absent = evaluate-everything, amber), directed-n, and
+    // directed-empty ("dead": wakes nothing, red). Until now only the
+    // inspector hinted at the mode, and panel-created triggers defaulted to
+    // the dead state invisibly.
+    // F-326: "dead" also covers a non-empty routes list whose targets can
+    // reach NO output (the graph walk below mirrors the runtime routing
+    // index) — the schema now warns on save; the badge keeps the canvas
+    // honest between saves.
+    // R4-1: the walk and the entity join live in _triggerCoverage/_triggerIsDead.
+    const ed = this._editor;
+    if (!ed.df?.container) return;
+    const cov = this._triggerCoverage();
     for (const [nid, tid] of ed.nodeToTrg) {
       const t = (ed.controller.triggers || []).find((x) => x.id === tid);
       const el = ed.df.container.querySelector(`#node-${nid}`);
       if (!el || !t) continue;
       const legacy = ed.legacyTrgIds.has(t.id);
-      const dead =
-        !legacy &&
-        t.routes !== undefined &&
-        !(t.routes?.conditions || []).some((cid) => (reachOuts[cid] || {}).size);
+      const dead = this._triggerIsDead(t, cov);
       el.classList.toggle("trg-legacy", legacy);
       el.classList.toggle("trg-dead", dead);
       let badge = el.querySelector(".trg-mode-badge");
@@ -2858,15 +2901,14 @@ class ScannerPanel extends HTMLElement {
       this.toast(this.tr("controllerName"), true);
       return;
     }
-    // M4 (0.9.0): an enabled directed trigger with empty coverage wakes
-    // nothing — usually a wire that was drawn and then deleted. Block the
-    // silent demotion once per editor session; legacy (routes absent) and
-    // disabled triggers are exempt.
+    // M4 (0.9.0): an enabled directed trigger that wakes nothing — usually
+    // a wire that was drawn and then deleted. Block the silent demotion
+    // once per editor session; legacy (routes absent) and disabled
+    // triggers are exempt. R4-1: the predicate is the shared
+    // _triggerIsDead (routes reach ∪ entity join), same as the badge.
+    const cov = this._triggerCoverage();
     const deadTrg = (ed.controller.triggers || []).filter(
-      (t) =>
-        t.enabled !== false &&
-        t.routes !== undefined &&
-        !(t.routes?.conditions || []).length
+      (t) => t.enabled !== false && this._triggerIsDead(t, cov)
     );
     if (deadTrg.length && !ed.deadTrgConfirmed) {
       if (!window.confirm(this.tr("trgDeadConfirm"))) return;

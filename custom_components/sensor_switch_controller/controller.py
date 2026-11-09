@@ -446,8 +446,13 @@ class ControllerManager:
             # re-evaluates the outputs that compare can reach — without
             # this join the "compare(entity) → literal" chain (the UI
             # default shape) has no legal wakeup path at all and the output
-            # freezes after the startup evaluation
-            if trg.get("type") == TRG_STATE:
+            # freezes after the startup evaluation. DISABLED triggers are
+            # skipped (R4-5): they never register a listener, so the join
+            # must not lend them targets.
+            if (
+                trg.get("type") == TRG_STATE
+                and trg.get("enabled", True) is not False
+            ):
                 listen = trg.get(CONF_ENTITY_ID)
                 if isinstance(listen, str):
                     listen = [listen]

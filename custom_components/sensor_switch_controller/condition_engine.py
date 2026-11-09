@@ -1061,13 +1061,18 @@ class ConditionEngine:
             self._warn_eval_failure(cid, f"compare input {which} (kind)", kind)
             return None
         # entity/snapshot end: numeric exactly when the reading parses as
-        # a FINITE number (bool excluded — True is not the number 1 here;
-        # NaN/inf count as STRING ends, the same isfinite gate the capture
-        # path and the literal validation apply — R3-3, without it a
-        # "nan" reading made not_equal permanently true and "inf" made
-        # above-family always fire)
-        if isinstance(raw, bool):
-            return raw, False
+        # a FINITE number (NaN/inf count as STRING ends, the same
+        # isfinite gate the capture path and the literal validation apply
+        # — R3-3). Unsupported attribute TYPES (bool/list/dict…) are
+        # neither numbers nor strings — a visible False with a WARN beats
+        # the silent always-false equality they used to produce (R4-4).
+        if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+            self._warn_eval_failure(
+                cid,
+                f"compare input {which} (unsupported attribute type)",
+                type(raw).__name__,
+            )
+            return None
         value = _parse_finite_float(raw)
         if value is not None:
             return value, True

@@ -2350,6 +2350,36 @@ async def main():
     )
     print("[PASS] data-node compare: NaN/inf readings are string ends (R3-3)")
 
+    # R4-4: unsupported attribute TYPES (bool/list/…) are neither numbers
+    # nor strings — visible False with one rate-limited WARN beats the
+    # silent always-false equality they used to produce
+    hass_r4 = _Hass()
+    hass_r4.states._attrs["sensor.a"] = {"battery_charging": True}
+    r4_eq = "cond_" + "ff" * 16
+    eng_r4 = ConditionEngine(
+        hass_r4,
+        [
+            {"id": lit_on, "type": "literal", "value_type": "state",
+             "value": "on"},
+            {"id": r4_eq, "type": "compare", "op": "equal",
+             "a": {"kind": "entity", "entity_id": "sensor.a",
+                   "attribute": "battery_charging"},
+             "b": {"kind": "literal", "cond": lit_on}},
+        ],
+    )
+    _cap4 = _Cap()
+    _lgdn.addHandler(_cap4)
+    try:
+        assert await eng_r4.evaluate_any([r4_eq]) is False
+        assert await eng_r4.evaluate_any([r4_eq]) is False  # rate limit: once
+    finally:
+        _lgdn.removeHandler(_cap4)
+    assert sum(
+        "compare input a (unsupported attribute type)" in r.getMessage()
+        for r in _cap4.records
+    ) == 1, [r.getMessage() for r in _cap4.records]
+    print("[PASS] data-node compare: bool attribute end is visible False + WARN (R4-4)")
+
     # six numeric operators against one shared literal (reuse pin)
     six_ids = [f"cond_{i:032x}" for i in range(6)]
     six_ops = ("equal", "not_equal", "above", "below", "above_equal", "below_equal")
@@ -2488,13 +2518,24 @@ async def main():
     r3_cmp2 = "cond_" + "eb" * 16  # compare: sensor.a below 5 (off chain —
                                    # an unmet on chain only HOLDS, turning
                                    # the output off needs the off chain)
+    r3_cmp3 = "cond_" + "ec" * 16  # compare: sensor.b above 5 (out2 chain —
+                                   # the JOIN-KEY discriminant: nobody
+                                   # listens to sensor.b, so out2 must stay
+                                   # out of the a-trigger's targets)
     r3_trg = "trg_" + "1" * 31 + "2"
+    r3_trg2 = "trg_" + "1" * 31 + "3"  # DISABLED, listens to sensor.b —
+                                       # enabled semantics must survive the
+                                       # join (R4-5)
     r3_out = "ssc_" + "9" * 31 + "8"
+    r3_out2 = "ssc_" + "9" * 31 + "7"
     r3_cfg = {
         "name": "r3-join", "enabled": True, "logging_enabled": False,
-        "triggers": [{"id": r3_trg, "type": "state",
-                      "entity_id": "sensor.a",
-                      "routes": {"conditions": []}}],
+        "triggers": [
+            {"id": r3_trg, "type": "state", "entity_id": "sensor.a",
+             "routes": {"conditions": []}},
+            {"id": r3_trg2, "type": "state", "entity_id": "sensor.b",
+             "enabled": False, "routes": {"conditions": []}},
+        ],
         "conditions": [
             {"id": r3_lit, "type": "literal", "value_type": "number",
              "value": 5},
@@ -2504,10 +2545,15 @@ async def main():
             {"id": r3_cmp2, "type": "compare", "op": "below",
              "a": {"kind": "entity", "entity_id": "sensor.a"},
              "b": {"kind": "literal", "cond": r3_lit}},
+            {"id": r3_cmp3, "type": "compare", "op": "above",
+             "a": {"kind": "entity", "entity_id": "sensor.b"},
+             "b": {"kind": "literal", "cond": r3_lit}},
         ],
         "outputs": [
             {"name": "r3", "type": "switch", "entity_id": r3_out,
              "on_conditions": [r3_cmp], "off_conditions": [r3_cmp2]},
+            {"name": "r3b", "type": "switch", "entity_id": r3_out2,
+             "on_conditions": [r3_cmp3], "off_conditions": []},
         ],
     }
     hass_r3 = _Hass()
@@ -2515,8 +2561,14 @@ async def main():
         hass_r3, "ctrl_r3join1", _vc(json.loads(json.dumps(r3_cfg)))
     )
     await mgr_r3.async_setup()
-    # build face: the empty-coverage trigger's targets grew via the join
+    # build face: the empty-coverage trigger's targets grew via the join —
+    # and ONLY via the listened entity: out2 (compare on sensor.b, nobody
+    # listening) must stay out (a wrong join key unioning every compare
+    # entity end yields {r3_out, r3_out2} here — red)
     assert mgr_r3._trg_targets[r3_trg] == {r3_out}, mgr_r3._trg_targets
+    # the DISABLED trigger listening to sensor.b gets no join credit
+    # (it never registers a listener — enabled semantics survive R4-5)
+    assert mgr_r3._trg_targets[r3_trg2] == set(), mgr_r3._trg_targets
     ent_r3 = _Entity("switch.r3out")
     mgr_r3.register_entity(r3_out, ent_r3)
     # startup evaluation: 16.7 above 5 → on
@@ -2533,6 +2585,57 @@ async def main():
     )
     mgr_r3.async_unload()
     print("[PASS] data-node wakeup: compare entity ends covered by the entity join (R3-1)")
+
+    # R4-1 schema face: the calendar heartbeat arm credits the entity join
+    # — "calendar + compare(entity end an enabled state trigger listens
+    # to)" must NOT warn heartbeat-only; without a listener it still does
+    r4c_cal = "cond_" + "31" * 16
+    r4c_cmp = "cond_" + "32" * 16
+    r4c_lit = "cond_" + "33" * 16
+    r4c_out = "ssc_" + "9" * 31 + "6"
+
+    def _cal_cfg(listen):
+        return {
+            "name": "r4-cal", "enabled": True, "logging_enabled": False,
+            "triggers": [{
+                "id": "trg_" + "2" * 31 + ("1" if listen else "0"),
+                "type": "state",
+                "entity_id": "sensor.a" if listen else "sensor.z",
+                "routes": {"conditions": [r4c_cal]},
+            }],
+            "conditions": [
+                {"id": r4c_cal, "type": "calendar",
+                 "entity_id": "calendar.x", "hours": 24.0},
+                {"id": r4c_lit, "type": "literal", "value_type": "number",
+                 "value": 5},
+                {"id": r4c_cmp, "type": "compare", "op": "above",
+                 "a": {"kind": "entity", "entity_id": "sensor.a"},
+                 "b": {"kind": "literal", "cond": r4c_lit}},
+            ],
+            "outputs": [
+                {"name": "r4c", "type": "switch", "entity_id": r4c_out,
+                 "on_conditions": [r4c_cal, r4c_cmp], "off_conditions": []},
+            ],
+        }
+
+    _scap4 = _Cap()
+    _slg4 = _logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _slg4.addHandler(_scap4)
+    try:
+        _vc(_cal_cfg(True))  # listened: no heartbeat-only warning
+        assert not any(
+            "依赖日历条件" in r.getMessage() for r in _scap4.records
+        ), [r.getMessage() for r in _scap4.records]
+        _scap4.records.clear()
+        _vc(_cal_cfg(False))  # nobody listens: the warning stays
+        assert any(
+            "依赖日历条件" in r.getMessage() for r in _scap4.records
+        ), [r.getMessage() for r in _scap4.records]
+    finally:
+        _slg4.removeHandler(_scap4)
+    print("[PASS] data-node hazards: calendar arm credits the entity join (R4-1)")
 
     # hub store: three tables in one payload; pre-0.13 payloads (no
     # snapshots key) load silently; bool-poisoned values drop loudly

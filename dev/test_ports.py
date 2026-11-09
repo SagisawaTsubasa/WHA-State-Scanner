@@ -60,12 +60,41 @@ _PORTS_HTML = """<!doctype html>
                   on_conditions: ["cond_cmp"], off_conditions: [],
                   manual_override: false }],
     };
+    // R4-1 panel face: the entity-coverage join must keep the canvas
+    // honest — trg_join (listens to sensor.a, routes EMPTY, a compare
+    // reads sensor.a into an output) is ALIVE at runtime, so no red dead
+    // badge; trg_dead (listens to sensor.z, nobody reads it) stays dead.
+    const joinHex = "b".repeat(32);
+    const controllerJoin = {
+      name: "join-test", enabled: true, logging_enabled: false,
+      triggers: [
+        { id: "trg_j1" + joinHex.slice(5), type: "state", label: "live",
+          enabled: true, entity_id: "sensor.a",
+          routes: { conditions: [] } },
+        { id: "trg_j2" + joinHex.slice(5), type: "state", label: "dead",
+          enabled: true, entity_id: "sensor.z",
+          routes: { conditions: [] } },
+      ],
+      conditions: [
+        { id: "cond_jl" + joinHex.slice(6), type: "literal", label: "l",
+          enabled: true, value_type: "number", value: 5 },
+        { id: "cond_jc" + joinHex.slice(6), type: "compare", label: "c",
+          enabled: true, op: "above",
+          a: { kind: "entity", entity_id: "sensor.a" },
+          b: { kind: "literal", cond: "cond_jl" + joinHex.slice(6) } },
+      ],
+      outputs: [{ name: "jo", type: "switch",
+                  entity_id: "ssc_" + joinHex,
+                  on_conditions: ["cond_jc" + joinHex.slice(6)],
+                  off_conditions: [], manual_override: false }],
+    };
     const hassStub = {
       language: "zh-Hans",
       states: {},
       async fetchWithAuth(url, opts = {}) {
         if (url.includes("/config"))
-          return json({ ok: true, controllers: { ctrl_test01: controller } });
+          return json({ ok: true, controllers: {
+            ctrl_test01: controller, ctrl_join01: controllerJoin } });
         return json({ ok: true });
       },
     };
@@ -77,6 +106,7 @@ _PORTS_HTML = """<!doctype html>
     document.getElementById("standalone-host").appendChild(a);
     a._nav("#/editor/ctrl_test01");
     window.__panel = a;
+    window.__joinPanel = a; // same panel instance; the join view is a nav
   </script>
 </body></html>
 """.replace("%H%", _HEX)
@@ -179,6 +209,35 @@ def main():
                 f"palette-added snapshot node input_1 not visible: {vis}"
             )
             print("[palette] freshly added snapshot node has a visible input_1")
+
+            # R4-1 canvas badge face: navigate to the join controller and
+            # check the dead badges — the entity-coverage join keeps a
+            # legally-wired (listening) trigger alive, the unlistened one
+            # stays dead (DOM truth via the .trg-dead class)
+            page.evaluate(
+                "() => window.__panel._nav('#/editor/ctrl_join01')"
+            )
+            page.wait_for_timeout(1500)
+            badges = page.evaluate(
+                "() => { const p = window.__panel;"
+                " const dead = {};"
+                " for (const [nid, tid] of p._editor.nodeToTrg) {"
+                "  const el = p.shadowRoot.querySelector('#node-' + nid);"
+                "  if (el) dead[tid] = el.classList.contains('trg-dead');"
+                " }"
+                " return dead; }"
+            )
+            assert len(badges) == 2, f"join controller triggers not drawn: {badges}"
+            live_tid = next(t for t in badges if t.startswith("trg_j1"))
+            dead_tid = next(t for t in badges if t.startswith("trg_j2"))
+            assert badges[live_tid] is False, (
+                "the entity-join trigger (listens to a compare-read entity) "
+                f"must NOT wear the dead badge (R4-1): {badges}"
+            )
+            assert badges[dead_tid] is True, (
+                "the unlistened trigger must stay dead: " + str(badges)
+            )
+            print("[badge] entity-join trigger alive, unlistened trigger dead (R4-1)")
 
             assert not errors, f"page errors: {errors}"
             browser.close()

@@ -13,7 +13,7 @@
 - **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
 - **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，刷新状态只读染色（绿=满足/红=不满足，不动作不写日志），「立即评估」确认后才真实动作（输出徽章显示决策）
 - **触发器可连线路由（0.7.0，0.10.0 起强制显式）** — 触发器是画布上的信号源：信号线连到条件或逻辑组的「信号」口开始评估；信号覆盖了哪些门，就沿链唤醒哪些输出；未连线=不评估，到期唤醒同样定向（逻辑组：连信号=触发合并贯通，连成员=条件判定）。0.10.0 起遗留全量评估（routes 缺省）与「留空监听整个传感器池」均废弃：routes 与触发实体（可逗号分隔多实体）必须显式声明
-- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒），支持 `AND`/`OR`/`NOT` 嵌套组合
+- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒）、`snapshot`（快照记忆）、`literal`（常量）、`compare`（双端求值）十二类叶子，支持 `AND`/`OR`/`NOT` 嵌套组合
 - **多路输出** — 一个控制器可生成多个开关或二进制传感器；`off_conditions` 优先于 `on_conditions`（防抖动）
 - **决策日志** — 每周期逐输出写入独立 JSONL（触发源实体与状态变化、逐条件求值明细、applied/override 标记；0.11.0 及以前的旧记录另含全池读数快照），面板内可直接查询
 - **手动覆盖** — 开关类型支持可选的手动强制控制
@@ -23,7 +23,7 @@
 
 - **Sidebar web panel** — overview / visual flow editor / decision-log viewer, fully built-in, zero CDN
 - **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; the read-only status refresh colors nodes (green=met / red=unmet, no actuation); "evaluate now" actuates behind a confirm (decision badges on outputs)
-- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), plus `AND`/`OR`/`NOT` nesting
+- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), `snapshot` (memory of one moment), `literal` (constant), `compare` (two-input verdict) — twelve leaf types, plus `AND`/`OR`/`NOT` nesting
 - **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
 - **Decision log** — per-cycle JSONL with firing entity + state change, per-condition verdicts, applied/override flags (records up to 0.11.0 also carry a full-pool readings snapshot); queryable in the panel
 - **Manual override** — optional per-switch manual control lock
@@ -211,7 +211,7 @@ MIT
 - **⚖ 求值（compare）叶子条件**——双输入单输出：A/B 各自三态（`{kind: entity, entity_id, attribute?}` 实体当前状态或属性 / `{kind: snapshot, cond}` 快照值 / `{kind: literal, cond}` 常量）。两端同数值型→数值比较；同状态型→字符串比较；above 族遇非数值端或两端混型→**判定为假+日志 WARN**（禁静默回落）；实体 unavailable/属性缺失→假+告警记因。六算子：`equal / not_equal / above / below / above_equal / below_equal`
 - **三层分工正交**：and/or/not 组管布尔逻辑、求值管值算术、快照管记忆——数据节点可进组/输出链统一求值，引擎无类型特例分支；`for` 持续前置按通用叶子规则同样可用。同周期收敛：拍/清事件发生时旗标重步进一次（旗标 set/reset 读快照不再慢一拍）并把下游链扩进本周期评估
 - **画布**：三新节点入调色板——快照=拍下/清空双入口（多线=任一，旗标同款）+源实体表单；常量=值类型下拉按型联动；求值=A/B 双口（只收快照/常量连线、单线，未连线端按表单实体求值，连线优先）+算子下拉；中英文案同步（LANG +36 键/语言）
-- **持久化**：旗标存储载荷 `{flags, last_flip}` 扩为 `{flags, last_flip, snapshots, snapshot_gates}`——旧载荷缺键静默容忍，**显式 null 与坏值告警丢弃**；快照与边沿门真值跨重启/重载存活。唤醒口径不变（0.12.0）：数据节点无计时边，依赖实体变化靠触发器显式声明——其中**求值的实体端由监听该实体的 state 触发器自动覆盖**（触发器 entity 列表命中求值所读实体时，该求值可达的输出自动并入本周期评估面，无需信号线）
+- **持久化**：旗标存储载荷 `{flags, last_flip}` 扩为 `{flags, last_flip, snapshots, snapshot_gates}`——旧载荷缺键静默容忍，**显式 null 与坏值告警丢弃**；快照与边沿门真值跨重启/重载存活。唤醒口径不变（0.12.0）：数据节点无计时边，依赖实体变化靠触发器显式声明——其中**求值的实体端由监听该实体的 state 触发器自动覆盖**（触发器 entity 列表命中求值所读实体时，该求值可达的输出自动并入本周期评估面，无需信号线）。该覆盖的边界：① 触发器自身的 `from`/`to`/`attribute` 过滤会收窄实际触发面，「监听命中」不等于「每次变化都唤醒」（被过滤吞掉的事件不唤醒）；② **属性端**：无 attribute 过滤的 state 触发器在状态值不变（仅属性变化）时不再触发事件，求值读属性的链若只靠此类触发器覆盖，属性单独变化不会唤醒——请给该触发器加对应 attribute 过滤；③ 触发器监听 X 而求值读 Y 不覆盖（需把信号线连到链上条件，或为 Y 另配触发器）
 - 校验面：快照 capture/clear 引用存在性、**拍/清门死分支拒存**（冷却条件在快照步进时没有输出上下文恒 False，混入恒假成员的组同理；混合 OR 组经活成员仍可用）、求值 A/B 引用必须指向同型节点、常量值型匹配、算子白名单；触发器覆盖展开含快照拍/清边与求值 A/B 引用（与运行时路由索引同构防漂移）
 
 **内部**
