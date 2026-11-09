@@ -48,9 +48,11 @@ from .const import (
     CONF_SET_CONDITIONS,
     CONF_START,
     CONF_TRIGGERS,
+    COND_COMPARE,
     COND_SNAPSHOT,
     DOMAIN,
     EVAL_DEBOUNCE_SECONDS,
+    TRG_STATE,
 )
 from .decision_log import DecisionLogger
 from .triggers import TriggerManager
@@ -398,6 +400,29 @@ class ControllerManager:
             add_chain(out_id, out.get("off_conditions") or [])
         self._cond_to_outs = cond_to_outs
 
+        # R3-1 entity coverage index: a compare reading an ENTITY end has
+        # no legal signal wire (data nodes carry no signal port and are not
+        # route targets), so its dependency is covered by the triggers
+        # LISTENING to that entity — entity_id → outputs for every compare
+        # entity end, consulted when the trigger targets are built below.
+        # Purely static (the trigger's declared entity list is the listen
+        # set), zero runtime dispatch changes.
+        entity_outs: dict[str, set[str]] = {}
+        for cond in cond_by_id.values():
+            if not isinstance(cond, dict) or cond.get("type") != COND_COMPARE:
+                continue
+            outs = cond_to_outs.get(cond.get("id")) or set()
+            if not outs:
+                continue
+            for side_key in (CONF_INPUT_A, CONF_INPUT_B):
+                side = cond.get(side_key)
+                if (
+                    isinstance(side, dict)
+                    and side.get("kind") == "entity"
+                    and isinstance(side.get(CONF_ENTITY_ID), str)
+                ):
+                    entity_outs.setdefault(side[CONF_ENTITY_ID], set()).update(outs)
+
         legacy = False
         targets_by_trg: dict[str, set[str]] = {}
         for trg in self.triggers:
@@ -417,6 +442,17 @@ class ControllerManager:
             targets = set()
             for cid in routes.get("conditions") or []:
                 targets |= cond_to_outs.get(cid) or set()
+            # R3-1: a state trigger listening to an entity a compare READS
+            # re-evaluates the outputs that compare can reach — without
+            # this join the "compare(entity) → literal" chain (the UI
+            # default shape) has no legal wakeup path at all and the output
+            # freezes after the startup evaluation
+            if trg.get("type") == TRG_STATE:
+                listen = trg.get(CONF_ENTITY_ID)
+                if isinstance(listen, str):
+                    listen = [listen]
+                for eid in listen or []:
+                    targets |= entity_outs.get(eid) or set()
             if trg_id:
                 targets_by_trg[trg_id] = targets
         self._trg_targets = targets_by_trg

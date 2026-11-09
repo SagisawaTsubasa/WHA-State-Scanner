@@ -2309,6 +2309,47 @@ async def main():
     assert ev_r2b == {sn_num: {"event": "capture", "value": 16.7}}, ev_r2b
     print("[PASS] data-node retry: failed capture keeps the edge alive (R2-2)")
 
+    # R3-3: non-finite readings on the compare read path are STRING ends —
+    # NaN no longer makes not_equal/equal comparisons lie and inf no longer
+    # makes above-family always fire (the same isfinite gate capture and
+    # the literal validation apply). Old behavior marked red: float("nan")
+    # was a numeric end (mixed-kind False here), float("inf") above 25 was
+    # True.
+    r3f_snap = "cond_" + "fa" * 16
+    r3f_lit = "cond_" + "fb" * 16   # literal state "nan"
+    r3f_litn = "cond_" + "fc" * 16  # literal number 25
+    r3f_eq = "cond_" + "fd" * 16    # snapshot "nan" equal literal "nan"
+    r3f_ab = "cond_" + "fe" * 16    # entity "inf" above 25
+    hass_r3f = _Hass()
+    hass_r3f.states._d["sensor.inf"] = "inf"
+    eng_r3f = ConditionEngine(
+        hass_r3f,
+        [
+            {"id": r3f_snap, "type": "snapshot", "entity_id": "sensor.nan",
+             "capture": [t7_gate], "clear": []},
+            {"id": r3f_lit, "type": "literal", "value_type": "state",
+             "value": "nan"},
+            {"id": r3f_litn, "type": "literal", "value_type": "number",
+             "value": 25},
+            {"id": r3f_eq, "type": "compare", "op": "equal",
+             "a": {"kind": "snapshot", "cond": r3f_snap},
+             "b": {"kind": "literal", "cond": r3f_lit}},
+            {"id": r3f_ab, "type": "compare", "op": "above",
+             "a": {"kind": "entity", "entity_id": "sensor.inf"},
+             "b": {"kind": "literal", "cond": r3f_litn}},
+        ],
+    )
+    # captured as a state string (the R1-7 NaN gate keeps it out of float)
+    eng_r3f._snapshot_values[r3f_snap] = "nan"
+    assert await eng_r3f.evaluate_any([r3f_eq]) is True, (
+        'string "nan" vs string "nan" must compare equal (R3-3)'
+    )
+    assert await eng_r3f.evaluate_any([r3f_ab]) is False, (
+        'the "inf" reading is a string end — above against a number must '
+        "be mixed-kind False, not always-true (R3-3)"
+    )
+    print("[PASS] data-node compare: NaN/inf readings are string ends (R3-3)")
+
     # six numeric operators against one shared literal (reuse pin)
     six_ids = [f"cond_{i:032x}" for i in range(6)]
     six_ops = ("equal", "not_equal", "above", "below", "above_equal", "below_equal")
@@ -2436,6 +2477,62 @@ async def main():
     ), "the re-stepped flag verdict must persist"
     mgr_rt.async_unload()
     print("[PASS] data-node directed cycle: same-cycle widening + flag re-step (R1-2/R1-8)")
+
+    # R3-1: a pure compare(entity) chain carries no legal signal wire (no
+    # signal port, no route target) — its wakeup rides the entity coverage
+    # join: a trigger LISTENING to the entity a compare reads pulls that
+    # compare's outputs into the dispatch targets. Without the join this
+    # exact shape (the UI default) froze the output after startup.
+    r3_lit = "cond_" + "da" * 16   # literal number 5
+    r3_cmp = "cond_" + "ea" * 16   # compare: sensor.a above 5 (on chain)
+    r3_cmp2 = "cond_" + "eb" * 16  # compare: sensor.a below 5 (off chain —
+                                   # an unmet on chain only HOLDS, turning
+                                   # the output off needs the off chain)
+    r3_trg = "trg_" + "1" * 31 + "2"
+    r3_out = "ssc_" + "9" * 31 + "8"
+    r3_cfg = {
+        "name": "r3-join", "enabled": True, "logging_enabled": False,
+        "triggers": [{"id": r3_trg, "type": "state",
+                      "entity_id": "sensor.a",
+                      "routes": {"conditions": []}}],
+        "conditions": [
+            {"id": r3_lit, "type": "literal", "value_type": "number",
+             "value": 5},
+            {"id": r3_cmp, "type": "compare", "op": "above",
+             "a": {"kind": "entity", "entity_id": "sensor.a"},
+             "b": {"kind": "literal", "cond": r3_lit}},
+            {"id": r3_cmp2, "type": "compare", "op": "below",
+             "a": {"kind": "entity", "entity_id": "sensor.a"},
+             "b": {"kind": "literal", "cond": r3_lit}},
+        ],
+        "outputs": [
+            {"name": "r3", "type": "switch", "entity_id": r3_out,
+             "on_conditions": [r3_cmp], "off_conditions": [r3_cmp2]},
+        ],
+    }
+    hass_r3 = _Hass()
+    mgr_r3 = ControllerManager(
+        hass_r3, "ctrl_r3join1", _vc(json.loads(json.dumps(r3_cfg)))
+    )
+    await mgr_r3.async_setup()
+    # build face: the empty-coverage trigger's targets grew via the join
+    assert mgr_r3._trg_targets[r3_trg] == {r3_out}, mgr_r3._trg_targets
+    ent_r3 = _Entity("switch.r3out")
+    mgr_r3.register_entity(r3_out, ent_r3)
+    # startup evaluation: 16.7 above 5 → on
+    await mgr_r3._async_evaluate(None, ["init"], None)
+    assert ent_r3.is_on is True
+    # the entity drops below the threshold and the trigger fires: the
+    # output must re-evaluate OFF in the same dispatch (frozen = red)
+    hass_r3.states._d["sensor.a"] = "3"
+    mgr_r3._on_trigger_fire(r3_trg, "sensor.a")
+    mgr_r3._async_debounced_evaluate(None)
+    await asyncio.sleep(0.05)
+    assert ent_r3.is_on is False, (
+        "compare entity ends must wake via the listening trigger (R3-1)"
+    )
+    mgr_r3.async_unload()
+    print("[PASS] data-node wakeup: compare entity ends covered by the entity join (R3-1)")
 
     # hub store: three tables in one payload; pre-0.13 payloads (no
     # snapshots key) load silently; bool-poisoned values drop loudly

@@ -136,7 +136,7 @@ Config Entry（单一条目 / single entry）
 |-------------|----------------|
 | `hub.py` | 域级单例：Store 读写、控制器 CRUD、运行时快照 / Domain singleton: store, controller CRUD, snapshots |
 | `controller.py` | 触发调度、定向路由评估（含 applied/override 记录）、评估/观察 API / Trigger scheduling, directed evaluation, evaluate/observe API |
-| `condition_engine.py` | 递归条件评估（九类叶子 + AND/OR/NOT 嵌套 + 计时账本 + 定向唤醒）/ Recursive evaluator |
+| `condition_engine.py` | 递归条件评估（十二类叶子 + AND/OR/NOT 嵌套 + 计时账本 + 定向唤醒）/ Recursive evaluator |
 | `schema.py` | 共享校验（Web API 与 config flow 同源）/ Shared validation |
 | `web.py` | REST views、面板注册、静态资源 / REST views, panel & static registration |
 | `static/panel.js` | 面板前端（零构建自定义元素 + Drawflow）/ Zero-build panel frontend |
@@ -211,7 +211,7 @@ MIT
 - **⚖ 求值（compare）叶子条件**——双输入单输出：A/B 各自三态（`{kind: entity, entity_id, attribute?}` 实体当前状态或属性 / `{kind: snapshot, cond}` 快照值 / `{kind: literal, cond}` 常量）。两端同数值型→数值比较；同状态型→字符串比较；above 族遇非数值端或两端混型→**判定为假+日志 WARN**（禁静默回落）；实体 unavailable/属性缺失→假+告警记因。六算子：`equal / not_equal / above / below / above_equal / below_equal`
 - **三层分工正交**：and/or/not 组管布尔逻辑、求值管值算术、快照管记忆——数据节点可进组/输出链统一求值，引擎无类型特例分支；`for` 持续前置按通用叶子规则同样可用。同周期收敛：拍/清事件发生时旗标重步进一次（旗标 set/reset 读快照不再慢一拍）并把下游链扩进本周期评估
 - **画布**：三新节点入调色板——快照=拍下/清空双入口（多线=任一，旗标同款）+源实体表单；常量=值类型下拉按型联动；求值=A/B 双口（只收快照/常量连线、单线，未连线端按表单实体求值，连线优先）+算子下拉；中英文案同步（LANG +36 键/语言）
-- **持久化**：旗标存储载荷 `{flags, last_flip}` 扩为 `{flags, last_flip, snapshots, snapshot_gates}`——旧载荷缺键静默容忍，**显式 null 与坏值告警丢弃**；快照与边沿门真值跨重启/重载存活。唤醒口径不变（0.12.0）：数据节点无计时边，依赖实体变化靠触发器显式声明
+- **持久化**：旗标存储载荷 `{flags, last_flip}` 扩为 `{flags, last_flip, snapshots, snapshot_gates}`——旧载荷缺键静默容忍，**显式 null 与坏值告警丢弃**；快照与边沿门真值跨重启/重载存活。唤醒口径不变（0.12.0）：数据节点无计时边，依赖实体变化靠触发器显式声明——其中**求值的实体端由监听该实体的 state 触发器自动覆盖**（触发器 entity 列表命中求值所读实体时，该求值可达的输出自动并入本周期评估面，无需信号线）
 - 校验面：快照 capture/clear 引用存在性、**拍/清门死分支拒存**（冷却条件在快照步进时没有输出上下文恒 False，混入恒假成员的组同理；混合 OR 组经活成员仍可用）、求值 A/B 引用必须指向同型节点、常量值型匹配、算子白名单；触发器覆盖展开含快照拍/清边与求值 A/B 引用（与运行时路由索引同构防漂移）
 
 **内部**

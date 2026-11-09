@@ -1061,15 +1061,17 @@ class ConditionEngine:
             self._warn_eval_failure(cid, f"compare input {which} (kind)", kind)
             return None
         # entity/snapshot end: numeric exactly when the reading parses as
-        # one (bool excluded — True is not the number 1 here)
+        # a FINITE number (bool excluded — True is not the number 1 here;
+        # NaN/inf count as STRING ends, the same isfinite gate the capture
+        # path and the literal validation apply — R3-3, without it a
+        # "nan" reading made not_equal permanently true and "inf" made
+        # above-family always fire)
         if isinstance(raw, bool):
             return raw, False
-        if isinstance(raw, (int, float)):
-            return float(raw), True
-        try:
-            return float(raw), True
-        except (TypeError, ValueError):
-            return raw, False
+        value = _parse_finite_float(raw)
+        if value is not None:
+            return value, True
+        return raw, False
 
     async def _evaluate_leaf(
         self, cond: dict, ctype: str, path: str, out_id: str | None = None
