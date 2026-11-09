@@ -466,6 +466,11 @@ class ScannerHub:
         # Runtime-only (not part of the controller config): the hub object
         # survives entry reloads, the store below survives HA restarts.
         self.flag_states: dict[str, dict[str, bool]] = {}
+        # Snapshot (memory) latches (0.13.0):
+        # {controller_id: {snapshot_cond_id: float | str}} — the value type
+        # IS the snapshot kind (numeric vs state, auto-typed at capture).
+        # Same persistence story as the flag latches below.
+        self.snapshot_states: dict[str, dict[str, Any]] = {}
         # Last applied flip (ISO string) per output, per controller — the
         # cooldown conditions' flip history, persisted with the same store
         # payload as the flag latches so it survives reloads/restarts
@@ -609,7 +614,7 @@ class ScannerHub:
             # a non-object (F-317: the missing/null faces used to vanish
             # silently, unlike the controllers guards) — degrades loudly.
             # The whole payload is untrustworthy, so the flip history goes
-            # with it.
+            # with it — and, since 0.13.0, the snapshot latches too.
             if data is not None:
                 _LOGGER.warning(
                     "Stored %s_flags 'flags' payload is not an object (%r); ignored",
@@ -618,6 +623,7 @@ class ScannerHub:
                 )
             self.flag_states = {}
             self.last_flips = {}
+            self.snapshot_states = {}
             return
         states: dict[str, dict[str, bool]] = {}
         for cid, value in raw.items():
@@ -688,10 +694,55 @@ class ScannerHub:
                         type(value).__name__,
                     )
             self.last_flips = flips
+        # Snapshot latches ride the same payload (0.13.0). Same tolerance
+        # ladder as 'last_flip': a missing key is the pre-0.13 normal shape
+        # (stay silent), a present-but-unusable value warns and degrades to
+        # empty (the captures are gone, NOT silently kept half-loaded).
+        raw_snaps = (data or {}).get("snapshots")
+        if not isinstance(raw_snaps, dict):
+            if data is not None and raw_snaps is not None:
+                _LOGGER.warning(
+                    "Stored %s_flags 'snapshots' payload is not an object (%r); ignored",
+                    STORE_KEY,
+                    type(raw_snaps).__name__,
+                )
+            self.snapshot_states = {}
+        else:
+            snaps: dict[str, dict[str, Any]] = {}
+            for cid, value in raw_snaps.items():
+                # same per-controller guard as the flag states: a
+                # non-object value would explode dict() in the managers
+                if isinstance(cid, str) and isinstance(value, dict):
+                    # keep only str → (int|float|str) entries; bools are
+                    # not legal snapshot values (a hand-edited True is not
+                    # the number 1, and bool would poison compare typing)
+                    clean = {
+                        k: v
+                        for k, v in value.items()
+                        if isinstance(k, str)
+                        and isinstance(v, (int, float, str))
+                        and not isinstance(v, bool)
+                    }
+                    if len(clean) != len(value):
+                        _LOGGER.warning(
+                            "Dropping %d malformed snapshot entries for "
+                            "controller %s (values must be numbers or strings)",
+                            len(value) - len(clean),
+                            cid,
+                        )
+                    snaps[cid] = clean
+                else:
+                    _LOGGER.warning(
+                        "Dropping malformed snapshot state for controller "
+                        "%r (%s)",
+                        cid,
+                        type(value).__name__,
+                    )
+            self.snapshot_states = snaps
 
     @staticmethod
-    def _flag_store_payload(flag_states: dict, last_flips: dict) -> dict:
-        """Snapshot both runtime tables for the store write (F-325): the
+    def _flag_store_payload(flag_states: dict, last_flips: dict, snapshot_states: dict) -> dict:
+        """Snapshot the runtime tables for the store write (F-325): the
         Store keeps the payload reference alive across await points (the
         write lock), so hand it per-controller copies — the same discipline
         as the controllers save (``payload = dict(self.controllers)``) —
@@ -699,17 +750,31 @@ class ScannerHub:
         flip. (Verified against the 2026.1.3 wheel: with the default
         ``serialize_in_event_loop=True`` the JSON pass itself is a
         synchronous event-loop walk, so this is a state-semantics
-        hardening, not a RuntimeError fix.)"""
+        hardening, not a RuntimeError fix.) Since 0.13.0 the payload carries
+        a third table, ``snapshots`` (pre-0.13 files load without the key;
+        every save writes it)."""
         return {
             "flags": {c: dict(v) for c, v in flag_states.items()},
             "last_flip": {c: dict(v) for c, v in last_flips.items()},
+            "snapshots": {c: dict(v) for c, v in snapshot_states.items()},
         }
 
     async def async_save_flag_states(self, cid: str, states: dict) -> None:
         """Persist one controller's flag states (called on flag flips)."""
         self.flag_states[cid] = dict(states)
         await self._flag_store.async_save(
-            self._flag_store_payload(self.flag_states, self.last_flips)
+            self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states
+            )
+        )
+
+    async def async_save_snapshots(self, cid: str, values: dict) -> None:
+        """Persist one controller's snapshot latches (capture/clear)."""
+        self.snapshot_states[cid] = dict(values)
+        await self._flag_store.async_save(
+            self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states
+            )
         )
 
     async def async_save_last_flip(self, cid: str, out_id: str, when: Any) -> None:
@@ -729,17 +794,23 @@ class ScannerHub:
         ``_flag_store_payload``."""
         self.last_flips.setdefault(cid, {})[out_id] = when.isoformat()
         self._flag_store.async_delay_save(
-            lambda: self._flag_store_payload(self.flag_states, self.last_flips),
+            lambda: self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states
+            ),
             1,
         )
 
     async def async_drop_flag_states(self, cid: str) -> None:
         """Forget and persist-erase one controller's flag states (and its
-        cooldown flip history — the controller is gone either way)."""
+        cooldown flip history and snapshot latches — the controller is gone
+        either way)."""
         self.flag_states.pop(cid, None)
         self.last_flips.pop(cid, None)
+        self.snapshot_states.pop(cid, None)
         await self._flag_store.async_save(
-            self._flag_store_payload(self.flag_states, self.last_flips)
+            self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states
+            )
         )
 
     # ------------------------------------------------------------------

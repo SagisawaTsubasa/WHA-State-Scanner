@@ -53,6 +53,9 @@ COND_CALENDAR = "calendar"
 COND_DURATION = "duration"
 COND_DEBOUNCE = "debounce"
 COND_FLAG = "flag"
+COND_SNAPSHOT = "snapshot"
+COND_LITERAL = "literal"
+COND_COMPARE = "compare"
 COND_AND = "and"
 COND_OR = "or"
 COND_NOT = "not"
@@ -62,6 +65,28 @@ COND_NOT = "not"
 CONF_SET_CONDITIONS = "set_conditions"
 CONF_RESET_CONDITIONS = "reset_conditions"
 CONF_INITIAL = "initial"
+
+# Snapshot (memory) condition fields: capture/clear reference condition ids
+# (capture = rising-edge of the capture gate, clear = level, reset wins);
+# the latched value is the source entity's reading at capture time. Literal
+# (constant) and compare (two-input verdict) fields follow.
+CONF_CAPTURE = "capture"
+CONF_CLEAR = "clear"
+CONF_VALUE_TYPE = "value_type"
+CONF_VALUE = "value"
+CONF_INPUT_A = "a"
+CONF_INPUT_B = "b"
+CONF_OP = "op"
+
+# Compare operators (op whitelist shared by schema validation and the engine).
+COMPARE_OPS = (
+    "equal",
+    "not_equal",
+    "above",
+    "below",
+    "above_equal",
+    "below_equal",
+)
 
 # Trigger types
 TRG_STATE = "state"

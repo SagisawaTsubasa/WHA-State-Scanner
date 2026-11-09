@@ -31,14 +31,25 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ABORT,
+    CONF_CAPTURE,
+    CONF_CLEAR,
     CONF_HOURS,
     CONF_INITIAL,
+    CONF_INPUT_A,
+    CONF_INPUT_B,
+    CONF_OP,
     CONF_RESET_CONDITIONS,
     CONF_SECONDS,
     CONF_SET_CONDITIONS,
     CONF_START,
+    CONF_VALUE,
+    CONF_VALUE_TYPE,
     CONF_WEEKDAYS,
+    COMPARE_OPS,
+    COND_COMPARE,
     COND_FLAG,
+    COND_LITERAL,
+    COND_SNAPSHOT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +72,10 @@ _CALENDAR_WAKE_MARGIN = timedelta(minutes=15)
 _EVAL_FAILURE_WARN_INTERVAL = timedelta(minutes=10)
 
 _WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+# Sentinel for a capture that must not land (source entity unreadable) —
+# distinct from any legal snapshot value (float | str).
+_CAPTURE_FAILED = object()
 
 
 class ConditionEngine:
@@ -87,6 +102,7 @@ class ConditionEngine:
         conditions: list[dict] | None,
         manager: Any = None,
         flag_states: dict[str, bool] | None = None,
+        snapshot_values: dict[str, Any] | None = None,
     ) -> None:
         """Initialize."""
         self.hass = hass
@@ -96,6 +112,16 @@ class ConditionEngine:
         # Latched flag verdicts, seeded from the hub's persisted states so a
         # latch survives entry reloads and HA restarts (0.9.0).
         self._flag_states: dict[str, bool] = dict(flag_states or {})
+        # Latched snapshot values (0.13.0), same persistence story: seeded
+        # from the hub store, written back on capture/clear. Value type IS
+        # the snapshot kind — float = numeric snapshot, str = state snapshot
+        # (auto-typed at capture time, see _capture_value).
+        self._snapshot_values: dict[str, Any] = dict(snapshot_values or {})
+        # Previous-cycle capture-gate verdicts (edge detection). Memory-only
+        # on purpose: after a restart the first true cycle fires one capture
+        # — idempotent (it snapshots the CURRENT value), noted in step_flags'
+        # sibling step_snapshots.
+        self._snapshot_prev: dict[str, bool] = {}
         self._conditions: dict[str, dict] = {}
         for cond in conditions or []:
             if not isinstance(cond, dict):
@@ -250,6 +276,88 @@ class ConditionEngine:
                 flipped.append(cid)
         return flipped
 
+    def snapshots(self) -> dict[str, Any]:
+        """Current latched snapshot values (for hub persistence)."""
+        return dict(self._snapshot_values)
+
+    async def step_snapshots(self) -> dict[str, dict]:
+        """Advance every snapshot's capture/clear gate once; returns events.
+
+        Stepping order mirrors step_flags (the flag step runs FIRST, then
+        this one, once per evaluation cycle): clear is level-triggered and
+        wins over capture (safe side, same reset-wins rule as flags);
+        capture fires on the capture gate's RISING edge only (previous
+        cycle False ∧ now True) — the source entity's later changes never
+        refresh the snapshot until the gate drops and rises again. The
+        previous-gate verdicts are memory-only: a restart zeroes them, so
+        the first true cycle after a restart captures once more —
+        idempotent (it snapshots the CURRENT value), by design.
+
+        shortcut: a snapshot's capture/clear referencing ANOTHER snapshot
+        reads that node's verdict in CONFIG order within this single loop
+        (earlier-listed nodes step first); referencing a flag is always
+        safe (flags stepped before snapshots). Schema-level cascade check
+        deferred — register in the ledger, revisit when a real config hits
+        it.
+
+        Returns {snapshot_id: {"event": "capture"|"clear", ...value}} for
+        the nodes whose memory changed this cycle (drives target widening,
+        persistence and the decision-log event lines).
+        """
+        events: dict[str, dict] = {}
+        for cid, cond in self._conditions.items():
+            if not isinstance(cond, dict) or cond.get("type") != COND_SNAPSHOT:
+                continue
+            if cond.get("enabled") is False:
+                continue  # frozen: no capture, no clear (mirrors flags)
+            gate_now = False
+            for member in cond.get(CONF_CAPTURE) or []:
+                if await self._evaluate_id(member, set()):
+                    gate_now = True
+            edge = gate_now and not self._snapshot_prev.get(cid, False)
+            self._snapshot_prev[cid] = gate_now
+            clear_met = False
+            for member in cond.get(CONF_CLEAR) or []:
+                if await self._evaluate_id(member, set()):
+                    clear_met = True
+            had = cid in self._snapshot_values
+            if clear_met:
+                self._snapshot_values.pop(cid, None)
+                if had:
+                    events[cid] = {"event": "clear"}
+            elif edge:
+                value = self._capture_value(cond, cid)
+                if value is not _CAPTURE_FAILED:
+                    self._snapshot_values[cid] = value
+                    events[cid] = {"event": "capture", "value": value}
+        return events
+
+    def _capture_value(self, cond: dict, cid: str) -> Any:
+        """Snapshot the source entity's current reading, auto-typed.
+
+        The verdict follows the source entity's own typing: a reading that
+        parses as a number (``float()``) becomes a NUMERIC snapshot —
+        sensors advertise ``unit_of_measurement``/``state_class`` precisely
+        to mark numeric readings, so the attribute hint and the parse
+        fallback converge on the same rule; anything else is stored as the
+        state string verbatim. An unreadable source (missing entity,
+        unknown/unavailable) captures NOTHING — a snapshot that exists but
+        carries "unavailable" would make the node's verdict (snapshot
+        exists) lie.
+        """
+        state = self.hass.states.get(cond.get(CONF_ENTITY_ID))
+        raw = getattr(state, "state", None)
+        if raw is None or raw in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            self._warn_eval_failure(
+                cid, "snapshot capture (source unreadable)",
+                cond.get(CONF_ENTITY_ID),
+            )
+            return _CAPTURE_FAILED
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return raw
+
     def _static_verdict(
         self,
         cid: str | None,
@@ -359,6 +467,8 @@ class ConditionEngine:
             )
         if ctype == COND_FLAG:
             return None  # latched read — not statically decidable
+        if ctype == COND_LITERAL:
+            return True  # constant node: always satisfied (engine mirror)
         if ctype == "duration":
             start_v = self._static_verdict(
                 cond.get(CONF_START), visited, dead_groups,
@@ -792,10 +902,143 @@ class ConditionEngine:
             err,
         )
 
+    def _evaluate_compare(self, cond: dict, path: str) -> bool:
+        """Two-input verdict: both ends numeric → numeric comparison, both
+        ends state strings → string equality; anything else (mixed kinds,
+        or an above/below-family op on non-numeric ends) evaluates False
+        with a rate-limited WARN — never a silent string-coercion fallback
+        (broken config semantics must stay visible)."""
+        cid = cond.get("id") or path
+        op = cond.get(CONF_OP)
+        if op not in COMPARE_OPS:
+            self._warn_eval_failure(cid, "compare op", op)
+            return False
+        side_a = self._compare_input(cond.get(CONF_INPUT_A), cid, "a")
+        side_b = self._compare_input(cond.get(CONF_INPUT_B), cid, "b")
+        if side_a is None or side_b is None:
+            return False  # input end unreadable (warned per cause)
+        (a_val, a_num), (b_val, b_num) = side_a, side_b
+        if a_num and b_num:
+            if op == "equal":
+                return a_val == b_val
+            if op == "not_equal":
+                return a_val != b_val
+            if op == "above":
+                return a_val > b_val
+            if op == "below":
+                return a_val < b_val
+            if op == "above_equal":
+                return a_val >= b_val
+            return a_val <= b_val  # below_equal (whitelist closed above)
+        if op not in ("equal", "not_equal") or a_num != b_num:
+            # above-family on string ends, or one numeric end against one
+            # state end — semantics broken, visible False beats a guess
+            self._warn_eval_failure(
+                cid, "compare type mismatch", f"{op}: {a_val!r} vs {b_val!r}"
+            )
+            return False
+        return (a_val == b_val) if op == "equal" else (a_val != b_val)
+
+    def _compare_input(
+        self, side: Any, cid: str, which: str
+    ) -> tuple[Any, bool] | None:
+        """Resolve one compare input end to ``(value, is_numeric)``.
+
+        Returns None — after a rate-limited WARN naming the cause — when
+        the end cannot be read: unavailable/missing entity, missing
+        attribute, absent snapshot, missing/malformed literal. An entity
+        end (state or attribute) is numeric exactly when the raw reading
+        parses as a number; a snapshot end is numeric exactly when the
+        captured value is a float (auto-typed at capture time)."""
+        if not isinstance(side, dict):
+            self._warn_eval_failure(cid, f"compare input {which}", side)
+            return None
+        kind = side.get("kind")
+        if kind == "entity":
+            state = self.hass.states.get(side.get(CONF_ENTITY_ID))
+            if not state or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                self._warn_eval_failure(
+                    cid,
+                    f"compare input {which} (entity unreadable)",
+                    side.get(CONF_ENTITY_ID),
+                )
+                return None
+            if side.get("attribute"):
+                raw = (state.attributes or {}).get(side["attribute"])
+                if raw is None:
+                    self._warn_eval_failure(
+                        cid,
+                        f"compare input {which} (attribute missing)",
+                        side["attribute"],
+                    )
+                    return None
+            else:
+                raw = state.state
+        elif kind == COND_SNAPSHOT:
+            raw = self._snapshot_values.get(side.get("cond"))
+            if raw is None:
+                self._warn_eval_failure(
+                    cid,
+                    f"compare input {which} (snapshot absent)",
+                    side.get("cond"),
+                )
+                return None
+        elif kind == COND_LITERAL:
+            lcond = self._conditions.get(side.get("cond"))
+            value = lcond.get(CONF_VALUE) if isinstance(lcond, dict) else None
+            if (
+                not isinstance(lcond, dict)
+                or lcond.get("type") != COND_LITERAL
+                or (
+                    lcond.get(CONF_VALUE_TYPE) == "number"
+                    and (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                    )
+                )
+            ):
+                self._warn_eval_failure(
+                    cid,
+                    f"compare input {which} (literal unreadable)",
+                    side.get("cond"),
+                )
+                return None
+            if lcond[CONF_VALUE_TYPE] == "number":
+                return float(value), True
+            return value, False
+        else:
+            self._warn_eval_failure(cid, f"compare input {which} (kind)", kind)
+            return None
+        # entity/snapshot end: numeric exactly when the reading parses as
+        # one (bool excluded — True is not the number 1 here)
+        if isinstance(raw, bool):
+            return raw, False
+        if isinstance(raw, (int, float)):
+            return float(raw), True
+        try:
+            return float(raw), True
+        except (TypeError, ValueError):
+            return raw, False
+
     async def _evaluate_leaf(
         self, cond: dict, ctype: str, path: str, out_id: str | None = None
     ) -> bool:
         """Evaluate a leaf condition without FOR handling."""
+        if ctype == COND_SNAPSHOT:
+            # Verdict = the snapshot EXISTS (no snapshot → always False).
+            # The value itself is read by compare inputs, never here; the
+            # source entity is only read at capture time (step_snapshots).
+            return cond.get("id") in self._snapshot_values
+
+        if ctype == COND_LITERAL:
+            # Constant node: the value is always there, so the node is
+            # always satisfied — no special case needed anywhere (groups
+            # and output chains treat it like any true leaf).
+            return True
+
+        if ctype == COND_COMPARE:
+            return self._evaluate_compare(cond, path)
+
         if ctype == "numeric_state":
             eid = cond.get(CONF_ENTITY_ID)
             state = self.hass.states.get(eid)

@@ -35,7 +35,11 @@ from homeassistant.util import dt as dt_util
 from .condition_engine import ConditionEngine
 from .const import (
     CONF_ABORT,
+    CONF_CAPTURE,
+    CONF_CLEAR,
     CONF_CONDITIONS,
+    CONF_INPUT_A,
+    CONF_INPUT_B,
     CONF_LOGGING,
     CONF_OUTPUTS,
     CONF_RESET_CONDITIONS,
@@ -97,7 +101,15 @@ class ControllerManager:
                     continue
                 saved_last_flip[out_id] = parsed
         self.engine = ConditionEngine(
-            hass, self.conditions, manager=self, flag_states=saved_flags
+            hass,
+            self.conditions,
+            manager=self,
+            flag_states=saved_flags,
+            # snapshot latches ride the same hub store (0.13.0): seeded
+            # here, written back on capture/clear (_persist_snapshots)
+            snapshot_values=(
+                hub.snapshot_states.get(controller_id, {}) if hub is not None else {}
+            ),
         )
         # trigger-logic groups: groups named by any trigger's signal coverage.
         # Coverage is topological (0.7.3 F-151 resolution, superseding the
@@ -320,10 +332,21 @@ class ControllerManager:
                     stack.append(cond[CONF_START])
                 if cond.get(CONF_ABORT):
                     stack.append(cond[CONF_ABORT])
-                for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+                for key in (
+                    CONF_SET_CONDITIONS,
+                    CONF_RESET_CONDITIONS,
+                    CONF_CAPTURE,
+                    CONF_CLEAR,
+                ):
                     for member in cond.get(key) or []:
                         if isinstance(member, str):
                             stack.append(member)
+                # compare reads its a/b ends (snapshot/literal node values)
+                # during evaluation, so those nodes belong to the chain too
+                for side_key in (CONF_INPUT_A, CONF_INPUT_B):
+                    side = cond.get(side_key)
+                    if isinstance(side, dict) and isinstance(side.get("cond"), str):
+                        stack.append(side["cond"])
 
         for out in self.outputs:
             if not isinstance(out, dict) or not out.get("entity_id"):
@@ -518,6 +541,14 @@ class ControllerManager:
             if targets is not None:
                 for fid in flipped:
                     targets |= self._cond_to_outs.get(fid) or set()
+        snap_events = await self.engine.step_snapshots()
+        if snap_events:
+            await self._persist_snapshots()
+            # same widening story as flag flips: a capture/clear flips the
+            # snapshot node's verdict and every compare chain reading it
+            if targets is not None:
+                for sid in snap_events:
+                    targets |= self._cond_to_outs.get(sid) or set()
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -540,8 +571,10 @@ class ControllerManager:
             record["triggered_by"] = source_desc
             records.append(record)
 
-        if self.logging_enabled and records:
-            await self.logger.log_cycle(records)
+        if self.logging_enabled:
+            snap_records = self._snapshot_log_records(snap_events, source_desc)
+            if records or snap_records:
+                await self.logger.log_cycle(records + snap_records)
 
     async def _persist_flag_states(self) -> None:
         """Persist flag verdicts via the hub (survives reloads/restarts)."""
@@ -565,6 +598,64 @@ class ControllerManager:
             _LOGGER.exception(
                 "Failed persisting flag states for %s", self.controller_id
             )
+
+    async def _persist_snapshots(self) -> None:
+        """Persist snapshot latches via the hub (survives reloads/restarts).
+
+        Same teardown guard and failure contract as _persist_flag_states:
+        a dead manager must not write back into the hub store, and a failed
+        save never breaks the evaluation cycle — the in-memory values stay
+        authoritative and the next capture/clear retries the write."""
+        if self._stopped:
+            return
+        hub = self.hass.data.get(DOMAIN)
+        if hub is None:
+            return
+        try:
+            await hub.async_save_snapshots(
+                self.controller_id, self.engine.snapshots()
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Failed persisting snapshot states for %s", self.controller_id
+            )
+
+    def _snapshot_log_records(
+        self, snap_events: dict[str, dict], source_desc: str
+    ) -> list[dict]:
+        """Decision-log event lines for captures/clears (0.13.0): the value
+        rides both the readable ``triggered_by`` summary (「拍下 25.3」/「清空
+        快照」— the panel's existing log table renders it in the source
+        column with zero renderer changes) and the raw ``value`` key."""
+        records: list[dict] = []
+        for sid, ev in snap_events.items():
+            cond = next(
+                (
+                    c
+                    for c in self.conditions
+                    if isinstance(c, dict) and c.get("id") == sid
+                ),
+                None,
+            )
+            label = (cond or {}).get("label") or sid
+            if ev["event"] == "capture":
+                records.append(
+                    {
+                        "output": label,
+                        "decision": "capture",
+                        "value": ev.get("value"),
+                        "triggered_by": f"拍下 {ev.get('value')}",
+                    }
+                )
+            else:
+                records.append(
+                    {
+                        "output": label,
+                        "decision": "clear",
+                        "triggered_by": "清空快照",
+                    }
+                )
+        return records
 
     async def _persist_last_flip(self, out_id: str) -> None:
         """Persist one applied flip via the hub (cooldown history, F-322).
@@ -705,6 +796,9 @@ class ControllerManager:
         flipped = await self.engine.step_flags()
         if flipped:
             await self._persist_flag_states()
+        snap_events = await self.engine.step_snapshots()
+        if snap_events:
+            await self._persist_snapshots()
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
         records: list[dict] = []
@@ -727,8 +821,12 @@ class ControllerManager:
             for key in ("on_conditions", "off_conditions"):
                 conditions.update((details or {}).get(key) or {})
 
-        if self.logging_enabled and records:
-            await self.logger.log_cycle(records)
+        if self.logging_enabled:
+            snap_records = self._snapshot_log_records(
+                snap_events, "manual-evaluate"
+            )
+            if records or snap_records:
+                await self.logger.log_cycle(records + snap_records)
 
         self._rearm_for_wakeup()
         return {"outputs": outputs, "conditions": conditions}
@@ -755,6 +853,13 @@ class ControllerManager:
                 CONF_ABORT,
                 CONF_SET_CONDITIONS,
                 CONF_RESET_CONDITIONS,
+                # snapshot capture/clear members and compare a/b cond
+                # references join the walk (a/b are dicts — the loop below
+                # takes their "cond" key)
+                CONF_CAPTURE,
+                CONF_CLEAR,
+                CONF_INPUT_A,
+                CONF_INPUT_B,
             )
             by_id = {
                 c["id"]: c
@@ -776,6 +881,8 @@ class ControllerManager:
                         stack.extend(val)
                     elif isinstance(val, str):
                         stack.append(val)
+                    elif isinstance(val, dict) and isinstance(val.get("cond"), str):
+                        stack.append(val["cond"])
             # cooldown needs the evaluating output's context; evaluate each
             # condition once per output whose chain contains it and keep the
             # best verdict (any output seeing it satisfied → satisfied)
@@ -823,6 +930,9 @@ class ControllerManager:
             flipped = await self.engine.step_flags()
             if flipped:
                 await self._persist_flag_states()
+            snap_events = await self.engine.step_snapshots()
+            if snap_events:
+                await self._persist_snapshots()
             try:
                 record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:
@@ -830,6 +940,12 @@ class ControllerManager:
                     "Error evaluating output '%s'", out_cfg.get("name", out_id)
                 )
                 return
-            if record and self.logging_enabled:
-                await self.logger.log_cycle([record])
+            if self.logging_enabled:
+                snap_records = self._snapshot_log_records(
+                    snap_events, "service-evaluate"
+                )
+                if record or snap_records:
+                    await self.logger.log_cycle(
+                        ([record] if record else []) + snap_records
+                    )
             self._rearm_for_wakeup()
