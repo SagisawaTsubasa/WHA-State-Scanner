@@ -177,6 +177,40 @@ const LANG = {
     invalidStoredLead: "存储中的配置无法载入：",
     invalidStoredTail: "请删除后重新创建控制器。",
     triggerErrorBadge: "触发器错误",
+    condSnapshot: "快照",
+    condLiteral: "常量",
+    condCompare: "求值",
+    snapshotHint: "快照=记忆这一刻：拍下条件的门由假变真那拍，拍下源实体当时的值（之后源变化不刷新，再拍需门先掉再升）；清空条件任一满足即清（清空优先）。快照节点真值=「快照存在」；纯读源实体，绝不写。",
+    snapshotEntity: "源实体",
+    wiredCapture: "拍下（由连线决定）",
+    wiredClear: "清空（可选，由连线决定）",
+    summarySnapshotIdle: "未配置拍下/清空",
+    summaryCapPrefix: "拍×",
+    summaryClearPrefix: "清×",
+    literalHint: "常量=恒真节点：给求值的 A/B 端提供比较基准（数字或状态），可被多个求值复用。",
+    literalValueType: "值类型",
+    literalTypeNumber: "数字",
+    literalTypeState: "状态",
+    literalValue: "值",
+    compareHint: "双输入单输出：A/B 未连线时按实体当前值（状态或属性）求值；从快照/常量节点拉线到 A/B 口则以连线为准。两端同数值型→数值比较；同状态型→字符串比较；above 族遇非数值端或两端混型→判定为假并在日志告警。",
+    compareOpLabel: "运算",
+    opEqual: "等于 =",
+    opNotEqual: "不等于 ≠",
+    opAbove: "大于 >",
+    opBelow: "小于 <",
+    opAboveEqual: "大于等于 ≥",
+    opBelowEqual: "小于等于 ≤",
+    inputA: "输入 A",
+    inputB: "输入 B",
+    compareAttribute: "attribute（可选）",
+    compareUnwiredEntity: "未连线：按实体当前值求值",
+    compareWired: "已连线",
+    portCapture: "拍下",
+    portClear: "清空",
+    portA: "A",
+    portB: "B",
+    compareBadWire: "连线被拒：求值的 A/B 口只接受快照或常量节点（实体端在表单填）；A/B 各只接一根线。",
+    snapshotNoSignal: "连线被拒：快照/求值/常量没有信号口；触发器信号线请连到具体条件或逻辑组。",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -333,6 +367,40 @@ const LANG = {
     invalidStoredLead: "Stored config failed to load: ",
     invalidStoredTail: "Delete and recreate the controller.",
     triggerErrorBadge: "Trigger errors",
+    condSnapshot: "Snapshot",
+    condLiteral: "Literal",
+    condCompare: "Compare",
+    snapshotHint: "A snapshot remembers one moment: when the capture gate rises (false→true) it takes the source entity's reading (later source changes never refresh it — the gate must drop and rise again); any clear condition wipes it (clear wins). The node's verdict is \"a snapshot exists\"; it only ever READS the source entity.",
+    snapshotEntity: "Source entity",
+    wiredCapture: "Capture (wired)",
+    wiredClear: "Clear (optional, wired)",
+    summarySnapshotIdle: "no capture/clear wired",
+    summaryCapPrefix: "cap×",
+    summaryClearPrefix: "clr×",
+    literalHint: "A literal is an always-true node: it feeds compare A/B ends a constant baseline (number or state) and may be reused by several compares.",
+    literalValueType: "Value type",
+    literalTypeNumber: "Number",
+    literalTypeState: "State",
+    literalValue: "Value",
+    compareHint: "Two inputs, one verdict: unwired A/B ends read the entity's current value (state or attribute); wires from snapshot/literal nodes override the form. Both numeric → numeric compare; both state strings → string compare; above-family ops on non-numeric ends or mixed kinds → verdict False plus a log warning.",
+    compareOpLabel: "Operator",
+    opEqual: "equal =",
+    opNotEqual: "not equal ≠",
+    opAbove: "above >",
+    opBelow: "below <",
+    opAboveEqual: "at least ≥",
+    opBelowEqual: "at most ≤",
+    inputA: "Input A",
+    inputB: "Input B",
+    compareAttribute: "attribute (optional)",
+    compareUnwiredEntity: "unwired: reads the entity's current value",
+    compareWired: "wired",
+    portCapture: "capture",
+    portClear: "clear",
+    portA: "A",
+    portB: "B",
+    compareBadWire: "Wire rejected: compare A/B ports take snapshot or literal nodes only (the entity end is a form field); one wire per port.",
+    snapshotNoSignal: "Wire rejected: snapshot/compare/literal have no signal port; route trigger signal wires to a concrete condition or logic group.",
   },
 };
 
@@ -362,6 +430,9 @@ const TYPE_LABEL_KEY = {
   duration: "condDuration",
   debounce: "condDebounce",
   flag: "condFlag",
+  snapshot: "condSnapshot",
+  literal: "condLiteral",
+  compare: "condCompare",
   and: "condAnd",
   or: "condOr",
   not: "condNot",
@@ -378,6 +449,9 @@ const TYPE_ICON = {
   duration: "⏳",
   debounce: "🕯",
   flag: "🚩",
+  snapshot: "📷",
+  literal: "#",
+  compare: "⚖",
   and: "⊕",
   or: "⊗",
   not: "¬",
@@ -431,6 +505,24 @@ function conditionSummary(cond, tr) {
       if (s) parts.push(`set×${s}`);
       if (r) parts.push(`reset×${r}`);
       text = `🚩 ${parts.join(" / ") || trk("summaryFlagIdle")}`;
+      break;
+    }
+    case "snapshot": {
+      const c = (cond.capture || []).length;
+      const l = (cond.clear || []).length;
+      const parts = [];
+      if (c) parts.push(`${trk("summaryCapPrefix")}${c}`);
+      if (l) parts.push(`${trk("summaryClearPrefix")}${l}`);
+      text = `${cond.entity_id || "?"}｜${parts.join(" / ") || trk("summarySnapshotIdle")}`;
+      break;
+    }
+    case "literal":
+      text = `${cond.value_type === "number" ? "#" : '"'}${cond.value ?? "?"}`;
+      break;
+    case "compare": {
+      const sideTxt = (side) =>
+        !side ? "?" : side.kind === "entity" ? side.entity_id || "?" : `${side.kind}:${side.cond ? side.cond.slice(5, 11) : "?"}`;
+      text = `${sideTxt(cond.a)} ${cond.op || "?"} ${sideTxt(cond.b)}`;
       break;
     }
     default:
@@ -964,7 +1056,7 @@ class ScannerPanel extends HTMLElement {
               .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag", "snapshot", "literal", "compare"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("logicGroups"))}</h3>
@@ -1271,6 +1363,9 @@ class ScannerPanel extends HTMLElement {
     output: { input_1: "portOn", input_2: "portOff" },
     duration: { input_1: "portStart", input_2: "portAbort", output_1: "portOut" },
     flag: { input_1: "portSet", input_2: "portReset", output_1: "portOut" },
+    snapshot: { input_1: "portCapture", input_2: "portClear", output_1: "portOut" },
+    compare: { input_1: "portA", input_2: "portB", output_1: "portOut" },
+    literal: { output_1: "portOut" },
     group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
     leaf: { input_3: "portSignal", output_1: "portOut" },
   };
@@ -1365,7 +1460,20 @@ class ScannerPanel extends HTMLElement {
     const condId = ed?.nodeToCond?.get(Number(e.input_id));
     if (!condId) return null;
     const cond = ed.controller.conditions.find((c) => c.id === condId);
-    if (!cond || !isGroupType(cond.type)) return null;
+    if (!cond) return null;
+    if (
+      ed.nodeToTrg.has(Number(e.output_id)) &&
+      (cond.type === "snapshot" || cond.type === "compare" || cond.type === "literal")
+    ) {
+      // signal wire onto a data node (0.13.0): no signal port exists
+      return this.tr("snapshotNoSignal");
+    }
+    if (cond.type === "compare") {
+      // wrong source kind (not a snapshot/literal) or a second wire on a
+      // single-value A/B port — both land in the same explanation
+      return this.tr("compareBadWire");
+    }
+    if (!isGroupType(cond.type)) return null;
     // Judge the group's PRE-EXISTING wiring from the live drawflow data,
     // excluding the attempted wire itself — immune to vendor rollback
     // timing (WHA-F-144/148)
@@ -1735,6 +1843,14 @@ class ScannerPanel extends HTMLElement {
           if (c.conditions) c.conditions = c.conditions.filter((m) => m !== condId);
           if (c.start === condId) delete c.start;
           if (c.abort === condId) delete c.abort;
+          // 0.13.0 data-node references cascade the same way (flag
+          // set/reset keep the legacy dangling-reference face — the schema
+          // rejects the save visibly, unchanged behavior)
+          if (c.capture) c.capture = c.capture.filter((m) => m !== condId);
+          if (c.clear) c.clear = c.clear.filter((m) => m !== condId);
+          for (const k of ["a", "b"]) {
+            if (c[k] && c[k].cond === condId) c[k] = { kind: "entity", entity_id: "" };
+          }
         }
         for (const o of ed.controller.outputs) {
           o.on_conditions = o.on_conditions.filter((m) => m !== condId);
@@ -1799,6 +1915,27 @@ class ScannerPanel extends HTMLElement {
         }
       }
     }
+    for (const cond of conds) {
+      if (cond.type !== "snapshot") continue;
+      const sid = ed.condToNode.get(cond.id);
+      for (const [key, port] of [["capture", "input_1"], ["clear", "input_2"]]) {
+        for (const m of cond[key] || []) {
+          const mid = ed.condToNode.get(m);
+          if (mid && sid) df.addConnection(String(mid), String(sid), "output_1", port);
+        }
+      }
+    }
+    for (const cond of conds) {
+      if (cond.type !== "compare") continue;
+      const did = ed.condToNode.get(cond.id);
+      for (const [key, port] of [["a", "input_1"], ["b", "input_2"]]) {
+        const side = cond[key];
+        if (side && (side.kind === "snapshot" || side.kind === "literal")) {
+          const mid = ed.condToNode.get(side.cond);
+          if (mid && did) df.addConnection(String(mid), String(did), "output_1", port);
+        }
+      }
+    }
     for (const out of ed.controller.outputs) {
       const oid = ed.outToNode.get(out.entity_id);
       if (!oid) continue;
@@ -1822,7 +1959,10 @@ class ScannerPanel extends HTMLElement {
         const dst = ed.condToNode.get(cid);
         if (dst === undefined) continue;
         const dstCond = ed.controller.conditions.find((c) => c.id === cid);
-        if (dstCond?.type === "duration" || dstCond?.type === "flag") continue; // neither has input_3
+        if (
+          dstCond?.type === "duration" || dstCond?.type === "flag" ||
+          dstCond?.type === "snapshot" || dstCond?.type === "compare" || dstCond?.type === "literal"
+        ) continue; // none of these carry input_3
         df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
       }
     }
@@ -1891,6 +2031,48 @@ class ScannerPanel extends HTMLElement {
         if (fbody) fbody.textContent = conditionSummary(cond, (k) => this.tr(k));
         continue;
       }
+      if (cond.type === "snapshot") {
+        const nid = ed.condToNode.get(cond.id);
+        if (nid === undefined) continue;
+        const inputs = data[String(nid)]?.inputs || {};
+        cond.capture = (inputs.input_1?.connections || [])
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean);
+        cond.clear = (inputs.input_2?.connections || [])
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean);
+        const sbody = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
+        if (sbody) sbody.textContent = conditionSummary(cond, (k) => this.tr(k));
+        continue;
+      }
+      if (cond.type === "compare") {
+        // a/b live-sync: a wire overrides the form's entity fields; losing
+        // the wire falls back to the entity end (whose entity_id/attribute
+        // are kept in the model — _exportGraph re-merges both sources)
+        const nid = ed.condToNode.get(cond.id);
+        if (nid === undefined) continue;
+        const inputs = data[String(nid)]?.inputs || {};
+        for (const [key, port] of [["a", "input_1"], ["b", "input_2"]]) {
+          const ref = (inputs[port]?.connections || [])
+            .map((c) => ed.nodeToCond.get(Number(c.node)))
+            .find(Boolean);
+          if (ref) {
+            const srcCond = ed.controller.conditions.find((c) => c.id === ref);
+            if (srcCond && (srcCond.type === "snapshot" || srcCond.type === "literal")) {
+              cond[key] = { kind: srcCond.type, cond: ref };
+              continue;
+            }
+          }
+          cond[key] = {
+            kind: "entity",
+            entity_id: cond[key]?.entity_id || "",
+            ...(cond[key]?.attribute ? { attribute: cond[key].attribute } : {}),
+          };
+        }
+        const cbody = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
+        if (cbody) cbody.textContent = conditionSummary(cond, (k) => this.tr(k));
+        continue;
+      }
       if (!isGroupType(cond.type)) continue;
       const nid = ed.condToNode.get(cond.id);
       if (nid === undefined) continue;
@@ -1943,7 +2125,14 @@ class ScannerPanel extends HTMLElement {
         (c) => c.id === ed.nodeToCond.get(Number(e.input_id))
       );
       if (!dst) return false;
-      if (dst.type === "duration" || dst.type === "flag") return false;
+      if (
+        dst.type === "duration" || dst.type === "flag" ||
+        dst.type === "snapshot" || dst.type === "compare" || dst.type === "literal"
+      ) {
+        // 0.13.0: data nodes carry no signal port (literal has no inputs
+        // at all) — same rejection face as duration/flag
+        return false;
+      }
       if (isGroupType(dst.type)) {
         // dual mode (0.7.3): trigger wires make the group a trigger-logic
         // merger; symmetric exclusion hides the members port instead
@@ -1969,6 +2158,34 @@ class ScannerPanel extends HTMLElement {
         if (dst && dst.type === "flag") {
           // flag set/reset ports: multiple wires, each side evaluated as OR
           return e.input_class === "input_1" || e.input_class === "input_2";
+        }
+        if (dst && dst.type === "snapshot") {
+          // capture/clear ports: multiple wires, each side evaluated as OR
+          // (same face as flag set/reset)
+          return e.input_class === "input_1" || e.input_class === "input_2";
+        }
+        if (dst && dst.type === "compare") {
+          // A/B are single-value ports (like duration start/abort) and only
+          // accept snapshot/literal sources — the schema rejects anything
+          // else as an a/b target, so the canvas must not draw it
+          if (e.input_class !== "input_1" && e.input_class !== "input_2") {
+            return false;
+          }
+          const srcCond = ed.controller.conditions.find(
+            (c) => c.id === ed.nodeToCond.get(Number(e.output_id))
+          );
+          if (
+            !srcCond ||
+            (srcCond.type !== "snapshot" && srcCond.type !== "literal")
+          ) {
+            return false;
+          }
+          try {
+            const nd = ed.df.getNodeFromId(String(e.input_id));
+            return (nd?.inputs?.[e.input_class]?.connections || []).length <= 1;
+          } catch {
+            return true;
+          }
         }
         if (dst && dst.type === "duration") {
           // start/abort are single-value ports: a second wire into the same
@@ -2050,10 +2267,13 @@ class ScannerPanel extends HTMLElement {
     // Port model (0.7.3): groups carry BOTH the members port (input_1)
     // and the trigger signal port (input_3) — dual mode, symmetric mutual
     // exclusion, empty groups may take signals directly. Duration keeps
-    // start/abort only.
+    // start/abort only. 0.13.0: snapshot = capture/clear (no signal),
+    // compare = A/B (no signal, snapshot/literal sources only), literal
+    // has no inputs at all.
     const isGroup = isGroupType(cond.type);
     const isFlag = cond.type === "flag";
-    const inputs = cond.type === "duration" || isFlag ? 2 : 3;
+    const twoPort = cond.type === "duration" || isFlag || cond.type === "snapshot" || cond.type === "compare";
+    const inputs = cond.type === "literal" ? 0 : twoPort ? 2 : 3;
     const nodeId = ed.df.addNode(
       cond.type,
       inputs,
@@ -2066,7 +2286,14 @@ class ScannerPanel extends HTMLElement {
     );
     ed.nodeToCond.set(nodeId, cond.id);
     ed.condToNode.set(cond.id, nodeId);
-    const kind = cond.type === "duration" ? "duration" : isFlag ? "flag" : isGroupType(cond.type) ? "group" : "leaf";
+    const kind =
+      cond.type === "duration" ? "duration"
+      : isFlag ? "flag"
+      : cond.type === "snapshot" ? "snapshot"
+      : cond.type === "compare" ? "compare"
+      : cond.type === "literal" ? "literal"
+      : isGroupType(cond.type) ? "group"
+      : "leaf";
     this._labelNodePorts(nodeId, kind);
     return nodeId;
   }
@@ -2120,6 +2347,17 @@ class ScannerPanel extends HTMLElement {
       cond.set_conditions = [];
       cond.reset_conditions = [];
       cond.initial = false;
+    } else if (type === "snapshot") {
+      cond.entity_id = "";
+      cond.capture = [];
+      cond.clear = [];
+    } else if (type === "literal") {
+      cond.value_type = "number";
+      cond.value = 25;
+    } else if (type === "compare") {
+      cond.op = "above";
+      cond.a = { kind: "entity", entity_id: "" };
+      cond.b = { kind: "entity", entity_id: "" };
     } else {
       cond.conditions = [];
     }
@@ -2336,6 +2574,9 @@ class ScannerPanel extends HTMLElement {
       ${cond.type === "duration"
         ? `<p class="wha-sub">${esc(this.tr("wiredStart"))}：${cond.start ? "✓" : "—"}<br>${esc(this.tr("wiredAbort"))}：${cond.abort ? "✓" : "—"}</p>`
         : ""}
+      ${cond.type === "snapshot"
+        ? `<p class="wha-sub">${esc(this.tr("wiredCapture"))}：${(cond.capture || []).length}<br>${esc(this.tr("wiredClear"))}：${(cond.clear || []).length}</p>`
+        : ""}
       ${this._trialHtml()}`;
 
     box.querySelectorAll("[data-insk]").forEach((input) =>
@@ -2349,8 +2590,31 @@ class ScannerPanel extends HTMLElement {
         } else if (k === "state") {
           const parts = String(v).split(",").map((s) => s.trim()).filter(Boolean);
           v = parts.length > 1 ? parts : parts[0] || "on";
+        } else if (k === "value" && cond.value_type === "number") {
+          const n = Number(v);
+          if (!Number.isFinite(n)) return; // ignored; schema guards on save
+          v = n;
         }
         cond[k] = v;
+        if (k === "value_type") {
+          // retype the stored value with the switch and rebuild the form
+          // so the value input's type follows (number ↔ text)
+          cond.value = v === "number" ? Number(cond.value) || 0 : String(cond.value ?? "");
+          this._renderInspector();
+        }
+        ed.dirty = true;
+        this._refreshNodeBody(sel.nodeId);
+      })
+    );
+    box.querySelectorAll("[data-cmp]").forEach((input) =>
+      input.addEventListener("change", () => {
+        const [which, field] = input.dataset.cmp.split(":");
+        const side = cond[which] || {};
+        const v = input.value.trim();
+        const next = { ...side };
+        if (field === "attribute" && !v) delete next.attribute;
+        else next[field] = v;
+        cond[which] = next;
         ed.dirty = true;
         this._refreshNodeBody(sel.nodeId);
       })
@@ -2434,6 +2698,43 @@ class ScannerPanel extends HTMLElement {
         return `
           <p class="wha-sub">${esc(trk("flagHint"))}</p>
           <label class="field field-inline"><input type="checkbox" data-insk="initial" ${cond.initial ? "checked" : ""}> ${esc(trk("flagInitial"))}</label>`;
+      case "snapshot":
+        return `
+          <div class="field"><span>${esc(trk("snapshotEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick value="${esc(cond.entity_id || "")}"></div>
+          <p class="wha-sub">${esc(trk("snapshotHint"))}</p>`;
+      case "literal":
+        return `
+          <label class="field"><span>${esc(trk("literalValueType"))}</span>
+            <select class="wha-input" data-insk="value_type">
+              <option value="number" ${cond.value_type === "number" ? "selected" : ""}>${esc(trk("literalTypeNumber"))}</option>
+              <option value="state" ${cond.value_type === "state" ? "selected" : ""}>${esc(trk("literalTypeState"))}</option>
+            </select></label>
+          <label class="field"><span>${esc(trk("literalValue"))}</span><input class="wha-input" ${cond.value_type === "number" ? 'type="number" step="any"' : ""} data-insk="value" value="${esc(cond.value ?? "")}"></label>
+          <p class="wha-sub">${esc(trk("literalHint"))}</p>`;
+      case "compare": {
+        const sideHtml = (which, labelKey) => {
+          const side = cond[which] || {};
+          if (side.kind === "entity") {
+            return `
+          <div class="field"><span>${esc(trk(labelKey))}</span><input class="wha-input" list="wha-entities-insp" data-cmp="${which}:entity_id" data-epick value="${esc(side.entity_id || "")}"></div>
+          <div class="field"><span>${esc(trk("compareAttribute"))}</span><input class="wha-input" data-cmp="${which}:attribute" value="${esc(side.attribute || "")}"></div>
+          <p class="wha-sub">${esc(trk("compareUnwiredEntity"))}</p>`;
+          }
+          const target = (this._editor?.controller?.conditions || []).find((c) => c.id === side.cond);
+          const name = target ? target.label || target.id : side.cond || "?";
+          return `<p class="wha-sub">${esc(trk(labelKey))}：${esc(trk("compareWired"))} → ${esc(TYPE_ICON[target?.type] || "")} ${esc(name)}</p>`;
+        };
+        return `
+          ${sideHtml("a", "inputA")}
+          ${sideHtml("b", "inputB")}
+          <label class="field"><span>${esc(trk("compareOpLabel"))}</span>
+            <select class="wha-input" data-insk="op">
+              ${[["equal", "opEqual"], ["not_equal", "opNotEqual"], ["above", "opAbove"], ["below", "opBelow"], ["above_equal", "opAboveEqual"], ["below_equal", "opBelowEqual"]]
+                .map(([v, k]) => `<option value="${v}" ${cond.op === v ? "selected" : ""}>${esc(trk(k))}</option>`)
+                .join("")}
+            </select></label>
+          <p class="wha-sub">${esc(trk("compareHint"))}</p>`;
+      }
       default:
         return "";
     }
@@ -2470,6 +2771,20 @@ class ScannerPanel extends HTMLElement {
       const refs = nodeRefs(nodeId, inputClass);
       return refs.length ? refs[0] : null;
     };
+    const compareSide = (nodeId, inputClass, current) => {
+      // wire wins: a snapshot/literal source overrides the form's entity
+      // end; no wire → keep/normalize the entity shape
+      const ref = singleRef(nodeId, inputClass);
+      if (ref) {
+        const srcCond = ed.controller.conditions.find((c) => c.id === ref);
+        if (srcCond && (srcCond.type === "snapshot" || srcCond.type === "literal")) {
+          return { kind: srcCond.type, cond: ref };
+        }
+      }
+      const out = { kind: "entity", entity_id: (current && current.entity_id) || "" };
+      if (current && current.attribute) out.attribute = current.attribute;
+      return out;
+    };
     for (const cond of ed.controller.conditions) {
       const nid = ed.condToNode.get(cond.id);
       if (!nid) continue;
@@ -2483,6 +2798,12 @@ class ScannerPanel extends HTMLElement {
         const abort = singleRef(nid, "input_2");
         if (abort) cond.abort = abort;
         else cond.abort = null;
+      } else if (cond.type === "snapshot") {
+        cond.capture = nodeRefs(nid, "input_1");
+        cond.clear = nodeRefs(nid, "input_2");
+      } else if (cond.type === "compare") {
+        cond.a = compareSide(nid, "input_1", cond.a);
+        cond.b = compareSide(nid, "input_2", cond.b);
       }
     }
     for (const out of ed.controller.outputs) {
