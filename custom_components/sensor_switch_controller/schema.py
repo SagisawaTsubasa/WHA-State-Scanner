@@ -44,24 +44,33 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import (
     CALENDAR_HOURS_MAX,
+    COMPARE_OPS,
     COND_AND,
     COND_CALENDAR,
     COND_COOLDOWN,
+    COND_COMPARE,
     COND_DEBOUNCE,
     COND_DURATION,
     COND_FLAG,
+    COND_LITERAL,
     COND_NOT,
     COND_NUMERIC_STATE,
     COND_OR,
+    COND_SNAPSHOT,
     COND_STATE,
     COND_SUN,
     COND_TEMPLATE,
     COND_TIME,
     CONF_ABORT,
     CONF_AT,
+    CONF_CAPTURE,
+    CONF_CLEAR,
     CONF_EVERY_SECONDS,
     CONF_HOURS,
     CONF_INITIAL,
+    CONF_INPUT_A,
+    CONF_INPUT_B,
+    CONF_OP,
     CONF_OFFSET,
     CONF_RESET_CONDITIONS,
     CONF_ROUTES,
@@ -70,6 +79,8 @@ from .const import (
     CONF_SET_CONDITIONS,
     CONF_START,
     CONF_TRIGGERS,
+    CONF_VALUE,
+    CONF_VALUE_TYPE,
     CONF_WEEKDAYS,
     COOLDOWN_MAX,
     DEBOUNCE_MAX,
@@ -106,6 +117,9 @@ LEAF_TYPES = (
     COND_CALENDAR,
     COND_DURATION,
     COND_DEBOUNCE,
+    COND_SNAPSHOT,
+    COND_LITERAL,
+    COND_COMPARE,
 )
 GROUP_TYPES = (COND_AND, COND_OR, COND_NOT)
 OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR)
@@ -419,8 +433,22 @@ def _covered_condition_ids(conditions: list, outputs: list, out_ids: list[str]) 
             stack.append(cond["start"])
         if isinstance(cond.get("abort"), str):
             stack.append(cond["abort"])
-        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+        for key in (
+            CONF_SET_CONDITIONS,
+            CONF_RESET_CONDITIONS,
+            # snapshot capture/clear edges (0.13.0): same story as the flag
+            # edges — without them a snapshot-driven chain's capture/clear
+            # leaves drop out of the materialized coverage
+            CONF_CAPTURE,
+            CONF_CLEAR,
+        ):
             stack.extend(m for m in cond.get(key) or [] if isinstance(m, str))
+        # compare a/b cond references (0.13.0): the referenced snapshot/
+        # literal nodes belong to the chain the same way group members do
+        for key in (CONF_INPUT_A, CONF_INPUT_B):
+            side = cond.get(key)
+            if isinstance(side, dict) and isinstance(side.get("cond"), str):
+                stack.append(side["cond"])
     return seen
 
 
@@ -708,6 +736,57 @@ def _validate_condition(cond) -> dict:
             _fail("旗标条件的 initial 必须是布尔值")
         result[CONF_INITIAL] = initial
 
+    elif ctype == COND_SNAPSHOT:
+        # Memory node (0.13.0): capture = rising-edge of the capture gate
+        # (snapshot the source entity's reading once), clear = level (reset
+        # wins); the verdict is "a snapshot exists". Pure read of the source
+        # entity — the node never writes it.
+        result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "快照源实体")
+        for key in (CONF_CAPTURE, CONF_CLEAR):
+            members = cond.get(key) or []
+            if not isinstance(members, list) or not all(
+                isinstance(m, str) for m in members
+            ):
+                _fail(f"快照条件的 {key} 必须是条件 id 字符串列表")
+            if len(set(members)) != len(members):
+                _fail(f"快照条件的 {key} 成员不能重复")
+            result[key] = list(dict.fromkeys(members))
+        if not result[CONF_CAPTURE] and not result[CONF_CLEAR]:
+            _fail("快照条件必须提供 capture 或 clear")
+
+    elif ctype == COND_LITERAL:
+        # Constant node (0.13.0): value_type types the value (number | state)
+        # and the two must match — the engine trusts the typing verbatim.
+        vt = cond.get(CONF_VALUE_TYPE)
+        if vt not in ("number", "state"):
+            _fail("常量条件的 value_type 必须是 number 或 state")
+        value = cond.get(CONF_VALUE)
+        if vt == "number":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                _fail("常量条件的 value 必须是有限数字")
+            result[CONF_VALUE] = float(value)
+        else:
+            if not isinstance(value, str) or not value.strip():
+                _fail("常量条件的 value 必须是非空字符串")
+            result[CONF_VALUE] = value.strip()
+        result[CONF_VALUE_TYPE] = vt
+
+    elif ctype == COND_COMPARE:
+        # Two-input verdict node (0.13.0): each end is an entity reading
+        # (state or attribute), a snapshot node's latched value or a literal
+        # node's constant. Cross-node reference targets are checked against
+        # the whole graph in _check_graph.
+        for key in (CONF_INPUT_A, CONF_INPUT_B):
+            result[key] = _validate_compare_input(cond.get(key), key)
+        op = cond.get(CONF_OP)
+        if op not in COMPARE_OPS:
+            _fail(f"求值条件的 op 必须是 {'/'.join(COMPARE_OPS)}")
+        result[CONF_OP] = op
+
     else:  # and / or / not
         members = cond.get("conditions") or []
         # an EMPTY group is provisionally allowed here: trigger-logic mode
@@ -730,6 +809,31 @@ def _validate_condition(cond) -> dict:
             result["for"] = for_cfg
 
     return result
+
+
+def _validate_compare_input(side, which: str) -> dict:
+    """Validate and normalize one compare input end (a/b, 0.13.0).
+
+    Three shapes: ``{kind: entity, entity_id, attribute?}`` (the entity's
+    current state or attribute value), ``{kind: snapshot, cond}`` and
+    ``{kind: literal, cond}`` (a node reference — that the target node IS
+    of the referenced type is a whole-graph fact, checked in _check_graph)."""
+    if not isinstance(side, dict):
+        _fail(f"求值条件的 {which} 必须是对象")
+    kind = side.get("kind")
+    if kind == "entity":
+        eid = _validate_entity_id(side.get("entity_id"), f"求值条件 {which} 的实体")
+        out: dict = {"kind": "entity", "entity_id": eid}
+        attr = _optional_str(side.get("attribute"), f"求值条件 {which} 的 attribute")
+        if attr:
+            out["attribute"] = attr
+        return out
+    if kind in (COND_SNAPSHOT, COND_LITERAL):
+        ref = side.get("cond")
+        if not isinstance(ref, str) or not _COND_ID_RE.match(ref):
+            _fail(f"求值条件的 {which} 必须提供 cond（条件 id）")
+        return {"kind": kind, "cond": ref}
+    _fail(f"求值条件的 {which} kind 必须是 entity/snapshot/literal")
 
 
 def _validate_output(out) -> dict:
@@ -769,24 +873,37 @@ def _validate_output(out) -> dict:
 
 def _condition_neighbors(cond: dict, include_flag_edges: bool = True) -> list[str]:
     """Referenced condition ids of one condition (group members, duration
-    start/abort, flag set/reset) — the edge set for graph checks.
+    start/abort, flag set/reset, compare a/b cond refs, snapshot
+    capture/clear) — the edge set for graph checks.
 
-    Group members and duration start/abort are EVALUATION edges (the
-    engine recurses into them); flag set/reset are NOT — the flag step
-    only reads the latched verdict (engine ``COND_FLAG`` branch never
-    re-evaluates a flag's own inputs). Cycle detection and the flag
-    closure therefore pass ``include_flag_edges=False``: a flag edge can
+    Group members, duration start/abort and compare a/b cond references
+    are EVALUATION-path edges (the engine recurses into members/start/
+    abort; a compare reads its a/b node values during evaluation, so a
+    chain through them is a live dependency — the routing index walks the
+    same edges). Flag set/reset and snapshot capture/clear are STEP edges
+    (stepped once per cycle in their own pass, reading latched verdicts —
+    the engine never re-evaluates them inside a leaf): cycle detection and
+    the flag closure pass ``include_flag_edges=False`` so a step edge can
     neither close an evaluation cycle nor cascade (审查 R6-1). The
-    existence check keeps the default: a dangling set/reset reference
-    must still fail.
+    existence check keeps the default: a dangling set/reset/capture/clear
+    reference must still fail.
     """
     edges = list(cond.get("conditions") or [])
     for key in (CONF_START, CONF_ABORT):
         ref = cond.get(key)
         if isinstance(ref, str):
             edges.append(ref)
+    for key in (CONF_INPUT_A, CONF_INPUT_B):
+        side = cond.get(key)
+        if isinstance(side, dict) and isinstance(side.get("cond"), str):
+            edges.append(side["cond"])
     if include_flag_edges:
-        for key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+        for key in (
+            CONF_SET_CONDITIONS,
+            CONF_RESET_CONDITIONS,
+            CONF_CAPTURE,
+            CONF_CLEAR,
+        ):
             val = cond.get(key)
             if isinstance(val, list):
                 edges.extend(m for m in val if isinstance(m, str))
@@ -833,6 +950,8 @@ def _flag_branch_verdict(
             verdict = False  # no output context during the flag step
         elif ctype == COND_FLAG:
             verdict = None  # latched read; non-self callers already failed
+        elif ctype == COND_LITERAL:
+            verdict = True  # constant node — the engine mirror returns True
         elif ctype in GROUP_TYPES:
             members = cond.get("conditions") or []
             if not members:
@@ -952,8 +1071,20 @@ def _reachable_from_chains(
                 ref = cond.get(ref_key)
                 if isinstance(ref, str):
                     stack.append(ref)
+            # compare a/b cond references walk with the evaluation edges
+            # (0.13.0) — the routing index (_build_route_index) walks the
+            # same set, so the two cannot drift
+            for ref_key in (CONF_INPUT_A, CONF_INPUT_B):
+                side = cond.get(ref_key)
+                if isinstance(side, dict) and isinstance(side.get("cond"), str):
+                    stack.append(side["cond"])
             if include_flag_edges:
-                for flag_key in (CONF_SET_CONDITIONS, CONF_RESET_CONDITIONS):
+                for flag_key in (
+                    CONF_SET_CONDITIONS,
+                    CONF_RESET_CONDITIONS,
+                    CONF_CAPTURE,
+                    CONF_CLEAR,
+                ):
                     stack.extend(
                         m
                         for m in cond.get(flag_key) or []
@@ -1205,6 +1336,27 @@ def _check_graph(
                 label = cond.get("label") or cond["id"]
                 _fail(f"条件「{label}」引用了不存在的成员：{member}")
 
+    # Compare a/b node references (0.13.0): a snapshot end must point at a
+    # snapshot node and a literal end at a literal node — the engine reads
+    # the target by its own kind (a snapshot end reads the snapshot latch,
+    # a literal end reads the constant), so a mismatched target would be
+    # permanently unreadable (compare False + WARN every cycle).
+    for cond in conditions:
+        if cond["type"] != COND_COMPARE:
+            continue
+        label = cond.get("label") or cond["id"]
+        for key in (CONF_INPUT_A, CONF_INPUT_B):
+            side = cond[key]
+            if side["kind"] not in (COND_SNAPSHOT, COND_LITERAL):
+                continue
+            target = by_id[side["cond"]]
+            if target["type"] != side["kind"]:
+                _fail(
+                    f"求值条件「{label}」的 {key} 引用了 "
+                    f"{target['type']} 型节点：{side['kind']} 端只能引用"
+                    f"{side['kind']} 节点"
+                )
+
     for cond in conditions:
         if cond["type"] != COND_FLAG:
             continue
@@ -1320,7 +1472,9 @@ def _check_graph(
     # topological references (WHA-F-167/F-170): membership in another
     # group, an output chain, a duration start/abort, or a flag's
     # set/reset input (审查 R6-3 — same graph, same judgement) — all keep
-    # an empty group alive on the canvas
+    # an empty group alive on the canvas. Snapshot capture/clear inputs are
+    # the same kind of wire (0.13.0): an empty group wired into a capture
+    # gate stays a legal wiring anchor.
     member_referenced = {
         m
         for cond in conditions
@@ -1331,6 +1485,8 @@ def _check_graph(
             + ([cond.get("abort")] if cond.get("abort") else [])
             + list(cond.get(CONF_SET_CONDITIONS) or [])
             + list(cond.get(CONF_RESET_CONDITIONS) or [])
+            + list(cond.get(CONF_CAPTURE) or [])
+            + list(cond.get(CONF_CLEAR) or [])
         )
         if isinstance(m, str)
     }
