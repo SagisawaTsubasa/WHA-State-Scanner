@@ -106,9 +106,16 @@ class ControllerManager:
             manager=self,
             flag_states=saved_flags,
             # snapshot latches ride the same hub store (0.13.0): seeded
-            # here, written back on capture/clear (_persist_snapshots)
+            # here, written back on capture/clear (_persist_snapshots).
+            # The previous-cycle capture-gate verdicts ride along (R1-3):
+            # without them a rebuild (every panel save reloads the entry)
+            # would treat a still-high gate as a fresh rising edge and
+            # overwrite the latched value with the CURRENT reading.
             snapshot_values=(
                 hub.snapshot_states.get(controller_id, {}) if hub is not None else {}
+            ),
+            snapshot_gates=(
+                hub.snapshot_gates.get(controller_id, {}) if hub is not None else {}
             ),
         )
         # trigger-logic groups: groups named by any trigger's signal coverage.
@@ -549,6 +556,19 @@ class ControllerManager:
             if targets is not None:
                 for sid in snap_events:
                     targets |= self._cond_to_outs.get(sid) or set()
+            # R1-2: flags stepped BEFORE snapshots, so a flag whose
+            # set/reset gate reads a snapshot latched on the OLD verdict.
+            # Re-step the flags once — the level-latch step is idempotent
+            # (members are level-evaluated, timers only continue,
+            # _empty_branch_warned is deduped) — or a "capture → flag.set →
+            # output" chain would wait forever for a second cycle that
+            # never comes (capture gates carry no timer of their own).
+            reflipped = await self.engine.step_flags()
+            if reflipped:
+                await self._persist_flag_states()
+                if targets is not None:
+                    for fid in reflipped:
+                        targets |= self._cond_to_outs.get(fid) or set()
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -572,7 +592,7 @@ class ControllerManager:
             records.append(record)
 
         if self.logging_enabled:
-            snap_records = self._snapshot_log_records(snap_events, source_desc)
+            snap_records = self._snapshot_log_records(snap_events)
             if records or snap_records:
                 await self.logger.log_cycle(records + snap_records)
 
@@ -613,20 +633,20 @@ class ControllerManager:
             return
         try:
             await hub.async_save_snapshots(
-                self.controller_id, self.engine.snapshots()
+                self.controller_id,
+                self.engine.snapshots(),
+                self.engine.snapshot_gates(),
             )
         except Exception:
             _LOGGER.exception(
                 "Failed persisting snapshot states for %s", self.controller_id
             )
 
-    def _snapshot_log_records(
-        self, snap_events: dict[str, dict], source_desc: str
-    ) -> list[dict]:
-        """Decision-log event lines for captures/clears (0.13.0): the value
-        rides both the readable ``triggered_by`` summary (「拍下 25.3」/「清空
-        快照」— the panel's existing log table renders it in the source
-        column with zero renderer changes) and the raw ``value`` key."""
+    def _snapshot_log_records(self, snap_events: dict[str, dict]) -> list[dict]:
+        """Decision-log event lines for captures/clears (0.13.0). Purely
+        structural — the value rides the ``value`` key and the panel
+        localizes the display from ``decision`` (capture/clear); the record
+        itself carries no user-facing copy (R1-6, F-338 family)."""
         records: list[dict] = []
         for sid, ev in snap_events.items():
             cond = next(
@@ -640,21 +660,10 @@ class ControllerManager:
             label = (cond or {}).get("label") or sid
             if ev["event"] == "capture":
                 records.append(
-                    {
-                        "output": label,
-                        "decision": "capture",
-                        "value": ev.get("value"),
-                        "triggered_by": f"拍下 {ev.get('value')}",
-                    }
+                    {"output": label, "decision": "capture", "value": ev.get("value")}
                 )
             else:
-                records.append(
-                    {
-                        "output": label,
-                        "decision": "clear",
-                        "triggered_by": "清空快照",
-                    }
-                )
+                records.append({"output": label, "decision": "clear"})
         return records
 
     async def _persist_last_flip(self, out_id: str) -> None:
@@ -799,6 +808,10 @@ class ControllerManager:
         snap_events = await self.engine.step_snapshots()
         if snap_events:
             await self._persist_snapshots()
+            # R1-2: same-cycle flag convergence as _async_evaluate_locked
+            reflipped = await self.engine.step_flags()
+            if reflipped:
+                await self._persist_flag_states()
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
         records: list[dict] = []
@@ -822,9 +835,7 @@ class ControllerManager:
                 conditions.update((details or {}).get(key) or {})
 
         if self.logging_enabled:
-            snap_records = self._snapshot_log_records(
-                snap_events, "manual-evaluate"
-            )
+            snap_records = self._snapshot_log_records(snap_events)
             if records or snap_records:
                 await self.logger.log_cycle(records + snap_records)
 
@@ -933,6 +944,10 @@ class ControllerManager:
             snap_events = await self.engine.step_snapshots()
             if snap_events:
                 await self._persist_snapshots()
+                # R1-2: same-cycle flag convergence as _async_evaluate_locked
+                reflipped = await self.engine.step_flags()
+                if reflipped:
+                    await self._persist_flag_states()
             try:
                 record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:
@@ -941,9 +956,7 @@ class ControllerManager:
                 )
                 return
             if self.logging_enabled:
-                snap_records = self._snapshot_log_records(
-                    snap_events, "service-evaluate"
-                )
+                snap_records = self._snapshot_log_records(snap_events)
                 if record or snap_records:
                     await self.logger.log_cycle(
                         ([record] if record else []) + snap_records

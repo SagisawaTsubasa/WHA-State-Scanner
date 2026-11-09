@@ -211,6 +211,8 @@ const LANG = {
     portB: "B",
     compareBadWire: "连线被拒：求值的 A/B 口只接受快照或常量节点（实体端在表单填）；A/B 各只接一根线。",
     snapshotNoSignal: "连线被拒：快照/求值/常量没有信号口；触发器信号线请连到具体条件或逻辑组。",
+    logCapture: "拍下",
+    logClear: "清空快照",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -401,6 +403,8 @@ const LANG = {
     portB: "B",
     compareBadWire: "Wire rejected: compare A/B ports take snapshot or literal nodes only (the entity end is a form field); one wire per port.",
     snapshotNoSignal: "Wire rejected: snapshot/compare/literal have no signal port; route trigger signal wires to a concrete condition or logic group.",
+    logCapture: "captured",
+    logClear: "cleared",
   },
 };
 
@@ -3096,7 +3100,20 @@ class ScannerPanel extends HTMLElement {
     const logs = this._logs || { records: [], truncated: false };
     const rows = (logs.records || [])
       .map((r) => {
-        const cls = r.decision === "on" ? "on" : r.decision === "off" ? "off" : "hold";
+        const cls =
+          r.decision === "on" ? "on"
+          : r.decision === "off" ? "off"
+          : r.decision === "capture" ? "capture"
+          : r.decision === "clear" ? "clear"
+          : "hold";
+        // snapshot event lines carry no triggered_by copy (R1-6): the
+        // source column localizes from the structured decision/value keys
+        const by =
+          r.decision === "capture"
+            ? `${this.tr("logCapture")} ${r.value ?? ""}`.trim()
+            : r.decision === "clear"
+              ? this.tr("logClear")
+              : r.triggered_by || "—";
         return `
         <tr>
           <td class="wha-sub">${esc((r.timestamp || "").replace("T", " ").slice(0, 19))}</td>
@@ -3105,7 +3122,7 @@ class ScannerPanel extends HTMLElement {
           <td>${r.on_met ? "✓" : "—"}</td>
           <td>${r.off_met ? "✓" : "—"}</td>
           <td>${r.applied ? "✓" : "—"}${r.override ? " ✋" : ""}</td>
-          <td class="wha-sub">${esc(r.triggered_by || "—")}</td>
+          <td class="wha-sub">${esc(by)}</td>
           <td>
             ${r.conditions && Object.keys(r.conditions).length
               ? `<details class="wha-json"><summary>${esc(this.tr("logConditions"))}</summary>

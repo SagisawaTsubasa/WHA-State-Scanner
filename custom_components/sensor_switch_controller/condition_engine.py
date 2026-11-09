@@ -15,6 +15,7 @@ instant and the outputs that instant can reach (directed wakeups).
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -78,6 +79,16 @@ _WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _CAPTURE_FAILED = object()
 
 
+def _parse_finite_float(raw: Any) -> float | None:
+    """float(raw) when it parses to a finite number, else None (NaN/inf
+    excluded — same gate as the literal validation, schema)."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 class ConditionEngine:
     """Evaluates a library of conditions with FOR-timer support.
 
@@ -103,6 +114,7 @@ class ConditionEngine:
         manager: Any = None,
         flag_states: dict[str, bool] | None = None,
         snapshot_values: dict[str, Any] | None = None,
+        snapshot_gates: dict[str, bool] | None = None,
     ) -> None:
         """Initialize."""
         self.hass = hass
@@ -117,11 +129,14 @@ class ConditionEngine:
         # the snapshot kind — float = numeric snapshot, str = state snapshot
         # (auto-typed at capture time, see _capture_value).
         self._snapshot_values: dict[str, Any] = dict(snapshot_values or {})
-        # Previous-cycle capture-gate verdicts (edge detection). Memory-only
-        # on purpose: after a restart the first true cycle fires one capture
-        # — idempotent (it snapshots the CURRENT value), noted in step_flags'
-        # sibling step_snapshots.
-        self._snapshot_prev: dict[str, bool] = {}
+        # Previous-cycle capture-gate verdicts (edge detection), seeded from
+        # the persisted gate table (R1-3): without the seed every rebuild
+        # (each panel save reloads the entry) would see an empty prev table,
+        # treat a still-high gate as a fresh rising edge and OVERWRITE the
+        # latched value with the current reading. A missing gate table (old
+        # / hand-edited payload) keeps the legacy degrade: first true cycle
+        # captures once — idempotent while the source value is unchanged.
+        self._snapshot_prev: dict[str, bool] = dict(snapshot_gates or {})
         self._conditions: dict[str, dict] = {}
         for cond in conditions or []:
             if not isinstance(cond, dict):
@@ -280,18 +295,27 @@ class ConditionEngine:
         """Current latched snapshot values (for hub persistence)."""
         return dict(self._snapshot_values)
 
+    def snapshot_gates(self) -> dict[str, bool]:
+        """Previous-cycle capture-gate verdicts (edge-detection state, for
+        hub persistence — R1-3: seeding these on rebuild keeps the rising
+        -edge semantics exact across reloads/restarts)."""
+        return dict(self._snapshot_prev)
+
     async def step_snapshots(self) -> dict[str, dict]:
         """Advance every snapshot's capture/clear gate once; returns events.
 
         Stepping order mirrors step_flags (the flag step runs FIRST, then
-        this one, once per evaluation cycle): clear is level-triggered and
-        wins over capture (safe side, same reset-wins rule as flags);
-        capture fires on the capture gate's RISING edge only (previous
-        cycle False ∧ now True) — the source entity's later changes never
-        refresh the snapshot until the gate drops and rises again. The
-        previous-gate verdicts are memory-only: a restart zeroes them, so
-        the first true cycle after a restart captures once more —
-        idempotent (it snapshots the CURRENT value), by design.
+        this one, once per evaluation cycle; the controller re-steps the
+        flags once more when this returns events, so flag gates reading a
+        snapshot converge in the same cycle — R1-2): clear is
+        level-triggered and wins over capture (safe side, same reset-wins
+        rule as flags); capture fires on the capture gate's RISING edge
+        only (previous cycle False ∧ now True) — the source entity's later
+        changes never refresh the snapshot until the gate drops and rises
+        again. The previous-gate verdicts persist with the snapshot table
+        (R1-3): seeded on rebuild, the edge semantics stay exact across
+        reloads/restarts; a missing gate table (legacy payload) degrades
+        to one idempotent re-capture on the first true cycle.
 
         shortcut: a snapshot's capture/clear referencing ANOTHER snapshot
         reads that node's verdict in CONFIG order within this single loop
@@ -333,14 +357,19 @@ class ConditionEngine:
         return events
 
     def _capture_value(self, cond: dict, cid: str) -> Any:
-        """Snapshot the source entity's current reading, auto-typed.
+        """Snapshot the source entity's current reading, auto-typed
+        (attribute hint FIRST, R1-7).
 
-        The verdict follows the source entity's own typing: a reading that
-        parses as a number (``float()``) becomes a NUMERIC snapshot —
-        sensors advertise ``unit_of_measurement``/``state_class`` precisely
-        to mark numeric readings, so the attribute hint and the parse
-        fallback converge on the same rule; anything else is stored as the
-        state string verbatim. An unreadable source (missing entity,
+        A source advertising ``unit_of_measurement`` or
+        ``state_class == "measurement"`` declares itself numeric: its
+        reading is parsed as float, and a hinted reading that fails to
+        parse (or is non-finite) WARNs — the sensor is lying about its own
+        typing — and degrades to a state snapshot instead of a fabricated
+        number. An unhinted source gets the ``float()`` parse fallback
+        (digit-shaped state strings still become numeric snapshots, per
+        the 0.13.0 spec), where unparseable simply means text. NaN/inf
+        never land as numeric values (same isfinite gate as the literal
+        validation, schema). An unreadable source (missing entity,
         unknown/unavailable) captures NOTHING — a snapshot that exists but
         carries "unavailable" would make the node's verdict (snapshot
         exists) lie.
@@ -353,10 +382,23 @@ class ConditionEngine:
                 cond.get(CONF_ENTITY_ID),
             )
             return _CAPTURE_FAILED
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return raw
+        attrs = getattr(state, "attributes", None) or {}
+        hinted = (
+            isinstance(attrs.get("unit_of_measurement"), str)
+            or attrs.get("state_class") == "measurement"
+        )
+        value = _parse_finite_float(raw)
+        if hinted:
+            if value is None:
+                self._warn_eval_failure(
+                    cid,
+                    "snapshot capture (numeric sensor with non-numeric "
+                    "reading)",
+                    raw,
+                )
+                return raw
+            return value
+        return raw if value is None else value
 
     def _static_verdict(
         self,

@@ -824,6 +824,9 @@ class _States:
             "switch.c": "on",
             "switch.d": "off",
         }
+        # per-entity attribute overrides (R1-7: capture typing reads
+        # unit_of_measurement / state_class from the state attributes)
+        self._attrs: dict = {}
         # entities "existed" since fixture construction: fixed last_changed
         # (a live clock here would make debounce never pass)
         self._born = _clock["utc"]
@@ -836,7 +839,9 @@ class _States:
         if v is None:
             return None
         lc = self.last_changed.get(eid, self._born)
-        return SimpleNamespace(state=v, attributes={}, last_changed=lc)
+        return SimpleNamespace(
+            state=v, attributes=self._attrs.get(eid, {}), last_changed=lc
+        )
 
 
 class _Entity:
@@ -2088,6 +2093,35 @@ async def main():
             raise AssertionError(f"schema accepted a bad data-node config: {bad}")
     print("[PASS] data-node schema: guards reject bad op/kind/refs/value typing")
 
+    # R1-4: dead capture/clear gates are REJECTED — a cooldown inside the
+    # snapshot step has no output context (permanently False); a mixed OR
+    # GROUP keeps the gate alive via its live member and stays saveable
+    cool_dn = "cond_" + "ac" * 16
+    grp_dn = "cond_" + "ad" * 16
+    dn_dead = json.loads(json.dumps(dn_cfg))
+    dn_dead["conditions"].append({"id": cool_dn, "type": "cooldown", "seconds": 60})
+    dn_dead["conditions"] = [
+        c if c["id"] != sn_num else {**c, "capture": [cool_dn]}
+        for c in dn_dead["conditions"]
+    ]
+    try:
+        _vc(dn_dead)
+    except _CVE:
+        pass
+    else:
+        raise AssertionError("schema accepted a dead capture gate (cooldown)")
+    dn_mixed = json.loads(json.dumps(dn_cfg))
+    dn_mixed["conditions"].append({"id": cool_dn, "type": "cooldown", "seconds": 60})
+    dn_mixed["conditions"].append(
+        {"id": grp_dn, "type": "or", "conditions": [cool_dn, sn_gate]}
+    )
+    dn_mixed["conditions"] = [
+        c if c["id"] != sn_num else {**c, "capture": [grp_dn]}
+        for c in dn_mixed["conditions"]
+    ]
+    _vc(dn_mixed)  # mixed OR group: must NOT raise
+    print("[PASS] data-node schema: dead capture gate rejected, mixed OR group saveable (R1-4)")
+
     # engine faces via the manager (hub-seeded persistence path included)
     from custom_components.sensor_switch_controller.hub import ScannerHub as _SH
     hass_dn = _Hass()
@@ -2148,6 +2182,49 @@ async def main():
         _lgdn.removeHandler(_capdn)
     print("[PASS] data-node engine: edge capture, no-refresh, clear-wins, freeze, WARN faces")
 
+    # R1-7: capture typing — attribute hint FIRST, float() fallback second,
+    # non-finite numbers never land (isfinite gate, literal parity). A
+    # hinted sensor with an unparseable reading WARNs (the sensor lies
+    # about its own typing); an unhinted digit-shaped string still parses
+    # (fallback), and NaN degrades to the state string.
+    hass_t7 = _Hass()
+    hass_t7.states._d["sensor.hint"] = "05"
+    hass_t7.states._attrs["sensor.hint"] = {"unit_of_measurement": "°C"}
+    hass_t7.states._d["sensor.txt"] = "05"
+    hass_t7.states._d["sensor.lie"] = "on"
+    hass_t7.states._attrs["sensor.lie"] = {"state_class": "measurement"}
+    hass_t7.states._d["sensor.nan"] = "nan"
+    t7_gate = "cond_" + "ae" * 16
+    t7_ids = {
+        "hint": "cond_" + "af" * 16,
+        "txt": "cond_" + "ba" * 16,
+        "lie": "cond_" + "bb" * 16,
+        "nan": "cond_" + "bc" * 16,
+    }
+    t7_conds = [
+        {"id": t7_gate, "type": "state", "entity_id": "switch.c", "state": "on"},
+    ] + [
+        {"id": t7_ids[k], "type": "snapshot", "entity_id": f"sensor.{k}",
+         "capture": [t7_gate], "clear": []}
+        for k in t7_ids
+    ]
+    eng_t7 = ConditionEngine(hass_t7, t7_conds)
+    _cap7 = _Cap()
+    _lgdn.addHandler(_cap7)
+    try:
+        ev_t7 = await eng_t7.step_snapshots()
+    finally:
+        _lgdn.removeHandler(_cap7)
+    assert ev_t7[t7_ids["hint"]] == {"event": "capture", "value": 5.0}, ev_t7
+    assert ev_t7[t7_ids["txt"]] == {"event": "capture", "value": 5.0}, ev_t7
+    assert ev_t7[t7_ids["lie"]] == {"event": "capture", "value": "on"}, ev_t7
+    assert ev_t7[t7_ids["nan"]] == {"event": "capture", "value": "nan"}, ev_t7
+    assert sum(
+        "numeric sensor with non-numeric reading" in r.getMessage()
+        for r in _cap7.records
+    ) == 1, [r.getMessage() for r in _cap7.records]
+    print("[PASS] data-node typing: hint-first, parse fallback, NaN gate, lying-sensor WARN (R1-7)")
+
     # six numeric operators against one shared literal (reuse pin)
     six_ids = [f"cond_{i:032x}" for i in range(6)]
     six_ops = ("equal", "not_equal", "above", "below", "above_equal", "below_equal")
@@ -2181,7 +2258,9 @@ async def main():
     print("[PASS] data-node compare: six numeric ops, shared literal, string equality")
 
     # manager cycle: capture event persists to the hub store AND lands in
-    # the decision log (「拍下 …」); compare verdicts join conditions detail
+    # the decision log; compare verdicts join conditions detail. R1-6: the
+    # event record is purely structural (decision/value) — no hardcoded
+    # copy in triggered_by (the panel localizes from decision)
     hass_dn.states._d["switch.c"] = "off"
     await eng_dn.step_snapshots()  # drop the gate outside the logged cycle
     recs_dn_before = _log_cycles("ctrl_dnsmk1")
@@ -2191,18 +2270,86 @@ async def main():
     assert hub_dn.snapshot_states.get("ctrl_dnsmk1", {}).get(sn_num) == 99.0, (
         hub_dn.snapshot_states
     )
+    # R1-3: the gate table persists with the latches (still-high gate)
+    assert hub_dn.snapshot_gates.get("ctrl_dnsmk1", {}).get(sn_num) is True, (
+        hub_dn.snapshot_gates
+    )
     dn_recs = _log_tail(recs_dn_before, "ctrl_dnsmk1")
     assert any(
         r.get("decision") == "capture" and r.get("output") and r.get("value") == 99.0
         for r in dn_recs
     ), dn_recs
-    assert any(str(r.get("triggered_by", "")).startswith("拍下") for r in dn_recs)
+    assert all("triggered_by" not in r for r in dn_recs if r.get("decision") == "capture")
     assert det_dn["conditions"].get(cmp_snap) is True
     # observe walk: a/b and capture/clear references join the live view
     obs_dn = await mgr_dn.async_observe_conditions()
     assert {sn_gate, sn_num, cmp_snap} <= set(obs_dn["conditions"]), obs_dn
     mgr_dn.async_unload()
     print("[PASS] data-node manager: persistence, decision-log event, observe walk")
+
+    # R1-2 + R1-8①: directed-cycle convergence and widening — a capture
+    # event must (a) pull out-of-target downstream chains into THIS cycle
+    # (R1-8①, mirrors the flag-widening pin) and (b) re-step the flags so
+    # a flag whose set gate reads the FRESH snapshot latches within the
+    # SAME cycle (R1-2 — without the re-step the flag would wait forever
+    # for a second trigger that never comes; without the widening the
+    # direct-snapshot output would sit stale).
+    rt_gate = "cond_" + "cb" * 16   # capture gate leaf (switch.c on)
+    rt_snap = "cond_" + "db" * 16   # snapshot of sensor.a
+    rt_flag = "cond_" + "eb" * 16   # flag: set = [snapshot]
+    rt_oA = "ssc_" + "1" * 32       # in-target output (chain = gate leaf)
+    rt_oB = "ssc_" + "2" * 32       # downstream: on = [snapshot] (direct)
+    rt_oC = "ssc_" + "3" * 32       # downstream: on = [flag] (needs re-step)
+    rt_cfg = {
+        "name": "rt-data", "enabled": True, "logging_enabled": False,
+        "triggers": [{"id": "trg_" + "f" * 32, "type": "state",
+                      "entity_id": "switch.c",
+                      "routes": {"conditions": [rt_gate]}}],
+        "conditions": [
+            {"id": rt_gate, "type": "state", "entity_id": "switch.c", "state": "on"},
+            {"id": rt_snap, "type": "snapshot", "entity_id": "sensor.a",
+             "capture": [rt_gate], "clear": []},
+            {"id": rt_flag, "type": "flag",
+             "set_conditions": [rt_snap], "reset_conditions": [],
+             "initial": False},
+        ],
+        "outputs": [
+            {"name": "rtA", "type": "switch", "entity_id": rt_oA,
+             "on_conditions": [rt_gate], "off_conditions": []},
+            {"name": "rtB", "type": "switch", "entity_id": rt_oB,
+             "on_conditions": [rt_snap], "off_conditions": []},
+            {"name": "rtC", "type": "switch", "entity_id": rt_oC,
+             "on_conditions": [rt_flag], "off_conditions": []},
+        ],
+    }
+    hass_rt = _Hass()
+    hass_rt.data["sensor_switch_controller"] = _SH(hass_rt)
+    mgr_rt = ControllerManager(hass_rt, "ctrl_rtdn01", _vc(json.loads(json.dumps(rt_cfg))))
+    await mgr_rt.async_setup()
+    ent_rtA = _Entity("switch.rta")
+    ent_rtB = _Entity("switch.rtb")
+    ent_rtC = _Entity("switch.rtc")
+    mgr_rt.register_entity(rt_oA, ent_rtA)
+    mgr_rt.register_entity(rt_oB, ent_rtB)
+    mgr_rt.register_entity(rt_oC, ent_rtC)
+    await mgr_rt._async_evaluate(None, ["directed"], {rt_oA})
+    assert ent_rtA.is_on is True, "in-target output evaluated"
+    assert ent_rtB.is_on is True, (
+        "capture event must widen the directed scope to the "
+        "direct-snapshot output within the same cycle (R1-8)"
+    )
+    assert ent_rtC.is_on is True, (
+        "capture event must re-step the flags so a flag reading the fresh "
+        "snapshot latches in the SAME cycle (R1-2)"
+    )
+    assert (
+        hass_rt.data["sensor_switch_controller"].flag_states.get(
+            "ctrl_rtdn01", {}
+        ).get(rt_flag)
+        is True
+    ), "the re-stepped flag verdict must persist"
+    mgr_rt.async_unload()
+    print("[PASS] data-node directed cycle: same-cycle widening + flag re-step (R1-2/R1-8)")
 
     # hub store: three tables in one payload; pre-0.13 payloads (no
     # snapshots key) load silently; bool-poisoned values drop loudly
@@ -2227,18 +2374,25 @@ async def main():
     hub_p13 = _SH(_Hass())
     hub_p13._flag_store = _SnapStore()
     await hub_p13.async_load_flag_states()
-    await hub_p13.async_save_snapshots("ctrl_ab12cd34", {sn_num: 16.7, "k": "on"})
+    await hub_p13.async_save_snapshots(
+        "ctrl_ab12cd34", {sn_num: 16.7, "k": "on"}, {sn_num: True}
+    )
     payload13 = hub_p13._flag_store.saved[-1]
-    assert set(payload13) == {"flags", "last_flip", "snapshots"}, payload13
+    assert set(payload13) == {
+        "flags", "last_flip", "snapshots", "snapshot_gates",
+    }, payload13
+    assert payload13["snapshot_gates"] == {"ctrl_ab12cd34": {sn_num: True}}
     hub_p13._flag_store.load_result = payload13
     await hub_p13.async_load_flag_states()
     assert hub_p13.snapshot_states == {"ctrl_ab12cd34": {sn_num: 16.7, "k": "on"}}
+    assert hub_p13.snapshot_gates == {"ctrl_ab12cd34": {sn_num: True}}
     hub_old13 = _SH(_Hass())
     hub_old13._flag_store = _SnapStore()
     hub_old13._flag_store.load_result = {
         "flags": {"ctrl_ab12cd34": {sn_num: True}}, "last_flip": {}}
     await hub_old13.async_load_flag_states()
     assert hub_old13.snapshot_states == {}, hub_old13.snapshot_states
+    assert hub_old13.snapshot_gates == {}, hub_old13.snapshot_gates
     hub_bad13 = _SH(_Hass())
     hub_bad13._flag_store = _SnapStore()
     hub_bad13._flag_store.load_result = {
@@ -2246,17 +2400,78 @@ async def main():
         "snapshots": {"ctrl_ab12cd34": {"cond_x": True, "cond_y": 5}}}
     await hub_bad13.async_load_flag_states()
     assert hub_bad13.snapshot_states == {"ctrl_ab12cd34": {"cond_y": 5}}
-    # restart idempotence: a fresh engine seeded with the persisted values
-    # re-fires the first true cycle (prev gate memory is gone by design) —
-    # harmless, it snapshots the CURRENT value again
+    # R1-5: an explicit null is PRESENT-but-unusable — it must warn, not
+    # silently wipe the latches (capture the hub logger for the check)
+    import logging as _hub_lg
+
+    class _HubCap(_hub_lg.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list = []
+
+        def emit(self, record):
+            self.records.append(record.getMessage())
+
+    _hub_cap = _HubCap()
+    _hub_logger = _hub_lg.getLogger(
+        "custom_components.sensor_switch_controller.hub"
+    )
+    _hub_logger.addHandler(_hub_cap)
+    try:
+        hub_null13 = _SH(_Hass())
+        hub_null13._flag_store = _SnapStore()
+        hub_null13._flag_store.load_result = {
+            "flags": {}, "last_flip": {}, "snapshots": None, "snapshot_gates": None}
+        await hub_null13.async_load_flag_states()
+        assert hub_null13.snapshot_states == {}
+        assert sum("'snapshots' payload is not an object" in m for m in _hub_cap.records) == 1, (
+            _hub_cap.records
+        )
+        assert sum("'snapshot_gates' payload is not an object" in m for m in _hub_cap.records) == 1
+        _hub_cap.records.clear()
+        hub_nullf = _SH(_Hass())
+        hub_nullf._flag_store = _SnapStore()
+        hub_nullf._flag_store.load_result = {
+            "flags": {}, "last_flip": None}
+        await hub_nullf.async_load_flag_states()
+        assert sum("'last_flip' payload is not an object" in m for m in _hub_cap.records) == 1, (
+            "explicit last_flip null must warn too (R1-5 family)",
+            _hub_cap.records,
+        )
+    finally:
+        _hub_logger.removeHandler(_hub_cap)
+    # R1-3 + R1-8②: a manager rebuilt on a SEEDED hub reads the latched
+    # values AND the gate verdicts — a still-high gate with a changed
+    # source must NOT overwrite the latch on the first cycle
+    hass_seed = _Hass()
+    hass_seed.data["sensor_switch_controller"] = _SH(hass_seed)
+    hub_seed = hass_seed.data["sensor_switch_controller"]
+    hub_seed.snapshot_states["ctrl_dnsmk2"] = {sn_num: 9.9}
+    hub_seed.snapshot_gates["ctrl_dnsmk2"] = {sn_num: True}
+    hass_seed.states._d["sensor.a"] = "42"  # source has MOVED since capture
+    mgr_seed = ControllerManager(
+        hass_seed, "ctrl_dnsmk2", json.loads(json.dumps(dn_valid))
+    )
+    assert mgr_seed.engine.snapshots()[sn_num] == 9.9, (
+        "hub latches must seed the rebuilt engine (R1-8)"
+    )
+    ev_seed = await mgr_seed.engine.step_snapshots()
+    # gate is high (switch.c on) AND seeded prev=True → no rising edge →
+    # the latched 9.9 survives the reload; a fresh (unseeded) engine would
+    # have overwritten it with 42.0
+    assert ev_seed == {}, ev_seed
+    assert mgr_seed.engine.snapshots()[sn_num] == 9.9
+    mgr_seed.async_unload()
+    # legacy degrade (no gate table): first true cycle captures once —
+    # idempotent while the source is unchanged, the documented fallback
     eng_rs = ConditionEngine(
         _Hass(),
         json.loads(json.dumps(dn_valid["conditions"])),
-        snapshot_values={sn_num: 99.0},
+        snapshot_values={sn_num: 16.7},
     )
-    ev_rs = await eng_rs.step_snapshots()  # switch.c on → edge → recapture
+    ev_rs = await eng_rs.step_snapshots()  # no gate seed → edge → recapture
     assert ev_rs == {sn_num: {"event": "capture", "value": 16.7}}, ev_rs
-    print("[PASS] data-node hub: 3-table payload, legacy tolerance, restart idempotence")
+    print("[PASS] data-node hub: 4-table payload, legacy/null tolerance, gate-seed rebuild")
 
     # coverage expansion: the compare b-side snapshot node and its capture
     # chain join the materialized coverage set (schema face)

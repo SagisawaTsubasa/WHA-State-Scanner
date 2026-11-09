@@ -92,6 +92,8 @@
 .badge.on { background: rgba(67, 160, 71, 0.15); color: var(--wha-ok); border-color: transparent; }
 .badge.off { background: rgba(219, 68, 55, 0.12); color: var(--wha-bad); border-color: transparent; }
 .badge.hold { color: var(--wha-warn); }
+.badge.capture { background: rgba(3, 169, 244, 0.12); color: var(--wha-accent, #03a9f4); border-color: transparent; }
+.badge.clear { background: rgba(127,127,127,.12); color: var(--wha-sub); border-color: transparent; }
 .badge.meta { background: rgba(127,127,127,.12); }
 
 table.wha-table {
@@ -394,10 +396,25 @@ details.wha-json pre {
 }
 
 /* plain leaves have no gate-input semantics - hide the dead ports
-   (flag is exempt: its input_1/2 are the live set/reset ports, 审查 WHA-FIX R1-1) */
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag) .input_1,
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag) .input_2 {
+   (flag is exempt: its input_1/2 are the live set/reset ports, 审查 WHA-FIX R1-1;
+   snapshot/compare are exempt too: their input_1/2 are the live capture/clear
+   and A/B ports — WHA-SNAPSHOT-121 R1-1, admission JS and CSS must agree) */
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare) .input_1,
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare) .input_2 {
   display: none;
+}
+
+/* snapshot capture/clear ports: blue = capture (memory write), red = clear */
+.parent-drawflow .drawflow .wha-node.cond-snapshot .input_1 {
+  background: var(--wha-accent, #03a9f4);
+}
+.parent-drawflow .drawflow .wha-node.cond-snapshot .input_2 {
+  background: var(--wha-bad, #db4437);
+}
+/* compare A/B input ports: slate like the gate wiring (value reads) */
+.parent-drawflow .drawflow .wha-node.cond-compare .input_1,
+.parent-drawflow .drawflow .wha-node.cond-compare .input_2 {
+  background: #64748b;
 }
 
 /* gate output dot: slate like the gate wiring */

@@ -471,6 +471,11 @@ class ScannerHub:
         # IS the snapshot kind (numeric vs state, auto-typed at capture).
         # Same persistence story as the flag latches below.
         self.snapshot_states: dict[str, dict[str, Any]] = {}
+        # Previous-cycle capture-gate verdicts (R1-3): seeding the engine's
+        # edge detector from this table keeps rising-edge semantics exact
+        # across reloads/restarts (a still-high gate must NOT re-capture).
+        # {controller_id: {snapshot_cond_id: bool}}, same store payload.
+        self.snapshot_gates: dict[str, dict[str, bool]] = {}
         # Last applied flip (ISO string) per output, per controller — the
         # cooldown conditions' flip history, persisted with the same store
         # payload as the flag latches so it survives reloads/restarts
@@ -614,7 +619,8 @@ class ScannerHub:
             # a non-object (F-317: the missing/null faces used to vanish
             # silently, unlike the controllers guards) — degrades loudly.
             # The whole payload is untrustworthy, so the flip history goes
-            # with it — and, since 0.13.0, the snapshot latches too.
+            # with it — and, since 0.13.0, the snapshot latches and gate
+            # table too.
             if data is not None:
                 _LOGGER.warning(
                     "Stored %s_flags 'flags' payload is not an object (%r); ignored",
@@ -624,6 +630,7 @@ class ScannerHub:
             self.flag_states = {}
             self.last_flips = {}
             self.snapshot_states = {}
+            self.snapshot_gates = {}
             return
         states: dict[str, dict[str, bool]] = {}
         for cid, value in raw.items():
@@ -656,11 +663,14 @@ class ScannerHub:
                 )
         self.flag_states = states
         # Cooldown flip history rides the same payload (F-322). A missing
-        # 'last_flip' key is the pre-0.11 normal shape — stay silent; only
-        # a present-but-unusable value warns.
+        # 'last_flip' key is the pre-0.11 normal shape — stay silent; a
+        # PRESENT-but-unusable value (null included, R1-5 — key-existence
+        # is the signal, the old `raw is not None` check let an explicit
+        # null wipe the history silently) warns.
         raw_flips = (data or {}).get("last_flip")
+        present_flips = isinstance(data, dict) and "last_flip" in data
         if not isinstance(raw_flips, dict):
-            if data is not None and raw_flips is not None:
+            if present_flips:
                 _LOGGER.warning(
                     "Stored %s_flags 'last_flip' payload is not an object (%r); ignored",
                     STORE_KEY,
@@ -696,11 +706,13 @@ class ScannerHub:
             self.last_flips = flips
         # Snapshot latches ride the same payload (0.13.0). Same tolerance
         # ladder as 'last_flip': a missing key is the pre-0.13 normal shape
-        # (stay silent), a present-but-unusable value warns and degrades to
-        # empty (the captures are gone, NOT silently kept half-loaded).
+        # (stay silent), a present-but-unusable value (null included, R1-5)
+        # warns and degrades to empty (the captures are gone, NOT silently
+        # kept half-loaded).
         raw_snaps = (data or {}).get("snapshots")
+        present_snaps = isinstance(data, dict) and "snapshots" in data
         if not isinstance(raw_snaps, dict):
-            if data is not None and raw_snaps is not None:
+            if present_snaps:
                 _LOGGER.warning(
                     "Stored %s_flags 'snapshots' payload is not an object (%r); ignored",
                     STORE_KEY,
@@ -739,9 +751,52 @@ class ScannerHub:
                         type(value).__name__,
                     )
             self.snapshot_states = snaps
+        # Capture-gate verdicts (R1-3): same tolerance ladder — a missing
+        # key is the pre-R1-fix payload (stay silent, the engine degrades
+        # to one idempotent re-capture), a present-but-unusable value
+        # warns.
+        raw_gates = (data or {}).get("snapshot_gates")
+        present_gates = isinstance(data, dict) and "snapshot_gates" in data
+        if not isinstance(raw_gates, dict):
+            if present_gates:
+                _LOGGER.warning(
+                    "Stored %s_flags 'snapshot_gates' payload is not an "
+                    "object (%r); ignored",
+                    STORE_KEY,
+                    type(raw_gates).__name__,
+                )
+            self.snapshot_gates = {}
+        else:
+            gates: dict[str, dict[str, bool]] = {}
+            for cid, value in raw_gates.items():
+                # same per-controller guard as the flag states
+                if isinstance(cid, str) and isinstance(value, dict):
+                    clean = {
+                        k: v
+                        for k, v in value.items()
+                        if isinstance(k, str) and isinstance(v, bool)
+                    }
+                    if len(clean) != len(value):
+                        _LOGGER.warning(
+                            "Dropping %d malformed snapshot-gate entries "
+                            "for controller %s (values must be booleans)",
+                            len(value) - len(clean),
+                            cid,
+                        )
+                    gates[cid] = clean
+                else:
+                    _LOGGER.warning(
+                        "Dropping malformed snapshot-gate state for "
+                        "controller %r (%s)",
+                        cid,
+                        type(value).__name__,
+                    )
+            self.snapshot_gates = gates
 
     @staticmethod
-    def _flag_store_payload(flag_states: dict, last_flips: dict, snapshot_states: dict) -> dict:
+    def _flag_store_payload(
+        flag_states: dict, last_flips: dict, snapshot_states: dict, snapshot_gates: dict
+    ) -> dict:
         """Snapshot the runtime tables for the store write (F-325): the
         Store keeps the payload reference alive across await points (the
         write lock), so hand it per-controller copies — the same discipline
@@ -751,12 +806,13 @@ class ScannerHub:
         ``serialize_in_event_loop=True`` the JSON pass itself is a
         synchronous event-loop walk, so this is a state-semantics
         hardening, not a RuntimeError fix.) Since 0.13.0 the payload carries
-        a third table, ``snapshots`` (pre-0.13 files load without the key;
-        every save writes it)."""
+        ``snapshots`` and, since R1-3, ``snapshot_gates`` (older files load
+        without the keys; every save writes them)."""
         return {
             "flags": {c: dict(v) for c, v in flag_states.items()},
             "last_flip": {c: dict(v) for c, v in last_flips.items()},
             "snapshots": {c: dict(v) for c, v in snapshot_states.items()},
+            "snapshot_gates": {c: dict(v) for c, v in snapshot_gates.items()},
         }
 
     async def async_save_flag_states(self, cid: str, states: dict) -> None:
@@ -764,16 +820,23 @@ class ScannerHub:
         self.flag_states[cid] = dict(states)
         await self._flag_store.async_save(
             self._flag_store_payload(
-                self.flag_states, self.last_flips, self.snapshot_states
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates,
             )
         )
 
-    async def async_save_snapshots(self, cid: str, values: dict) -> None:
-        """Persist one controller's snapshot latches (capture/clear)."""
+    async def async_save_snapshots(
+        self, cid: str, values: dict, gates: dict
+    ) -> None:
+        """Persist one controller's snapshot latches AND gate verdicts
+        (capture/clear; the gates keep the edge detector exact across
+        rebuilds — R1-3)."""
         self.snapshot_states[cid] = dict(values)
+        self.snapshot_gates[cid] = dict(gates)
         await self._flag_store.async_save(
             self._flag_store_payload(
-                self.flag_states, self.last_flips, self.snapshot_states
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates,
             )
         )
 
@@ -795,21 +858,24 @@ class ScannerHub:
         self.last_flips.setdefault(cid, {})[out_id] = when.isoformat()
         self._flag_store.async_delay_save(
             lambda: self._flag_store_payload(
-                self.flag_states, self.last_flips, self.snapshot_states
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates,
             ),
             1,
         )
 
     async def async_drop_flag_states(self, cid: str) -> None:
         """Forget and persist-erase one controller's flag states (and its
-        cooldown flip history and snapshot latches — the controller is gone
-        either way)."""
+        cooldown flip history, snapshot latches and gate table — the
+        controller is gone either way)."""
         self.flag_states.pop(cid, None)
         self.last_flips.pop(cid, None)
         self.snapshot_states.pop(cid, None)
+        self.snapshot_gates.pop(cid, None)
         await self._flag_store.async_save(
             self._flag_store_payload(
-                self.flag_states, self.last_flips, self.snapshot_states
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates,
             )
         )
 

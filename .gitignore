@@ -26,10 +26,13 @@ Thumbs.db
 # dev/test_routing.py 已于 0.9.0 解禁入仓（panel.js 唯一回归防线，体检 A6）；
 # dev/mutation_check.py 已于 R7 修复轮解禁入仓（变异判别脚本，审查沙箱
 # 须可读——R7 报告第三节门禁证据不合规项，WHA-F-303）；
+# dev/test_ports.py 已于 0.13.0 R1 修复轮解禁入仓（数据节点端口可见性
+# DOM 冒烟钉——准入 JS 与 CSS 反向的复发防线，WHA-SNAPSHOT-121 R1-1）；
 # dev/ 其余本地工具仍不入库
 dev/*
 !dev/test_routing.py
 !dev/mutation_check.py
+!dev/test_ports.py
 /*.png
 
 .zcode/

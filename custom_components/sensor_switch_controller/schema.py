@@ -1406,6 +1406,33 @@ def _check_graph(
                         "或中止恒真同理；请修正该分支"
                     )
 
+    # Snapshot capture/clear dead gates (R1-4): the snapshot step evaluates
+    # its gates with NO output context either (same judge as the flag (b)
+    # face above — step edges only, never the evaluation-edge hazard faces).
+    # A cooldown hidden behind a group/duration is permanently False there,
+    # so a gate whose member is provably dead would silently never
+    # capture/clear — the node reads "no snapshot" forever with only an
+    # invisible debug line. An empty non-signal group stays None (wiring
+    # anchor, same clemency as the flag face — R6-3), and a mixed OR GROUP
+    # keeps working via its other members (the verdict judges the group as
+    # a whole).
+    for cond in conditions:
+        if cond["type"] != COND_SNAPSHOT:
+            continue
+        label = cond.get("label") or cond["id"]
+        for key in (CONF_CAPTURE, CONF_CLEAR):
+            if not cond[key]:
+                continue
+            memo: dict[str, bool | None] = {}
+            for member in cond[key]:
+                if _flag_branch_verdict(by_id[member], by_id, memo) is False:
+                    _fail(
+                        f"快照条件「{label}」的 {key}（直接或经组/持续门间接）恒不"
+                        "成立：冷却条件在快照步进时没有输出上下文（恒 False），"
+                        "AND 组混入冷却、NOT 组含恒真成员、持续门起点恒假"
+                        "或中止恒真同理；请修正该门"
+                    )
+
     # Cycle detection over group references and duration start/abort edges
     # (iterative DFS with colors).
     WHITE, GRAY, BLACK = 0, 1, 2
