@@ -3033,6 +3033,8 @@ class ScannerPanel extends HTMLElement {
             <option value="on">on</option>
             <option value="off">off</option>
             <option value="hold">hold</option>
+            <option value="capture">capture</option>
+            <option value="clear">clear</option>
           </select>
           <input class="wha-input" type="number" min="10" max="5000" value="500" data-lf="limit" style="width:90px">
           <button class="wha-btn primary" data-lact="query">${esc(this.tr("query"))}</button>

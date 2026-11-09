@@ -725,21 +725,46 @@ class ScannerHub:
                 # same per-controller guard as the flag states: a
                 # non-object value would explode dict() in the managers
                 if isinstance(cid, str) and isinstance(value, dict):
-                    # keep only str → (int|float|str) entries; bools are
-                    # not legal snapshot values (a hand-edited True is not
-                    # the number 1, and bool would poison compare typing)
-                    clean = {
-                        k: v
-                        for k, v in value.items()
-                        if isinstance(k, str)
-                        and isinstance(v, (int, float, str))
-                        and not isinstance(v, bool)
-                    }
-                    if len(clean) != len(value):
+                    # R2-6 shape: str → {"entity_id": str|absent,
+                    # "value": number|string}. Bools are never legal values
+                    # (a hand-edited True is not the number 1, and bool
+                    # would poison compare typing). Legacy BARE scalars
+                    # (pre-R2 payloads) pass through as origin-unknown.
+                    clean: dict[str, Any] = {}
+                    dropped = 0
+                    for k, v in value.items():
+                        if not isinstance(k, str):
+                            dropped += 1
+                            continue
+                        if isinstance(v, dict):
+                            src = v.get("entity_id")
+                            val = v.get("value")
+                            if (
+                                (src is None or isinstance(src, str))
+                                and isinstance(val, (int, float, str))
+                                and not isinstance(val, bool)
+                            ):
+                                entry: Any = (
+                                    {"entity_id": src, "value": val}
+                                    if src is not None
+                                    else {"value": val}
+                                )
+                                clean[k] = entry
+                            else:
+                                dropped += 1
+                        elif (
+                            isinstance(v, (int, float, str))
+                            and not isinstance(v, bool)
+                        ):
+                            clean[k] = v  # legacy bare scalar
+                        else:
+                            dropped += 1
+                    if dropped:
                         _LOGGER.warning(
                             "Dropping %d malformed snapshot entries for "
-                            "controller %s (values must be numbers or strings)",
-                            len(value) - len(clean),
+                            "controller %s (values must be {entity_id?, value} "
+                            "with number/string values)",
+                            dropped,
                             cid,
                         )
                     snaps[cid] = clean
@@ -838,6 +863,26 @@ class ScannerHub:
                 self.flag_states, self.last_flips, self.snapshot_states,
                 self.snapshot_gates,
             )
+        )
+
+    def async_save_snapshot_gates(self, cid: str, gates: dict) -> None:
+        """Persist the gate table alone via the DEBOUNCED write (R2-1).
+
+        Gate verdicts move every cycle while capture/clear events fire
+        only on value changes — this path covers the eventless transitions
+        (a stale stored verdict would swallow the next rising edge after a
+        rebuild). The in-memory table updates immediately (it IS the
+        rebuild seed source); the disk write defers through
+        Store.async_delay_save (F-339 discipline — same as the flip
+        history: the 1s window merges per-cycle bursts, Store's
+        final-write listener flushes on HA shutdown)."""
+        self.snapshot_gates[cid] = dict(gates)
+        self._flag_store.async_delay_save(
+            lambda: self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates,
+            ),
+            1,
         )
 
     async def async_save_last_flip(self, cid: str, out_id: str, when: Any) -> None:

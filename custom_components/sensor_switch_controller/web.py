@@ -316,7 +316,11 @@ class LogsView(HomeAssistantView):
                 {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}, status_code=400
             )
         decision = request.query.get("decision") or None
-        if decision is not None and decision not in ("on", "off", "hold"):
+        # capture/clear: the 0.13.0 snapshot event lines join the filter
+        # face (R2-5, closing the ledger item — the panel dropdown follows)
+        if decision is not None and decision not in (
+            "on", "off", "hold", "capture", "clear",
+        ):
             return self.json({"ok": False, "error": "decision 参数非法"}, status_code=400)
         try:
             limit = int(request.query.get("limit", "500"))

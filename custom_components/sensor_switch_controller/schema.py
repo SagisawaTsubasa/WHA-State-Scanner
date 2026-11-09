@@ -122,6 +122,19 @@ LEAF_TYPES = (
     COND_COMPARE,
 )
 GROUP_TYPES = (COND_AND, COND_OR, COND_NOT)
+# NOT signal origins (R2-7): timing gates latch/hold internal state and
+# the 0.13.0 data nodes carry no signal port on the canvas — a trigger
+# route naming one is hand-written, can never fire meaningfully and would
+# be silently dropped by the next canvas save (_exportGraph rebuilds
+# routes from drawable wires). Shared by the _check_graph route rejection
+# and the _signal_leaf_ids materialization filter so the two cannot drift.
+NON_SIGNAL_TYPES = (
+    COND_DURATION,
+    COND_FLAG,
+    COND_SNAPSHOT,
+    COND_LITERAL,
+    COND_COMPARE,
+)
 OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR)
 TRIGGER_TYPES = (TRG_STATE, TRG_TIME, TRG_SUN, TRG_HOMEASSISTANT)
 EVERY_SECONDS_MIN, EVERY_SECONDS_MAX = 10, 86400
@@ -454,13 +467,15 @@ def _covered_condition_ids(conditions: list, outputs: list, out_ids: list[str]) 
 
 def _signal_leaf_ids(conditions: list, outputs: list) -> list[str]:
     """Sorted signal-origin leaf ids reachable from ALL output chains —
-    the exact materialization set of the v6→v7 routes migration: group,
-    duration and flag ids are not signal origins (schema rejects them as
-    route targets; an empty group would flip into a pass-through anchor
-    and invert its verdict), yet every driving leaf stays reachable via
-    group-member, duration start/abort and flag set/reset edges
-    (_covered_condition_ids). Outputs without a usable ``entity_id``
-    contribute no coverage — the same face the v7 migration shows.
+    the exact materialization set of the v6→v7 routes migration: groups,
+    timing gates (duration/flag) and the 0.13.0 data nodes are not signal
+    origins (schema rejects them as route targets via NON_SIGNAL_TYPES; an
+    empty group would flip into a pass-through anchor and invert its
+    verdict), yet every driving leaf stays reachable via group-member,
+    duration start/abort, flag set/reset, snapshot capture/clear and
+    compare a/b edges (_covered_condition_ids). Outputs without a usable
+    ``entity_id`` contribute no coverage — the same face the v7 migration
+    shows.
     """
     by_id = {
         c.get("id"): c
@@ -477,7 +492,7 @@ def _signal_leaf_ids(conditions: list, outputs: list) -> list[str]:
         for cid in _covered_condition_ids(conditions, outputs, out_ids)
         if cid in by_id
         and by_id[cid].get("type")
-        not in (COND_DURATION, COND_FLAG, COND_AND, COND_OR, COND_NOT)
+        not in NON_SIGNAL_TYPES + GROUP_TYPES
     )
 
 
@@ -728,6 +743,16 @@ def _validate_condition(cond) -> dict:
                 _fail(f"旗标条件的 {key} 必须是条件 id 字符串列表")
             if len(set(members)) != len(members):
                 _fail(f"旗标条件的 {key} 成员不能重复")
+            if cid in members:
+                # R2-4: a DIRECT self reference made the latch's verdict
+                # depend on how many times the step ran per cycle (one
+                # pass = one-tick pulse, the R1-2 re-step = instant
+                # self-clear). The supported self-reset shape goes through
+                # a duration gate (R6-1) and stays legal.
+                _fail(
+                    "旗标条件不能直接以自身作为置位/复位条件：单次步进是一拍脉冲、"
+                    "二次步进会立即自清，语义不确定；自复位请经持续门实现"
+                )
             result[key] = list(dict.fromkeys(members))
         if not result[CONF_SET_CONDITIONS] and not result[CONF_RESET_CONDITIONS]:
             _fail("旗标条件必须提供 set_conditions 或 reset_conditions")
@@ -1360,6 +1385,11 @@ def _check_graph(
     for cond in conditions:
         if cond["type"] != COND_FLAG:
             continue
+        if cond.get("enabled") is False:
+            # R2-3: disabled flags are inert (step_flags skips them) —
+            # keep them saveable as canvas anchors, same clemency as
+            # F-336/F-346 give every other disabled node
+            continue
         label = cond.get("label") or cond["id"]
         # (a) Order-dependence hunt (审查 R5-4, narrowed by R6-1/R6-3): any
         # reachable NON-self flag makes the verdict depend on flag stepping
@@ -1418,6 +1448,10 @@ def _check_graph(
     # a whole).
     for cond in conditions:
         if cond["type"] != COND_SNAPSHOT:
+            continue
+        if cond.get("enabled") is False:
+            # R2-3: disabled snapshots are frozen (step_snapshots skips
+            # them) — saveable as canvas anchors
             continue
         label = cond.get("label") or cond["id"]
         for key in (CONF_CAPTURE, CONF_CLEAR):
@@ -1561,10 +1595,16 @@ def _check_graph(
         for member in routes.get("conditions", []):
             if member not in by_id:
                 _fail(f"触发器「{label}」的路由引用了不存在的条件：{member}")
-            if by_id[member]["type"] in (COND_DURATION, COND_FLAG):
+            if by_id[member]["type"] in NON_SIGNAL_TYPES:
+                # R2-7: widened from duration/flag to every portless/
+                # latching node — snapshot/compare/literal have no signal
+                # port on the canvas, so a hand-written route naming one
+                # cannot be drawn and the next canvas save would silently
+                # drop it
                 _fail(
-                    f"触发器「{label}」的信号线连到了持续门或旗标：两者都不是"
-                    "信号起点，请连到具体条件或逻辑组"
+                    f"触发器「{label}」的信号线连到了持续门、旗标或数据节点"
+                    "（快照/常量/求值）：它们都不是信号起点，"
+                    "请连到具体条件或逻辑组"
                 )
 
     # Save-time static hazard warnings (never rejecting): the off-chain

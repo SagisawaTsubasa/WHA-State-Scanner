@@ -25,6 +25,7 @@ import asyncio
 import logging
 from typing import Any
 
+from homeassistant.const import CONF_ENTITY_ID
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import (
     async_call_later,
@@ -47,6 +48,7 @@ from .const import (
     CONF_SET_CONDITIONS,
     CONF_START,
     CONF_TRIGGERS,
+    COND_SNAPSHOT,
     DOMAIN,
     EVAL_DEBOUNCE_SECONDS,
 )
@@ -100,6 +102,41 @@ class ControllerManager:
                     )
                     continue
                 saved_last_flip[out_id] = parsed
+        # Snapshot latch seeding (R2-6): persisted entries carry their
+        # source entity; a latch captured from a DIFFERENT entity than the
+        # config now names is dropped loudly (the old value would keep
+        # driving compare chains invisibly). Legacy bare scalars (pre-R2
+        # payloads) carry no origin and are kept once.
+        saved_snapshots: dict[str, Any] = {}
+        if hub is not None:
+            for sid, entry in (
+                hub.snapshot_states.get(controller_id) or {}
+            ).items():
+                cfg_src = next(
+                    (
+                        c.get(CONF_ENTITY_ID)
+                        for c in self.conditions
+                        if isinstance(c, dict) and c.get("id") == sid
+                    ),
+                    None,
+                )
+                if isinstance(entry, dict):
+                    src = entry.get("entity_id")
+                    if isinstance(src, str) and src != cfg_src:
+                        _LOGGER.warning(
+                            "Controller %s: dropping snapshot latch for %s "
+                            "(captured from %r, config now reads %r) — "
+                            "re-capture to re-arm",
+                            controller_id,
+                            sid,
+                            src,
+                            cfg_src,
+                        )
+                        continue
+                    value = entry.get("value")
+                else:
+                    value = entry  # legacy bare scalar: origin unknown
+                saved_snapshots[sid] = value
         self.engine = ConditionEngine(
             hass,
             self.conditions,
@@ -111,9 +148,7 @@ class ControllerManager:
             # without them a rebuild (every panel save reloads the entry)
             # would treat a still-high gate as a fresh rising edge and
             # overwrite the latched value with the CURRENT reading.
-            snapshot_values=(
-                hub.snapshot_states.get(controller_id, {}) if hub is not None else {}
-            ),
+            snapshot_values=saved_snapshots,
             snapshot_gates=(
                 hub.snapshot_gates.get(controller_id, {}) if hub is not None else {}
             ),
@@ -548,6 +583,7 @@ class ControllerManager:
             if targets is not None:
                 for fid in flipped:
                     targets |= self._cond_to_outs.get(fid) or set()
+        gates_before = self.engine.snapshot_gates()
         snap_events = await self.engine.step_snapshots()
         if snap_events:
             await self._persist_snapshots()
@@ -569,6 +605,12 @@ class ControllerManager:
                 if targets is not None:
                     for fid in reflipped:
                         targets |= self._cond_to_outs.get(fid) or set()
+        else:
+            # R2-1: eventless gate transitions (e.g. the gate DROPPED — no
+            # capture/clear fires) still move the edge-detection table; a
+            # stale stored verdict would swallow the next rising edge after
+            # a rebuild
+            self._persist_gates_if_changed(gates_before)
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -622,24 +664,67 @@ class ControllerManager:
     async def _persist_snapshots(self) -> None:
         """Persist snapshot latches via the hub (survives reloads/restarts).
 
-        Same teardown guard and failure contract as _persist_flag_states:
-        a dead manager must not write back into the hub store, and a failed
-        save never breaks the evaluation cycle — the in-memory values stay
+        The persisted shape carries each latch's source entity (R2-6) so a
+        rebuilt manager can tell a stale-origin latch from a live one. Same
+        teardown guard and failure contract as _persist_flag_states: a dead
+        manager must not write back into the hub store, and a failed save
+        never breaks the evaluation cycle — the in-memory values stay
         authoritative and the next capture/clear retries the write."""
         if self._stopped:
             return
         hub = self.hass.data.get(DOMAIN)
         if hub is None:
             return
+        src_by_id = {
+            c["id"]: c.get(CONF_ENTITY_ID)
+            for c in self.conditions
+            if isinstance(c, dict) and c.get("type") == COND_SNAPSHOT
+        }
+        payload = {
+            sid: {"entity_id": src_by_id.get(sid), "value": value}
+            for sid, value in self.engine.snapshots().items()
+        }
         try:
             await hub.async_save_snapshots(
                 self.controller_id,
-                self.engine.snapshots(),
+                payload,
                 self.engine.snapshot_gates(),
             )
         except Exception:
             _LOGGER.exception(
                 "Failed persisting snapshot states for %s", self.controller_id
+            )
+
+    def _persist_gates_if_changed(self, gates_before: dict) -> None:
+        """Sync the capture-gate table to the hub whenever it moved (R2-1).
+
+        The engine advances the gate verdicts EVERY cycle, but capture/clear
+        events only fire on value changes — persisting only on events left
+        the stored table stuck at the last event's verdict (e.g. True while
+        the gate has since dropped), and a rebuild seeded from that stale
+        table would swallow the next rising edge inside the startup window.
+        This sync path covers the eventless transitions; it updates the
+        hub's in-memory table immediately (that IS the rebuild seed source)
+        and defers the disk write through Store's debounce (F-339
+        discipline — gate edges can flip every cycle, an immediate
+        whole-table write per edge would serialize inside the eval lock).
+        The event path (_persist_snapshots) already writes the fresh table
+        in the same payload."""
+        if self._stopped:
+            return
+        after = self.engine.snapshot_gates()
+        if after == gates_before:
+            return
+        hub = self.hass.data.get(DOMAIN)
+        if hub is None:
+            return
+        try:
+            hub.async_save_snapshot_gates(self.controller_id, after)
+        except Exception:
+            # same contract as the other persist helpers: the in-engine
+            # verdicts stay authoritative; the next moving cycle retries
+            _LOGGER.exception(
+                "Failed persisting snapshot gates for %s", self.controller_id
             )
 
     def _snapshot_log_records(self, snap_events: dict[str, dict]) -> list[dict]:
@@ -805,6 +890,7 @@ class ControllerManager:
         flipped = await self.engine.step_flags()
         if flipped:
             await self._persist_flag_states()
+        gates_before = self.engine.snapshot_gates()
         snap_events = await self.engine.step_snapshots()
         if snap_events:
             await self._persist_snapshots()
@@ -812,6 +898,8 @@ class ControllerManager:
             reflipped = await self.engine.step_flags()
             if reflipped:
                 await self._persist_flag_states()
+        else:
+            self._persist_gates_if_changed(gates_before)  # R2-1
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
         records: list[dict] = []
@@ -941,6 +1029,7 @@ class ControllerManager:
             flipped = await self.engine.step_flags()
             if flipped:
                 await self._persist_flag_states()
+            gates_before = self.engine.snapshot_gates()
             snap_events = await self.engine.step_snapshots()
             if snap_events:
                 await self._persist_snapshots()
@@ -948,6 +1037,8 @@ class ControllerManager:
                 reflipped = await self.engine.step_flags()
                 if reflipped:
                     await self._persist_flag_states()
+            else:
+                self._persist_gates_if_changed(gates_before)  # R2-1
             try:
                 record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:

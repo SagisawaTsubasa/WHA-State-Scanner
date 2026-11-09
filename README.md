@@ -75,8 +75,11 @@
 
 **编辑器节点语义 / Node semantics:**
 
-- 条件节点（九类叶子 + 逻辑组 AND/OR/NOT）→ 信号线连到普通条件或逻辑组的「信号」口（input_3；持续与输出无信号口）
+- 条件节点（十二类叶子 + 逻辑组 AND/OR/NOT）→ 信号线连到普通条件或逻辑组的「信号」口（input_3；持续、旗标与数据节点无信号口）
 - 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
+- **快照节点**：`input_1` = 拍下（capture，多线=任一门的上升沿拍一次）、`input_2` = 清空（clear，多线=任一，清空优先）+ 表单选源实体（纯读）
+- **常量节点**：恒真，无输入口，表单填值类型（数字/状态）与值，供求值 A/B 端复用
+- **求值节点**：`input_1`/`input_2` = A/B 端（各只接一根线，**只收快照/常量节点**；未连线端按表单实体状态或属性求值），算子在表单选
 - **刷新状态**是只读观察（不写输出实体、不写决策日志），把每个条件的当前满足结果染色到节点上；真实评估走「立即评估」按钮（经确认框，会实际写输出实体、写决策日志）
 - 保存后控制器整条重载，FOR 计时器清零
 
@@ -89,7 +92,7 @@ GET    /api/sensor_switch_controller/controllers/{id}/observe # 只读实时条�
 PUT    /api/sensor_switch_controller/controllers/{id}     # 更新
 DELETE /api/sensor_switch_controller/controllers/{id}
 POST   /api/sensor_switch_controller/controllers/{id}/evaluate   # 立即评估（带逐条件结果）
-GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decision=on|off|hold&limit=500
+GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decision=on|off|hold|capture|clear&limit=500
 ```
 
 ---
@@ -108,7 +111,7 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 {"timestamp":"2026-10-05T14:30:00+08:00","controller":"浴室湿度控制","output":"湿度控制使能","decision":"off","on_met":false,"off_met":true,"applied":true,"override":false,"triggered_by":"湿度达标 [switch.shi_du: off→on]","conditions":{"cond_1a2b…":false}}
 ```
 
-- `decision` 为条件判定结果（on/off/hold，hold 也记录——"为什么没动作"同样有据可查）
+- `decision` 为条件判定结果（on/off/hold；0.13.0 起快照拍下/清空另记 capture/clear 事件行——hold 也记录，"为什么没动作"同样有据可查）
 - `applied` 表示判定是否实际写入实体；`override` 表示该写入被手动覆盖拦截
 - `triggered_by` 记录触发来源（触发器标签 + 触发实体及其状态变化）；`conditions` 是本周期输出链逐条件求值明细（条件 id → 布尔结果）
 - 0.11.0 及以前的旧记录另有 `readings` 键（当时的全池读数快照）；0.12.0 起新记录不再携带，面板仅对旧记录展开显示
@@ -121,7 +124,7 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 Config Entry（单一条目 / single entry）
 ├── Store                → 全部控制器配置（hub.ScannerHub, storage.Store）
 ├── ControllerManager    → 每控制器一个：触发调度 + 评估 + 实体注册（controller.py）
-├── Condition Engine     → 九类叶子（含 duration/debounce 计时门）+ AND/OR/NOT 嵌套 + 逐条件追踪（condition_engine.py）
+├── Condition Engine     → 十二类叶子（duration/debounce 计时门 + snapshot/literal/compare 数据节点）+ AND/OR/NOT 嵌套 + 逐条件追踪（condition_engine.py）
 ├── Output Platforms     → switch / binary_sensor（每控制器一个设备）
 ├── Web Layer            → 侧边栏面板 + REST API + 静态资源（web.py + static/）
 └── Decision Logger      → 独立 JSONL（decision_log.py）

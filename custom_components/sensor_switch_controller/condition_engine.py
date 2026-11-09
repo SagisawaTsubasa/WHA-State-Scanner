@@ -339,7 +339,6 @@ class ConditionEngine:
                 if await self._evaluate_id(member, set()):
                     gate_now = True
             edge = gate_now and not self._snapshot_prev.get(cid, False)
-            self._snapshot_prev[cid] = gate_now
             clear_met = False
             for member in cond.get(CONF_CLEAR) or []:
                 if await self._evaluate_id(member, set()):
@@ -347,13 +346,23 @@ class ConditionEngine:
             had = cid in self._snapshot_values
             if clear_met:
                 self._snapshot_values.pop(cid, None)
+                self._snapshot_prev[cid] = gate_now
                 if had:
                     events[cid] = {"event": "clear"}
             elif edge:
                 value = self._capture_value(cond, cid)
                 if value is not _CAPTURE_FAILED:
                     self._snapshot_values[cid] = value
+                    # a SUCCESSFUL capture consumes the edge; a failed one
+                    # (source unreadable) keeps prev at False so the gate
+                    # retries every cycle until the source reads again —
+                    # R2-2: a transient unavailable at the edge must not
+                    # pin the snapshot empty for the whole uptime
+                    self._snapshot_prev[cid] = gate_now
                     events[cid] = {"event": "capture", "value": value}
+            else:
+                # no edge, no clear: the gate verdict still advances
+                self._snapshot_prev[cid] = gate_now
         return events
 
     def _capture_value(self, cond: dict, cid: str) -> Any:
