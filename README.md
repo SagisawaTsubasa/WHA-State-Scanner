@@ -13,7 +13,7 @@
 - **侧边栏 Web 管理页** — 无需 YAML：总览 / 流程图编辑器 / 决策日志三个视图，全部内置、零 CDN、离线可用
 - **可视化流程图编辑器** — 条件→组→输出拖线连线（Drawflow），节点点击即改参数，刷新状态只读染色（绿=满足/红=不满足，不动作不写日志），「立即评估」确认后才真实动作（输出徽章显示决策）
 - **触发器可连线路由（0.7.0，0.10.0 起强制显式）** — 触发器是画布上的信号源：信号线连到条件或逻辑组的「信号」口开始评估；信号覆盖了哪些门，就沿链唤醒哪些输出；未连线=不评估，到期唤醒同样定向（逻辑组：连信号=触发合并贯通，连成员=条件判定）。0.10.0 起遗留全量评估（routes 缺省）与「留空监听整个传感器池」均废弃：routes 与触发实体（可逗号分隔多实体）必须显式声明
-- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒）、`snapshot`（快照记忆）、`literal`（常量）、`compare`（双端求值）十二类叶子，支持 `AND`/`OR`/`NOT` 嵌套组合
+- **条件规则库** — `numeric_state`、`state`、`time`、`sun`、`template`、`cooldown`、`calendar`、`duration`（持续满 N 秒，TON）、`debounce`（静默 N 秒）、`snapshot`（快照记忆）、`literal`（常量）、`compare`（双端求值）、`countdown`（倒计时锁存）、`quota`（次数余量）、`tally`（累计计数）十五类叶子，支持 `AND`/`OR`/`NOT` 嵌套组合
 - **多路输出** — 一个控制器可生成多个开关或二进制传感器；`off_conditions` 优先于 `on_conditions`（防抖动）
 - **决策日志** — 每周期逐输出写入独立 JSONL（触发源实体与状态变化、逐条件求值明细、applied/override 标记；0.11.0 及以前的旧记录另含全池读数快照），面板内可直接查询
 - **手动覆盖** — 开关类型支持可选的手动强制控制
@@ -23,7 +23,7 @@
 
 - **Sidebar web panel** — overview / visual flow editor / decision-log viewer, fully built-in, zero CDN
 - **Visual flow editor** — wire condition→group→output on a Drawflow canvas; click a node to edit it; the read-only status refresh colors nodes (green=met / red=unmet, no actuation); "evaluate now" actuates behind a confirm (decision badges on outputs)
-- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), `snapshot` (memory of one moment), `literal` (constant), `compare` (two-input verdict) — twelve leaf types, plus `AND`/`OR`/`NOT` nesting
+- **Condition library** — `numeric_state`, `state`, `time`, `sun`, `template`, `cooldown`, `calendar`, `duration` (hold N seconds, TON), `debounce` (quiet N seconds), `snapshot` (memory of one moment), `literal` (constant), `compare` (two-input verdict), `countdown` (timed latch), `quota` (budget gate), `tally` (pass-through counter) — fifteen leaf types, plus `AND`/`OR`/`NOT` nesting
 - **Multiple outputs** — switches and binary sensors per controller; `off_conditions` win over `on_conditions` (anti-flapping)
 - **Decision log** — per-cycle JSONL with firing entity + state change, per-condition verdicts, applied/override flags (records up to 0.11.0 also carry a full-pool readings snapshot); queryable in the panel
 - **Manual override** — optional per-switch manual control lock
@@ -169,6 +169,7 @@ target:
 - **⊕⊗¬ 逻辑组 = 汇聚判定**：**双模式**——成员口（input_1，灰蓝）收条件线组成 AND/OR/NOT（条件逻辑）；信号口（input_3，琥珀）收触发器线做触发合并（任一触发贯通放行，可多条；空组合法）。两侧对称互斥：连了一侧另一侧隐藏，删线恢复。
 - **🕯 防抖（debounce）= 静默门**：实体最后一次变化后安静满 N 秒才放行（每次变化重置）。
 - **⏱ 翻转冷却（cooldown）= 闭锁门**：输出翻转一次后 N 秒内拒绝再次翻转。翻转史持久化（0.11.0 起）；**只挂 on 链**——挂 off 链会在无翻转史时恒为 True 并以 off 优先永久压制 on 链（保存时会告警）。
+- **⏲🎫🧮 状态节点（0.14.0）= 数值状态步进门**：一套机制三种参数化，全部边沿触发（电平持续只算一次）、同拍复位优先、内部状态进第五张持久化表（跨重启/重载存活）——**⏲ 倒计时（countdown）**：开始门升沿启动/重走（时限=当下+秒数），复位门升沿停止并回满；出口=归零后 true 并锁存，再次开始瞬间翻 false，复位翻 false；归零由定向唤醒自调度，重启按 wall-clock 差值继续走到零（停机时长计入倒计时）。**🎫 次数余量（quota）**：消耗门升沿剩余>0→扣 1→出口 true，剩余=0→出口 false（拦截）；复位门升沿恢复满 X；出口=最近一次消耗的结果。**🧮 累计计数（tally）**：计数门升沿 +1；出口随计数门电平透传（门假→出口假）；复位门升沿归零；不判阈值不锁存，计数供面板/日志/未来判断面观测。三者均非信号起点（无信号口），出口由步进/锁存决定、不支持 `for`。
 - **输出 = 执行器**：只有「是 / 否」两个口——on 门（input_1，绿）/ off 门（input_2，红，优先），由条件链决定；触发器不直连输出（0.7.0 起 routes.outputs 被拒绝，存量经 v4 迁移自动折算为其条件链覆盖）。
 
 **到期也定向**：掐表门到点、静默门放行、冷却结束、时间范围进/出点、日出日落时刻——引擎只在那个精确瞬间唤醒这些时刻**能影响到的输出**，其余输出保持沉默。手动评估与刷新状态始终全量。
@@ -202,6 +203,21 @@ MIT
 *Built with [Kimi](https://kimi.moonshot.cn) by Moonshot AI · Author: [@SagisawaTsubasa](https://github.com/SagisawaTsubasa)*
 
 ## 更新日志 / Changelog
+
+### 0.14.0（2026-11-14）— 状态节点批：倒计时、次数余量、累计计数
+
+**新增（补引擎数值状态原语，替代 HA 原生 timer/counter 的判断面职能，防镜像化回潮；存量配置零改动）**
+- **⏲ 倒计时（countdown）**——双入口（start/reset）一出口：start 门升沿启动/重启动（回满重走，时限=当下+秒数，1..86400 同 duration 梯）；reset 门升沿=停止并回满（未启动态）；出口=**归零后 true 并锁存**，再次 start 瞬间翻 false，reset 翻 false。归零由 `next_wakeup` 定向自调度唤醒（duration offer 同源）；**重启按 wall-clock 差值继续走到零**（持久化的是绝对 deadline，停机时长计入倒计时；到零即锁存 true，verdict 丢失可由 deadline 自愈）
+- **🎫 次数余量（quota，X 次）**——双入口（consume/reset）一出口：consume 门升沿剩余>0→扣 1→出口传 true；剩余=0→**出口传 false（拦截）**；reset 门升沿=恢复满 X。出口=最近一次消耗的结果（消耗掉最后一个名额那次报告 true——当时允许；下一次尝试在 0 处报告 false）
+- **🧮 累计计数（tally）**——双入口（count/reset）一出口：count 门升沿=+1→出口传 true（入口 false→出口 false，**透传+副作用**）；reset 门升沿=归零；不判阈值不锁存，计数状态供面板/日志/未来判断面观测
+- **通用口径**：触发一律**上升沿**（电平持续成立只算一次，防连环扣/连环加）；同拍 reset 优先于普通入口；一套机制三种参数化（`STATEFUL_GATE_KEYS` 单源：start/consume/count + 共享 reset_conditions），仿旗标步进族在每周期输出求值前统一执行
+- **持久化（第五张运行态表）**：三节点内部状态进 `stateful` 表（flags/last_flip/snapshots/snapshot_gates 之后，键=节点 id，值=verdict+deadline（ISO）/余量/计数+prev 门真值）——prev 门随值表持久化，重载/重启后电平持续**不会**重放边沿（防重启多扣/多计）；旧载荷无该键静默容忍，坏值（类型不符）告警丢弃、引擎默认值自愈。控制器删除时第五表成对清理。存储版本 v8→v9（控制器配置零变化，v8 链为空过站，载荷重存至 v9 纪元）
+- **校验面**：双门引用存在性、参数范围（countdown `seconds` 1-86400 整数、quota `times` 1-86400 整数）、禁自引用（直接引用拒存 F-451 同型；间接引用闭包走查拒绝——**reset 方向走查含 duration abort 边**，主门方向的一次性自复位[abort]合法，R8#1 教训内建）、门死分支拒存（冷却在步进上下文恒假同型）、`for` 拒收（旗标族口径，持续前置用 duration 组合）；状态节点入 NON_SIGNAL_TYPES（非信号起点，路由目标拒存）；触发覆盖展开/路由索引/空组存续/静态告警四处走查列表同步
+- **画布**：三新节点入调色板——倒计时/次数余量/累计计数均为双入口（主门 input_1 蓝 + 复位 input_2 红，多线=任一）+单出口；编辑表单含秒数/次数与语义提示；中英文案同步（LANG +16 键/语言）；触发覆盖走查含状态节点门边
+- **同周期收敛**：状态节点动作与旗标/快照门互读时单周期内收敛（旗标/快照在读到新出口判定后有界重步进，F-427 同型面镜像）；快照 clear 门闭包走查补 duration abort 边（F-459 清偿：clear=[duration(start=X,abort=自身)] 拒存，capture 方向一次性自复位保持合法）
+
+**内部**
+- 引擎 `step_stateful`（快照步进后单次推进，动作事件立即持久化+prev 门移动去抖持久化 if-changed [F-434 纪律]+翻转定向扩面+收敛重步）；`next_wakeup` 倒计时 deadline offer；hub 第五表 load 阶梯（单点规整+坏值自愈）与事件/去抖双保存路径；smoke 新增五段状态节点钉（边沿/电平判别、同拍 reset 优先、余量 0 拦截极性、锁存翻回、无自唤醒、零点翻转驱动输出+快照门同周期收敛、壁钟续走+原值恢复+deadline 自愈、hub 阶梯+成对清理、v8→v9 迁移链+历史链全量 validate、schema 拒存面+F-459 判别对）；test_roundtrip 新增状态节点形态字节等价钉
 
 ### 0.13.0（2026-11-10）— 数据节点批：快照记忆、常量、双端求值
 

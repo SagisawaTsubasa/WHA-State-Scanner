@@ -129,3 +129,51 @@ def test_legacy_config_accepts_new_types_without_drift() -> None:
     # no data-node keys leaked into legacy nodes
     for c in stored["conditions"]:
         assert "capture" not in c and "value_type" not in c and "op" not in c, c
+
+
+def _stateful_kitchen_sink() -> dict:
+    """The 0.14.0 stateful-node shapes: all three kinds with both gates
+    wired, driven by a shared leaf, chained into an output."""
+    leaf = "cond_" + "a1" * 16
+    reset = "cond_" + "b1" * 16
+    cd = "cond_" + "c1" * 16
+    qt = "cond_" + "d1" * 16
+    tl = "cond_" + "e1" * 16
+    out1 = "ssc_" + "7" * 32
+    trg1 = "trg_" + "9" * 32
+    return {
+        "name": "状态节点样例",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [
+            {"id": trg1, "type": "state", "label": "状态触发", "enabled": True,
+             "entity_id": ["switch.c"], "routes": {"conditions": [leaf]}},
+        ],
+        "conditions": [
+            {"id": leaf, "type": "state", "label": "c 开", "enabled": True,
+             "entity_id": "switch.c", "state": "on"},
+            {"id": reset, "type": "time", "label": "", "enabled": True,
+             "after": "22:00", "before": "06:00"},
+            {"id": cd, "type": "countdown", "label": "cd", "enabled": True,
+             "seconds": 90, "start_conditions": [leaf], "reset_conditions": [reset]},
+            {"id": qt, "type": "quota", "label": "qt", "enabled": True,
+             "times": 3, "consume_conditions": [leaf], "reset_conditions": [reset]},
+            {"id": tl, "type": "tally", "label": "tl", "enabled": True,
+             "count_conditions": [leaf], "reset_conditions": []},
+        ],
+        "outputs": [
+            {"name": "o1", "type": "switch", "entity_id": out1,
+             "on_conditions": [cd, qt, tl], "off_conditions": []},
+        ],
+    }
+
+
+def test_stateful_config_put_roundtrip_is_byte_identical() -> None:
+    """The 0.14.0 stateful shapes are idempotent under validate_controller —
+    the GET→PUT round-trip changes zero bytes (same guarantee as the legacy
+    sink, extended to the new node kinds)."""
+    stored = validate_controller(_stateful_kitchen_sink())
+    again = validate_controller(json.loads(_dumps(stored)))
+    assert _dumps(again) == _dumps(stored), "round-trip mutated the stored form"
+    types = {c["type"] for c in stored["conditions"]}
+    assert {"countdown", "quota", "tally"} <= types, types

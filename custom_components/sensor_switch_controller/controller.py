@@ -188,6 +188,8 @@ class ControllerManager:
                             clean["deadline"],
                         )
                         clean["deadline"] = None
+                    else:
+                        clean["deadline"] = parsed
                 saved_stateful[nid] = clean
         self.engine = ConditionEngine(
             hass,

@@ -4515,5 +4515,343 @@ async def main():
         "with a warning, no crash"
     )
 
+    # ------------------------------------------------------------------
+    # Stateful step nodes (0.14.0, WHA-STATEFUL-123): one mechanism, three
+    # parameterizations. Pins are discriminating (F-343 教训): every face
+    # asserts the value AND a wrong-polarity/wrong-count counterexample.
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.schema import (
+        ControllerValidationError,
+    )
+    from custom_components.sensor_switch_controller.const import STORE_VERSION
+
+    st_cd = "cond_" + "c" * 32  # countdown (start=switch.c, reset=switch.d)
+    st_qt = "cond_" + "d" * 32  # quota ×2 (consume=switch.c, reset=switch.d)
+    st_tl = "cond_" + "e" * 32  # tally (count=switch.c, reset=switch.d)
+    st_snap = "cond_" + "f" * 32  # snapshot (capture=[countdown])
+    st_out = "ssc_" + "9" * 32
+    st_trg = "trg_" + "8" * 32
+
+    def _st_cfg(with_snap: bool) -> dict:
+        conds = [
+            {"id": st_cd, "type": "countdown", "label": "cd", "enabled": True,
+             "seconds": 60, "start_conditions": ["cond_" + "a" * 32],
+             "reset_conditions": ["cond_" + "b" * 32]},
+            {"id": st_qt, "type": "quota", "label": "qt", "enabled": True,
+             "times": 2, "consume_conditions": ["cond_" + "a" * 32],
+             "reset_conditions": ["cond_" + "b" * 32]},
+            {"id": st_tl, "type": "tally", "label": "tl", "enabled": True,
+             "count_conditions": ["cond_" + "a" * 32],
+             "reset_conditions": ["cond_" + "b" * 32]},
+            {"id": "cond_" + "a" * 32, "type": "state", "label": "", "enabled": True,
+             "entity_id": "switch.c", "state": "on"},
+            {"id": "cond_" + "b" * 32, "type": "state", "label": "", "enabled": True,
+             "entity_id": "switch.d", "state": "on"},
+        ]
+        chains = [st_cd, st_qt, st_tl]
+        if with_snap:
+            conds.append(
+                {"id": st_snap, "type": "snapshot", "label": "snap", "enabled": True,
+                 "entity_id": "sensor.a", "capture": [st_cd], "clear": []}
+            )
+            chains = [st_snap]
+        return {
+            "name": "stful",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": st_trg, "type": "state", "entity_id": "switch.c",
+                          "enabled": True, "routes": {"conditions": ["cond_" + "a" * 32]}}],
+            "conditions": conds,
+            "outputs": [{"name": "o", "type": "switch", "entity_id": st_out,
+                         "on_conditions": chains, "off_conditions": []}],
+        }
+
+    # engine level: edge vs level (防连环扣/连环加), same-cycle reset wins,
+    # quota zero polarity, latch flip-back, wakeup offers
+    eng_st = ConditionEngine(
+        _Hass(), json.loads(json.dumps(_st_cfg(with_snap=True)["conditions"]))
+    )
+    vals = eng_st.stateful_values()
+    ev = await eng_st.step_stateful()
+    # all gates high (switch.c on, switch.d off): reset absent, edges fire
+    assert vals[st_cd]["deadline"] == _clock["utc"] + timedelta(seconds=60), vals[st_cd]
+    assert vals[st_qt]["remaining"] == 1 and vals[st_qt]["verdict"] is True, vals[st_qt]
+    assert vals[st_tl]["count"] == 1 and vals[st_tl]["verdict"] is True, vals[st_tl]
+    # 边沿 vs 电平: the gates STAY high → nothing moves again
+    ev = await eng_st.step_stateful()
+    assert ev == {}, f"a level-held gate must act once only: {ev}"
+    assert vals[st_qt]["remaining"] == 1 and vals[st_tl]["count"] == 1
+    # running countdown offers its deadline to the reverse index; quota and
+    # tally never self-wake (无自唤醒)
+    rev = {st_cd: {st_out}, st_qt: {st_out}, st_tl: {st_out}, st_snap: {st_out}}
+    pending = eng_st.next_wakeup(rev)
+    assert pending is not None and pending[0] == _clock["utc"] + timedelta(seconds=60), pending
+    assert pending[1] == {st_out}, pending
+    # advance past the deadline → the NEXT step latches (归零锁存 true)
+    _advance_utc(120)
+    ev = await eng_st.step_stateful()
+    assert ev[st_cd]["flipped"] is True, ev
+    assert eng_st.stateful_values()[st_cd]["verdict"] is True
+    # latched countdown offers nothing, and so do quota/tally ever
+    assert eng_st.next_wakeup(rev) is None
+    # 锁存翻回 #1: start rise → 瞬间翻 false + 回满重走
+    _hass_st = eng_st.hass
+    _hass_st.states._d["switch.c"] = "off"
+    await eng_st.step_stateful()  # gate drops, prev advances
+    _hass_st.states._d["switch.c"] = "on"
+    ev = await eng_st.step_stateful()  # fresh rising edge → restart
+    assert ev[st_cd]["flipped"] is True, ev
+    assert eng_st.stateful_values()[st_cd]["verdict"] is False
+    assert eng_st.stateful_values()[st_cd]["deadline"] == _clock["utc"] + timedelta(seconds=60)
+    # 余量 0 拦截极性: the consume that TAKES the last unit reports True,
+    # the NEXT attempt (gate drop → rise at 0) reports False — a pinned-True
+    # at zero would be the cooldown off-side polarity trap
+    assert eng_st.stateful_values()[st_qt]["remaining"] == 0
+    assert eng_st.stateful_values()[st_qt]["verdict"] is True  # last unit allowed
+    _hass_st.states._d["switch.c"] = "off"
+    await eng_st.step_stateful()
+    _hass_st.states._d["switch.c"] = "on"
+    ev = await eng_st.step_stateful()
+    assert eng_st.stateful_values()[st_qt]["verdict"] is False, (
+        f"consume at remaining=0 must report False (拦截): {ev}"
+    )
+    assert ev[st_qt]["flipped"] is True
+    # 同拍 reset 优先: reset rises while the gates are high → the reset wins
+    # and the gate edge is consumed (quota stays FULL, countdown stays idle)
+    _hass_st.states._d["switch.d"] = "on"
+    ev = await eng_st.step_stateful()
+    assert eng_st.stateful_values()[st_qt]["remaining"] == 2, (
+        f"same-cycle reset must win over consume: {ev}"
+    )
+    assert eng_st.stateful_values()[st_cd]["deadline"] is None
+    assert eng_st.stateful_values()[st_tl]["count"] == 0
+    assert eng_st.stateful_values()[st_cd]["verdict"] is False  # reset 翻 false
+    # 锁存翻回 #2: reset while latched → verdict False (engine-fresh check)
+    eng_rst = ConditionEngine(_Hass(), json.loads(json.dumps(_st_cfg(True)["conditions"][:1] + _st_cfg(True)["conditions"][3:])))
+    eng_rst._stateful_values[st_cd] = {"verdict": True, "deadline": _clock["utc"], "prev_gate": False, "prev_reset": False}
+    _hass_r = eng_rst.hass
+    _hass_r.states._d["switch.c"] = "off"
+    _hass_r.states._d["switch.d"] = "on"
+    ev = await eng_rst.step_stateful()
+    assert eng_rst.stateful_values()[st_cd]["verdict"] is False, ev
+    assert eng_rst.stateful_values()[st_cd]["deadline"] is None
+    # tally 透传: gate low → verdict False while the count persists
+    _hass_st.states._d["switch.c"] = "off"
+    _hass_st.states._d["switch.d"] = "off"
+    ev = await eng_st.step_stateful()
+    assert ev[st_tl]["flipped"] is True, ev
+    assert eng_st.stateful_values()[st_tl]["verdict"] is False
+    assert eng_st.stateful_values()[st_tl]["count"] == 0  # reset already fired
+    print("[PASS] stateful engine: edge/level, reset-wins, zero polarity, latch flip-back, no self-wakeup")
+
+    # controller level: the deadline flip drives the output in ONE cycle and
+    # the snapshot capture gate reading the countdown converges same-cycle
+    # (the F-427 mirror — without the re-step the capture would wait for a
+    # second cycle that never comes)
+    st_valid = validate_controller(json.loads(json.dumps(_st_cfg(with_snap=True))))
+    hass_stc = _Hass()
+    hub_stc = ScannerHub(hass_stc)
+    hass_stc.data["sensor_switch_controller"] = hub_stc
+    mgr_stc = ControllerManager(hass_stc, "ctrl_stful01", json.loads(json.dumps(st_valid)))
+    ent_st = _Entity("switch.out_st")
+    mgr_stc.register_entity(st_out, ent_st)
+    await mgr_stc._async_evaluate(None, ["init"], None)
+    assert ent_st.is_on is False, "a running countdown must not fire its output"
+    _advance_utc(120)
+    await mgr_stc._async_evaluate(None, ["zero"], None)
+    assert ent_st.is_on is True, "the zero-cross cycle must latch AND flip the output"
+    assert mgr_stc.engine.snapshots().get(st_snap) == 16.7, (
+        "the snapshot capture gate reading the countdown must converge in "
+        "the SAME cycle (F-427 mirror)"
+    )
+    assert hub_stc.stateful_states["ctrl_stful01"][st_cd]["verdict"] is True
+    mgr_stc.async_unload()
+    print("[PASS] stateful controller: zero-cross latch drives output + snapshot gate converges same-cycle")
+
+    # persistence / restart wall-clock 续走: the stored deadline is an
+    # absolute instant — a rebuilt manager continues to zero by wall-clock
+    # difference (downtime counts), quota/tally restore verbatim
+    hass_wl = _Hass()
+    hub_wl = ScannerHub(hass_wl)
+    hass_wl.data["sensor_switch_controller"] = hub_wl
+    mgr_wl = ControllerManager(hass_wl, "ctrl_stful02", json.loads(json.dumps(st_valid)))
+    mgr_wl.register_entity(st_out, _Entity("switch.out_wl"))
+    await mgr_wl._async_evaluate(None, ["init"], None)  # starts countdown, consumes 1
+    stored_dl = hub_wl.stateful_states["ctrl_stful02"][st_cd]["deadline"]
+    assert isinstance(stored_dl, str), stored_dl
+    stored_rem = hub_wl.stateful_states["ctrl_stful02"][st_qt]["remaining"]
+    assert stored_rem == 1 and hub_wl.stateful_states["ctrl_stful02"][st_tl]["count"] == 1
+    mgr_wl.async_unload()
+    _advance_utc(45)  # restart 45s later — 15s of the budget must remain
+    mgr_wl2 = ControllerManager(hass_wl, "ctrl_stful02", json.loads(json.dumps(st_valid)))
+    ent_wl2 = _Entity("switch.out_wl2")
+    mgr_wl2.register_entity(st_out, ent_wl2)
+    seeded = mgr_wl2.engine.stateful_values()
+    assert seeded[st_qt]["remaining"] == 1 and seeded[st_tl]["count"] == 1, (
+        f"quota/tally must restore verbatim (原值恢复): {seeded}"
+    )
+    _advance_utc(16)  # the remaining 15s elapse
+    await mgr_wl2._async_evaluate(None, ["wakeup"], None)
+    assert mgr_wl2.engine.stateful_values()[st_cd]["verdict"] is True, (
+        "the countdown must continue to zero by wall-clock difference "
+        "(壁钟续走到零锁存)"
+    )
+    assert ent_wl2.is_on is True
+    # discriminate: the deadline did NOT restart at the rebuild — the stored
+    # instant is preserved verbatim through the reload
+    assert hub_wl.stateful_states["ctrl_stful02"][st_cd]["deadline"] == stored_dl
+    mgr_wl2.async_unload()
+    # a latched countdown re-latches after an even LONGER outage (到零即锁存,
+    # self-healing the verdict from the deadline alone)
+    hass_wl3 = _Hass()
+    hub_wl3 = ScannerHub(hass_wl3)
+    hass_wl3.data["sensor_switch_controller"] = hub_wl3
+    hub_wl3.stateful_states["ctrl_stful03"] = {
+        st_cd: {"verdict": False, "deadline": stored_dl, "prev_gate": True,
+                "prev_reset": False},
+    }
+    mgr_wl3 = ControllerManager(hass_wl3, "ctrl_stful03", json.loads(json.dumps(st_valid)))
+    assert mgr_wl3.engine.stateful_values()[st_cd]["verdict"] is False
+    _advance_utc(86400)
+    await mgr_wl3._async_evaluate(None, ["init"], None)
+    assert mgr_wl3.engine.stateful_values()[st_cd]["verdict"] is True, (
+        "a deadline long past must re-latch on the first cycle"
+    )
+    mgr_wl3.async_unload()
+    print("[PASS] stateful persistence: wall-clock 续走, 原值恢复, deadline self-heal")
+
+    # hub fifth-table ladder: a 0.13.0 four-table payload (no stateful key)
+    # loads silently; wrong-typed fields drop loudly and the good ones stay
+    class _StStore:
+        """Injectable-load recording store (the module-level _Store stub is
+        a no-op; this pin must observe the load face)."""
+
+        def __init__(self):
+            self.saved = []
+            self.load_result = None
+
+        async def async_load(self):
+            return self.load_result
+
+        async def async_save(self, data):
+            self.saved.append(data)
+
+        def async_delay_save(self, data_func, delay=0):
+            self.saved.append(data_func())
+
+    hub_l = ScannerHub(_Hass())
+    hub_l._flag_store = _StStore()
+    await hub_l.async_load_flag_states()  # missing file (None) → silent
+    assert hub_l.stateful_states == {}
+    hub_l._flag_store.load_result = {
+        "flags": {}, "last_flip": {}, "snapshots": {}, "snapshot_gates": {},
+    }
+    await hub_l.async_load_flag_states()
+    assert hub_l.stateful_states == {}, "the 0.13.0 four-table shape must stay silent"
+    hub_l._flag_store.load_result = {
+        "flags": {}, "last_flip": {},
+        "stateful": {"ctrl_stful04": {
+            st_cd: {"verdict": "yes", "deadline": 5, "prev_gate": True},
+            st_qt: {"remaining": True, "verdict": False},
+            "cond_nodict": 7,
+        }},
+    }
+    await hub_l.async_load_flag_states()
+    tbl = hub_l.stateful_states["ctrl_stful04"]
+    assert tbl[st_cd] == {"prev_gate": True}, tbl[st_cd]
+    assert tbl[st_qt] == {"verdict": False}, tbl[st_qt]  # bool verdict kept
+    assert "cond_nodict" not in tbl
+    # drop 成对清理 (F-449 先例): deleting a controller erases the fifth table
+    await hub_l.async_save_stateful("ctrl_stful05", {st_cd: {"verdict": True}})
+    assert "ctrl_stful05" in hub_l.stateful_states
+    await hub_l.async_drop_flag_states("ctrl_stful05")
+    assert "ctrl_stful05" not in hub_l.stateful_states
+    print("[PASS] stateful hub: 0.13.0 payload silent, bad values self-heal, drop pairs")
+
+    # store version epoch: v9 with an empty v8→v9 controller chain — a real
+    # 0.13.0-shaped payload migrates and still validates (教训 R2: 迁移产物
+    # →validate 全链冒烟)
+    assert STORE_VERSION == 9, STORE_VERSION
+    v13_cfg = {
+        "name": "v13",
+        "conditions": [
+            {"id": CID1, "type": "state", "label": "", "enabled": True,
+             "entity_id": "sensor.a", "state": "on"},
+            {"id": CID2, "type": "flag", "label": "", "enabled": True,
+             "set_conditions": [CID1], "reset_conditions": [], "initial": False},
+        ],
+        "outputs": [{"name": "o", "type": "switch", "entity_id": OID1,
+                     "on_conditions": [CID2], "off_conditions": []}],
+        "triggers": [{"id": TID1, "type": "state", "entity_id": "sensor.a",
+                      "enabled": True, "routes": {"conditions": [CID1]}}],
+    }
+    hub_mig = ScannerHub(_Hass())
+    migrated9 = await hub_mig.store._async_migrate_func(
+        8, 1, {"controllers": {"ctrl_v13x1": v13_cfg}}
+    )
+    validate_controller(migrated9["controllers"]["ctrl_v13x1"])
+    # every historical chain still lands valid (v2..v8 dispatch unchanged)
+    for old_v in (2, 5, 8):
+        migrated = await hub_mig.store._async_migrate_func(
+            old_v, 1, {"controllers": {"ctrl_v13x1": json.loads(json.dumps(v13_cfg))}}
+        )
+        validate_controller(migrated["controllers"]["ctrl_v13x1"])
+    print("[PASS] store v9: v8→v9 epoch chain + historical chains all validate")
+
+    # schema faces: self-reference (direct + closure), dead gate, route
+    # target, parameter ranges — each rejected with a visible message
+    def _st_fail(cfg, frag):
+        try:
+            validate_controller(cfg)
+        except ControllerValidationError as err:
+            assert frag in str(err), (frag, str(err))
+            return
+        raise AssertionError(f"expected failure containing {frag!r}")
+
+    _cfg_self = json.loads(json.dumps(st_valid))
+    _cfg_self["conditions"][0]["start_conditions"] = [st_cd]
+    _st_fail(_cfg_self, "不能直接以自身作为")
+    _cfg_closure = json.loads(json.dumps(st_valid))
+    _grp_id = "cond_" + "77" * 16
+    _cfg_closure["conditions"].append(
+        {"id": _grp_id, "type": "or", "label": "", "enabled": True,
+         "conditions": ["cond_" + "a" * 32, st_cd]}
+    )
+    _cfg_closure["conditions"][0]["start_conditions"] = [_grp_id]
+    _st_fail(_cfg_closure, "引用了自身")
+    _cfg_dead = json.loads(json.dumps(st_valid))
+    _cool_id = "cond_" + "88" * 16
+    _cfg_dead["conditions"].append(
+        {"id": _cool_id, "type": "cooldown", "label": "", "enabled": True, "seconds": 60}
+    )
+    _cfg_dead["conditions"][2]["count_conditions"] = [_cool_id]
+    _st_fail(_cfg_dead, "恒不成立")
+    _cfg_route = json.loads(json.dumps(st_valid))
+    _cfg_route["triggers"][0]["routes"] = {"conditions": [st_qt]}
+    _st_fail(_cfg_route, "都不是信号起点")
+    _cfg_range = json.loads(json.dumps(st_valid))
+    _cfg_range["conditions"][0]["seconds"] = 86401
+    _st_fail(_cfg_range, "seconds 必须在 1-")
+    _cfg_range["conditions"][0]["seconds"] = 60
+    _cfg_range["conditions"][1]["times"] = 0
+    _st_fail(_cfg_range, "times 必须在 1-")
+    # F-459 discriminating pair (snapshot clear vs capture through abort)
+    _dur_id = "cond_" + "99" * 16
+    _cfg_clear = json.loads(json.dumps(st_valid))
+    _cfg_clear["conditions"].append(
+        {"id": _dur_id, "type": "duration", "label": "", "enabled": True,
+         "seconds": 5, "start": "cond_" + "a" * 32, "abort": st_snap}
+    )
+    _cfg_clear["conditions"][5]["clear"] = [_dur_id]
+    _st_fail(_cfg_clear, "引用了自身")
+    _cfg_cap = json.loads(json.dumps(st_valid))
+    _cfg_cap["conditions"].append(
+        {"id": _dur_id, "type": "duration", "label": "", "enabled": True,
+         "seconds": 5, "start": "cond_" + "a" * 32, "abort": st_snap}
+    )
+    _cfg_cap["conditions"][5]["capture"] = [_dur_id]
+    validate_controller(_cfg_cap)  # one-shot self-reset via abort stays legal
+    print("[PASS] stateful schema: self-ref/dead-gate/route/params rejected, F-459 pair split")
+
 asyncio.run(main())
 print("SMOKE OK")
