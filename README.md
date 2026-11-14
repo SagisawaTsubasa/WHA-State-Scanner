@@ -75,7 +75,7 @@
 
 **编辑器节点语义 / Node semantics:**
 
-- 条件节点（十二类叶子 + 逻辑组 AND/OR/NOT）→ 信号线连到普通条件或逻辑组的「信号」口（input_3；持续、旗标与数据节点无信号口）
+- 条件节点（十五类叶子 + 逻辑组 AND/OR/NOT）→ 信号线连到普通条件或逻辑组的「信号」口（input_3；持续、旗标、状态与数据节点无信号口）
 - 组或顶层条件连线到**输出节点**的两个输入端口：`input_1` = 满足则开（on_conditions），`input_2` = 满足则关（off_conditions，**优先**）
 - **快照节点**：`input_1` = 拍下（capture，多线=任一门的上升沿拍一次）、`input_2` = 清空（clear，多线=任一，清空优先）+ 表单选源实体（纯读）
 - **常量节点**：恒真，无输入口，表单填值类型（数字/状态）与值，供求值 A/B 端复用
@@ -124,7 +124,7 @@ GET    /api/sensor_switch_controller/logs?controller_id=&date=YYYY-MM-DD&decisio
 Config Entry（单一条目 / single entry）
 ├── Store                → 全部控制器配置（hub.ScannerHub, storage.Store）
 ├── ControllerManager    → 每控制器一个：触发调度 + 评估 + 实体注册（controller.py）
-├── Condition Engine     → 十二类叶子（duration/debounce 计时门 + snapshot/literal/compare 数据节点）+ AND/OR/NOT 嵌套 + 逐条件追踪（condition_engine.py）
+├── Condition Engine     → 十五类叶子（duration/debounce 计时门 + snapshot/literal/compare 数据节点 + countdown/quota/tally 状态节点）+ AND/OR/NOT 嵌套 + 逐条件追踪（condition_engine.py）
 ├── Output Platforms     → switch / binary_sensor（每控制器一个设备）
 ├── Web Layer            → 侧边栏面板 + REST API + 静态资源（web.py + static/）
 └── Decision Logger      → 独立 JSONL（decision_log.py）
@@ -136,7 +136,7 @@ Config Entry（单一条目 / single entry）
 |-------------|----------------|
 | `hub.py` | 域级单例：Store 读写、控制器 CRUD、运行时快照 / Domain singleton: store, controller CRUD, snapshots |
 | `controller.py` | 触发调度、定向路由评估（含 applied/override 记录）、评估/观察 API / Trigger scheduling, directed evaluation, evaluate/observe API |
-| `condition_engine.py` | 递归条件评估（十二类叶子 + AND/OR/NOT 嵌套 + 计时账本 + 定向唤醒）/ Recursive evaluator |
+| `condition_engine.py` | 递归条件评估（十五类叶子 + AND/OR/NOT 嵌套 + 计时账本 + 定向唤醒）/ Recursive evaluator |
 | `schema.py` | 共享校验（Web API 与 config flow 同源）/ Shared validation |
 | `web.py` | REST views、面板注册、静态资源 / REST views, panel & static registration |
 | `static/panel.js` | 面板前端（零构建自定义元素 + Drawflow）/ Zero-build panel frontend |
@@ -169,7 +169,7 @@ target:
 - **⊕⊗¬ 逻辑组 = 汇聚判定**：**双模式**——成员口（input_1，灰蓝）收条件线组成 AND/OR/NOT（条件逻辑）；信号口（input_3，琥珀）收触发器线做触发合并（任一触发贯通放行，可多条；空组合法）。两侧对称互斥：连了一侧另一侧隐藏，删线恢复。
 - **🕯 防抖（debounce）= 静默门**：实体最后一次变化后安静满 N 秒才放行（每次变化重置）。
 - **⏱ 翻转冷却（cooldown）= 闭锁门**：输出翻转一次后 N 秒内拒绝再次翻转。翻转史持久化（0.11.0 起）；**只挂 on 链**——挂 off 链会在无翻转史时恒为 True 并以 off 优先永久压制 on 链（保存时会告警）。
-- **⏲🎫🧮 状态节点（0.14.0）= 数值状态步进门**：一套机制三种参数化，全部边沿触发（电平持续只算一次）、同拍复位优先、内部状态进第五张持久化表（跨重启/重载存活）——**⏲ 倒计时（countdown）**：开始门升沿启动/重走（时限=当下+秒数），复位门升沿停止并回满；出口=归零后 true 并锁存，再次开始瞬间翻 false，复位翻 false；归零由定向唤醒自调度，重启按 wall-clock 差值继续走到零（停机时长计入倒计时）。**🎫 次数余量（quota）**：消耗门升沿剩余>0→扣 1→出口 true，剩余=0→出口 false（拦截）；复位门升沿恢复满 X；出口=最近一次消耗的结果。**🧮 累计计数（tally）**：计数门升沿 +1；出口随计数门电平透传（门假→出口假）；复位门升沿归零；不判阈值不锁存，计数供面板/日志/未来判断面观测。三者均非信号起点（无信号口），出口由步进/锁存决定、不支持 `for`。
+- **⏲🎫🧮 状态节点（0.14.0）= 数值状态步进门**：一套机制三种参数化，全部边沿触发（电平持续只算一次）、同拍复位优先、内部状态进第五张持久化表（跨重启/重载存活）——**⏲ 倒计时（countdown）**：开始门升沿启动/重走（时限=当下+秒数），复位门升沿停止并回满；出口=归零后 true 并锁存，再次开始瞬间翻 false，复位翻 false；归零由定向唤醒自调度，重启按 wall-clock 差值继续走到零（停机时长计入倒计时）。**🎫 次数余量（quota）**：消耗门升沿剩余>0→扣 1→出口 true，剩余=0→出口 false（拦截）；复位门升沿恢复满 X；出口=最近一次消耗的结果。**🧮 累计计数（tally）**：计数门升沿 +1；出口随计数门电平透传（门假→出口假）；复位门升沿归零；不判阈值不锁存，计数随运行快照（`GET /config` 的 `runtime.stateful`）观测，面板渲染属未来判断面。三者均非信号起点（无信号口），出口由步进/锁存决定、不支持 `for`。
 - **输出 = 执行器**：只有「是 / 否」两个口——on 门（input_1，绿）/ off 门（input_2，红，优先），由条件链决定；触发器不直连输出（0.7.0 起 routes.outputs 被拒绝，存量经 v4 迁移自动折算为其条件链覆盖）。
 
 **到期也定向**：掐表门到点、静默门放行、冷却结束、时间范围进/出点、日出日落时刻——引擎只在那个精确瞬间唤醒这些时刻**能影响到的输出**，其余输出保持沉默。手动评估与刷新状态始终全量。

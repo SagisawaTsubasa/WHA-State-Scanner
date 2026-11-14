@@ -23,7 +23,7 @@ import importlib
 import json
 import sys
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -4385,6 +4385,83 @@ async def main():
             "an empty group behind a disabled group is never evaluated — "
             f"must not warn (R3#2): {sch_records[n_dead_empty:]}"
         )
+        # R2#4: a countdown is an armable timer — face ⑤ must NOT fire for
+        # a countdown-only chain (a running countdown self-wakes at its
+        # deadline), while the same chain on tally (never self-wakes)
+        # still warns; face ② keeps the calendar warning for calendar+
+        # tally but not for calendar+countdown
+        cd_w = "cond_" + "c" * 32
+        cd_g = "cond_" + "d" * 32
+        tl_w = "cond_" + "e" * 32
+        n_r2w = len(sch_records)
+        _vc({"name": "hazards",
+             "conditions": [
+                 {"id": cd_g, "type": "state", "entity_id": "switch.d",
+                  "state": "on"},
+                 {"id": cd_w, "type": "countdown", "seconds": 60,
+                  "start_conditions": [cd_g], "reset_conditions": []},
+             ],
+             "triggers": [{"id": "trg_" + "2" * 32, "type": "state",
+                           "entity_id": "switch.c",
+                           "routes": {"conditions": []}}],
+             "outputs": [{"name": "o", "type": "switch", "entity_id": hz_o1,
+                          "on_conditions": [cd_w], "off_conditions": []}]})
+        assert len(sch_records) == n_r2w, (
+            f"a countdown-only chain self-wakes at its deadline — no "
+            f"no-wakeup-source warning (R2#4): {sch_records[n_r2w:]}"
+        )
+        _vc({"name": "hazards",
+             "conditions": [
+                 {"id": cd_g, "type": "state", "entity_id": "switch.d",
+                  "state": "on"},
+                 {"id": tl_w, "type": "tally",
+                  "count_conditions": [cd_g], "reset_conditions": []},
+             ],
+             "triggers": [{"id": "trg_" + "2" * 32, "type": "state",
+                           "entity_id": "switch.c",
+                           "routes": {"conditions": []}}],
+             "outputs": [{"name": "o", "type": "switch", "entity_id": hz_o1,
+                          "on_conditions": [tl_w], "off_conditions": []}]})
+        assert sum("没有任何可唤醒源" in r for r in sch_records[n_r2w:]) == 1, (
+            f"a tally never self-wakes — face ⑤ must still warn: "
+            f"{sch_records[n_r2w:]}"
+        )
+        # face ② pair: calendar as the countdown's start gate — the
+        # countdown counts as another wakeup, so no calendar-only warning;
+        # with a tally in its place the warning fires
+        n_r2c = len(sch_records)
+        _vc({"name": "hazards",
+             "conditions": [
+                 {"id": cd_g, "type": "calendar", "entity_id": "calendar.x",
+                  "hours": 2},
+                 {"id": cd_w, "type": "countdown", "seconds": 60,
+                  "start_conditions": [cd_g], "reset_conditions": []},
+             ],
+             "triggers": [{"id": "trg_" + "2" * 32, "type": "state",
+                           "entity_id": "switch.c",
+                           "routes": {"conditions": []}}],
+             "outputs": [{"name": "o", "type": "switch", "entity_id": hz_o1,
+                          "on_conditions": [cd_w], "off_conditions": []}]})
+        assert len(sch_records) == n_r2c, (
+            f"a calendar+countdown chain has another wakeup — no calendar "
+            f"warning (R2#4): {sch_records[n_r2c:]}"
+        )
+        _vc({"name": "hazards",
+             "conditions": [
+                 {"id": cd_g, "type": "calendar", "entity_id": "calendar.x",
+                  "hours": 2},
+                 {"id": tl_w, "type": "tally",
+                  "count_conditions": [cd_g], "reset_conditions": []},
+             ],
+             "triggers": [{"id": "trg_" + "2" * 32, "type": "state",
+                           "entity_id": "switch.c",
+                           "routes": {"conditions": []}}],
+             "outputs": [{"name": "o", "type": "switch", "entity_id": hz_o1,
+                          "on_conditions": [tl_w], "off_conditions": []}]})
+        assert sum("日历条件" in r for r in sch_records[n_r2c:]) == 1, (
+            f"a calendar+tally chain has no other wakeup — the calendar "
+            f"warning must fire: {sch_records[n_r2c:]}"
+        )
     finally:
         sch_logger.removeHandler(_sch_handler)
     print(
@@ -4644,6 +4721,47 @@ async def main():
     assert eng_st.stateful_values()[st_tl]["count"] == 0  # reset already fired
     print("[PASS] stateful engine: edge/level, reset-wins, zero polarity, latch flip-back, no self-wakeup")
 
+    # R2#2: a never-acted tally stays ENTRY-FREE — the verdict key is only
+    # written on a change, so the first-movement guard keeps its meaning
+    # (pre-fix every tally dropped a {verdict:False} entry on first sight)
+    eng_tl = ConditionEngine(
+        _Hass(), json.loads(json.dumps(_st_cfg(with_snap=False)["conditions"]))
+    )
+    eng_tl.hass.states._d["switch.c"] = "off"  # count/consume gates low
+    await eng_tl.step_stateful()
+    assert not any(
+        nid in eng_tl.stateful_values() for nid in (st_cd, st_qt, st_tl)
+    ), (
+        f"no-action stateful nodes must not create fifth-table entries: "
+        f"{eng_tl.stateful_values()}"
+    )
+    # counterface: a rising count gate DOES land the entry (verdict + count)
+    eng_tl.hass.states._d["switch.c"] = "on"
+    await eng_tl.step_stateful()
+    assert eng_tl.stateful_values()[st_tl] == {
+        "count": 1, "verdict": True, "prev_gate": True, "prev_reset": False,
+    }, eng_tl.stateful_values()[st_tl]
+    print("[PASS] stateful R2#2: no-action tally stays entry-free, acting tally lands")
+
+    # R2#5: quota parameter tuning — a persisted remaining above a LOWERED
+    # times clamps down on the next step and writes through
+    # (X=5 用 1 → 改 X=2 → seed remaining=4 → 2)
+    eng_cl = ConditionEngine(
+        _Hass(), json.loads(json.dumps(_st_cfg(with_snap=False)["conditions"]))
+    )
+    eng_cl.hass.states._d["switch.c"] = "off"  # no consume edge this step
+    eng_cl._stateful_values[st_qt] = {
+        "remaining": 4, "verdict": True,
+        "prev_gate": False, "prev_reset": False,
+    }
+    ev_cl = await eng_cl.step_stateful()
+    assert eng_cl.stateful_values()[st_qt]["remaining"] == 2, (
+        f"remaining must clamp to the lowered times: "
+        f"{eng_cl.stateful_values()[st_qt]}"
+    )
+    assert ev_cl.get(st_qt, {}).get("flipped") is False, ev_cl
+    print("[PASS] stateful R2#5: lowered times clamps the persisted remaining")
+
     # controller level: the deadline flip drives the output in ONE cycle and
     # the snapshot capture gate reading the countdown converges same-cycle
     # (the F-427 mirror — without the re-step the capture would wait for a
@@ -4665,8 +4783,76 @@ async def main():
         "the SAME cycle (F-427 mirror)"
     )
     assert hub_stc.stateful_states["ctrl_stful01"][st_cd]["verdict"] is True
+    # R2#9 + F-461 read faces: runtime_snapshot mirrors the fifth table
+    # (deadline ISO) and the snapshot latch values
+    rt = mgr_stc.runtime_snapshot()
+    assert rt["stateful"][st_cd]["verdict"] is True, rt["stateful"]
+    assert isinstance(rt["stateful"][st_cd]["deadline"], str), rt["stateful"]
+    assert rt["snapshots"].get(st_snap) == 16.7, rt["snapshots"]
     mgr_stc.async_unload()
     print("[PASS] stateful controller: zero-cross latch drives output + snapshot gate converges same-cycle")
+
+    # R2#3: a convergence re-step capture reaches the decision log — the
+    # countdown zero-cross flips the verdict inside the stateful pass, the
+    # snapshot capture fires in the RE-step, and the cycle's log must carry
+    # the decision=capture row (pre-fix only first-pass snap events logged)
+    cfg_log = json.loads(json.dumps(st_valid))
+    cfg_log["logging_enabled"] = True
+    hass_lg = _Hass()
+    hub_lg = ScannerHub(hass_lg)
+    hass_lg.data["sensor_switch_controller"] = hub_lg
+    mgr_lg = ControllerManager(hass_lg, "ctrl_stful06", cfg_log)
+    mgr_lg.register_entity(st_out, _Entity("switch.out_lg"))
+    recs_lg = _log_cycles("ctrl_stful06")
+    await mgr_lg._async_evaluate(None, ["init"], None)  # starts the countdown
+    assert not [
+        r for r in _log_tail(recs_lg, "ctrl_stful06")
+        if r.get("decision") == "capture"
+    ], "a running countdown must not capture yet"
+    _advance_utc(120)
+    await mgr_lg._async_evaluate(None, ["zero"], None)
+    caps_lg = [
+        r for r in _log_tail(recs_lg, "ctrl_stful06")
+        if r.get("decision") == "capture"
+    ]
+    assert len(caps_lg) == 1, (
+        f"the convergence re-step capture must land a decision=capture row: "
+        f"{caps_lg}"
+    )
+    mgr_lg.async_unload()
+    print("[PASS] stateful R2#3: convergence re-step capture reaches the decision log")
+
+    # R2#8: the two non-trigger entrances step the stateful table too
+    # (three entrances unified — deleting either _step_stateful_and_persist
+    # call would leave the fifth table empty and these pins red)
+    hass_d1 = _Hass()
+    hub_d1 = ScannerHub(hass_d1)
+    hass_d1.data["sensor_switch_controller"] = hub_d1
+    mgr_d1 = ControllerManager(
+        hass_d1, "ctrl_stful07", json.loads(json.dumps(st_valid))
+    )
+    mgr_d1.register_entity(st_out, _Entity("switch.out_d1"))
+    await mgr_d1.async_evaluate_with_details()
+    assert hub_d1.stateful_states["ctrl_stful07"][st_qt]["remaining"] == 1, (
+        "the details entrance must consume the quota (stateful stepped)"
+    )
+    assert hub_d1.stateful_states["ctrl_stful07"][st_cd]["deadline"], (
+        "the details entrance must start the countdown"
+    )
+    mgr_d1.async_unload()
+    hass_d2 = _Hass()
+    hub_d2 = ScannerHub(hass_d2)
+    hass_d2.data["sensor_switch_controller"] = hub_d2
+    mgr_d2 = ControllerManager(
+        hass_d2, "ctrl_stful08", json.loads(json.dumps(st_valid))
+    )
+    mgr_d2.register_entity(st_out, _Entity("switch.out_d2"))
+    await mgr_d2.async_evaluate_output(st_out)
+    assert hub_d2.stateful_states["ctrl_stful08"][st_qt]["remaining"] == 1, (
+        "the service entrance must consume the quota (stateful stepped)"
+    )
+    mgr_d2.async_unload()
+    print("[PASS] stateful R2#8: details/service entrances step the fifth table")
 
     # persistence / restart wall-clock 续走: the stored deadline is an
     # absolute instant — a rebuilt manager continues to zero by wall-clock
@@ -4768,6 +4954,52 @@ async def main():
     assert "ctrl_stful05" not in hub_l.stateful_states
     print("[PASS] stateful hub: 0.13.0 payload silent, bad values self-heal, drop pairs")
 
+    # R2#1 (P2): naive ISO deadline — a hand-edited offset-less store value
+    # must load (normalized to UTC at the manager's single tz gate), seed
+    # the engine AWARE, and the evaluation cycle must run instead of
+    # TypeError-ing on the aware/naive compare. The stub clock is naive by
+    # default — this pin explicitly aware-ifies clock + as_utc for the run.
+    _dtmod = sys.modules["homeassistant.util.dt"]
+    _saved_as_utc = _dtmod.as_utc
+    _saved_utc = _clock["utc"]
+    _dtmod.as_utc = lambda v: (
+        v.replace(tzinfo=timezone.utc)
+        if v is not None and getattr(v, "tzinfo", None) is None
+        else v
+    )
+    _clock["utc"] = _saved_utc.replace(tzinfo=timezone.utc)
+    try:
+        hub_nz = ScannerHub(_Hass())
+        hub_nz._flag_store = _StStore()
+        hub_nz._flag_store.load_result = {
+            "flags": {}, "last_flip": {}, "snapshots": {}, "snapshot_gates": {},
+            "stateful": {"ctrl_stful10": {
+                st_cd: {"verdict": False, "deadline": "2026-10-06T02:00:00",
+                        "prev_gate": True, "prev_reset": False},
+            }},
+        }
+        await hub_nz.async_load_flag_states()
+        hass_nz = _Hass()
+        hass_nz.data["sensor_switch_controller"] = hub_nz
+        mgr_nz = ControllerManager(
+            hass_nz, "ctrl_stful10", json.loads(json.dumps(st_valid))
+        )
+        seeded_dl = mgr_nz.engine.stateful_values()[st_cd]["deadline"]
+        assert seeded_dl is not None and seeded_dl.tzinfo is not None, (
+            f"the load ladder must normalize a naive deadline at its single "
+            f"tz gate: {seeded_dl!r}"
+        )
+        mgr_nz.register_entity(st_out, _Entity("switch.out_nz"))
+        await mgr_nz._async_evaluate(None, ["init"], None)  # must not TypeError
+        assert mgr_nz.engine.stateful_values()[st_cd]["verdict"] is True, (
+            "a naive past deadline must latch on the first cycle"
+        )
+        mgr_nz.async_unload()
+    finally:
+        _dtmod.as_utc = _saved_as_utc
+        _clock["utc"] = _saved_utc
+    print("[PASS] stateful R2#1: naive deadline seeds aware, cycle runs, latch fires")
+
     # store version epoch: v9 with an empty v8→v9 controller chain — a real
     # 0.13.0-shaped payload migrates and still validates (教训 R2: 迁移产物
     # →validate 全链冒烟)
@@ -4851,7 +5083,24 @@ async def main():
     )
     _cfg_cap["conditions"][5]["capture"] = [_dur_id]
     validate_controller(_cfg_cap)  # one-shot self-reset via abort stays legal
-    print("[PASS] stateful schema: self-ref/dead-gate/route/params rejected, F-459 pair split")
+    # R2#8: the same abort split for a stateful reset gate — the RESET gate
+    # self-reads through the duration abort input (rejected); the PRIMARY
+    # gate keeps the one-shot self-reset legal
+    _cfg_cdr = json.loads(json.dumps(st_valid))
+    _cfg_cdr["conditions"].append(
+        {"id": _dur_id, "type": "duration", "label": "", "enabled": True,
+         "seconds": 5, "start": "cond_" + "a" * 32, "abort": st_cd}
+    )
+    _cfg_cdr["conditions"][0]["reset_conditions"] = [_dur_id]
+    _st_fail(_cfg_cdr, "引用了自身")
+    _cfg_cds = json.loads(json.dumps(st_valid))
+    _cfg_cds["conditions"].append(
+        {"id": _dur_id, "type": "duration", "label": "", "enabled": True,
+         "seconds": 5, "start": "cond_" + "a" * 32, "abort": st_cd}
+    )
+    _cfg_cds["conditions"][0]["start_conditions"] = [_dur_id]
+    validate_controller(_cfg_cds)  # primary-gate one-shot self-reset legal
+    print("[PASS] stateful schema: self-ref/dead-gate/route/params rejected, F-459+R2#8 abort pairs split")
 
 asyncio.run(main())
 print("SMOKE OK")

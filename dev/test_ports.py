@@ -53,6 +53,12 @@ _PORTS_HTML = """<!doctype html>
           seconds: 5, start: "cond_gate", abort: null },
         { id: "cond_flag", type: "flag", label: "f", enabled: true,
           set_conditions: ["cond_gate"], reset_conditions: [], initial: false },
+        { id: "cond_cdw", type: "countdown", label: "cd", enabled: true,
+          seconds: 60, start_conditions: ["cond_gate"], reset_conditions: [] },
+        { id: "cond_qta", type: "quota", label: "qt", enabled: true,
+          times: 2, consume_conditions: ["cond_gate"], reset_conditions: [] },
+        { id: "cond_tly", type: "tally", label: "tl", enabled: true,
+          count_conditions: ["cond_gate"], reset_conditions: [] },
         { id: "cond_grp", type: "or", label: "grp", enabled: true,
           conditions: ["cond_gate"] },
       ],
@@ -118,6 +124,14 @@ PORT_CHECKS = [
     (".cond-snapshot .input_2", True),
     (".cond-compare .input_1", True),
     (".cond-compare .input_2", True),
+    # 0.14.0 stateful gate/reset ports (WHA-STATEFUL-123 R2#7): visible —
+    # the CSS :not() exemption chain and the admission JS must agree
+    (".cond-countdown .input_1", True),
+    (".cond-countdown .input_2", True),
+    (".cond-quota .input_1", True),
+    (".cond-quota .input_2", True),
+    (".cond-tally .input_1", True),
+    (".cond-tally .input_2", True),
     # legacy live faces stay visible (regression guard)
     (".cond-duration .input_1", True),
     (".cond-flag .input_2", True),
@@ -164,7 +178,7 @@ def main():
             nodes = page.evaluate(
                 "() => %s.querySelectorAll('.drawflow .wha-node').length" % canvas
             )
-            assert nodes >= 7, f"canvas did not import the config nodes: {nodes}"
+            assert nodes >= 10, f"canvas did not import the config nodes: {nodes}"
             print(f"[canvas] editor imported {nodes} nodes from the config")
 
             for selector, expect in PORT_CHECKS:
@@ -192,6 +206,20 @@ def main():
             )
             print("[port] .cond-literal exposes no input ports (as designed)")
 
+            # stateful nodes are non-signal types — input_3 (the signal
+            # port) must not exist at all, same absence face as literal's
+            # inputs (R2#7)
+            st_ports = page.evaluate(
+                "() => %s.querySelectorAll("
+                "'.drawflow .cond-countdown .input_3, "
+                ".drawflow .cond-quota .input_3, "
+                ".drawflow .cond-tally .input_3').length" % canvas
+            )
+            assert st_ports == 0, (
+                f"stateful nodes must expose no signal port, found {st_ports}"
+            )
+            print("[port] stateful nodes expose no input_3 (non-signal types)")
+
             # palette path: a freshly added snapshot node keeps visible ports
             added = page.evaluate(
                 "() => { const c = %s; const before = c.querySelectorAll('.cond-snapshot').length;"
@@ -209,6 +237,31 @@ def main():
                 f"palette-added snapshot node input_1 not visible: {vis}"
             )
             print("[palette] freshly added snapshot node has a visible input_1")
+
+            # palette path for the stateful trio (R2#7): freshly added
+            # countdown/quota/tally nodes keep visible gate ports
+            for tp in ("countdown", "quota", "tally"):
+                added = page.evaluate(
+                    "([tp]) => { const c = %s;"
+                    " const before = c.querySelectorAll('.cond-' + tp).length;"
+                    " c.querySelector('[data-add-cond=\"' + tp + '\"]').click();"
+                    " return c.querySelectorAll('.cond-' + tp).length - before; }"
+                    % canvas,
+                    [tp],
+                )
+                assert added == 1, f"palette click did not add a {tp} node: {added}"
+                page.wait_for_timeout(200)
+                vis = page.evaluate(
+                    "([tp]) => { const all = %s.querySelectorAll("
+                    "'.drawflow .cond-' + tp + ' .input_1');"
+                    " const el = all[all.length - 1];"
+                    " return el ? el.offsetParent !== null : null; }" % canvas,
+                    [tp],
+                )
+                assert vis is True, (
+                    f"palette-added {tp} node input_1 not visible: {vis}"
+                )
+                print(f"[palette] freshly added {tp} node has a visible input_1")
 
             # R4-1 canvas badge face: navigate to the join controller and
             # check the dead badges — the entity-coverage join keeps a

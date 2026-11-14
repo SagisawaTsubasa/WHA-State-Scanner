@@ -1309,9 +1309,10 @@ def _warn_static_hazards(
         conditions, outputs, out_ids, eval_chains, True, respect_enabled=True
     )
     # wall-clock wakeup types (R3#1): computed by next_wakeup from pure
-    # clock/state timestamps, no evaluation-time timer involved. COND_DURATION
-    # and `for` gates are deliberately absent — they are evaluation-born
-    # (see the wakeup arm below and live_reach above).
+    # clock/state timestamps, no evaluation-time timer involved. COND_DURATION,
+    # `for` gates and COND_COUNTDOWN are deliberately absent — they are
+    # evaluation-born (a countdown's deadline exists only once its start
+    # gate was evaluated; see the wakeup arm below and live_reach above).
     wall_clock_types = {COND_TIME, COND_SUN, COND_DEBOUNCE, COND_COOLDOWN}
     # R4-1 entity-coverage join: compare nodes whose entity end an ENABLED
     # state trigger listens to — the runtime routing index pulls their
@@ -1415,6 +1416,10 @@ def _warn_static_hazards(
             # subtree containing one still wakes); duration/`for` gates
             # qualify only from the live set (a timer exists only if its
             # gate was evaluated). Enabled still filters both tiers.
+            # R2#4: countdown joins the live tier — a running countdown
+            # self-wakes at its deadline (next_wakeup offers it), so it is
+            # an armable-timer source like duration/`for`, not a frozen
+            # latch like flag/snapshot.
             # R4-1 third tier: the entity-coverage join — a compare whose
             # entity end an ENABLED state trigger listens to is woken by
             # that trigger (the runtime routing index does the same join,
@@ -1425,6 +1430,7 @@ def _warn_static_hazards(
                 and (by_id.get(cid, {}).get("type") in wall_clock_types
                      or (cid in live_ids
                          and (by_id.get(cid, {}).get("type") == COND_DURATION
+                              or by_id.get(cid, {}).get("type") == COND_COUNTDOWN
                               or by_id.get(cid, {}).get("for"))))
                 or cid in wakeup_covered
                 or cid in entity_end_covered
@@ -1467,7 +1473,9 @@ def _warn_static_hazards(
         # ⑤ no-wakeup-source face (R5-6, closes the data-node hazard
         # ledger item): the output's chain carries nothing that can ever
         # flip on its own or be woken — no wall-clock gate, no live
-        # duration/`for` timer, no enabled trigger's signal coverage, no
+        # duration/`for`/countdown timer (R2#4: a running countdown
+        # self-wakes at its deadline), no enabled trigger's signal
+        # coverage, no
         # entity-end join. The output evaluates once at startup and then
         # only on manual evaluate. Same two-tier set discipline as face ②
         # (R3#1): wall-clock/calendar gates qualify from the TOPOLOGICAL
@@ -1499,6 +1507,7 @@ def _warn_static_hazards(
                 or (cid in live_ids
                     and by_id.get(cid, {}).get("enabled") is not False
                     and (by_id.get(cid, {}).get("type") == COND_DURATION
+                         or by_id.get(cid, {}).get("type") == COND_COUNTDOWN
                          or by_id.get(cid, {}).get("for")))
                 or cid in wakeup_covered
                 or cid in entity_end_covered

@@ -480,9 +480,16 @@ class ConditionEngine:
                     new_entry["deadline"] = now + timedelta(seconds=seconds)
             elif kind == COND_QUOTA:
                 times = int(cond.get("times", 1))
-                remaining = (
-                    entry.get("remaining", times) if entry else times
+                # 调参夹取 (R2#5): a persisted remaining above a LOWERED
+                # times must not keep spending the old budget — clamp every
+                # read and write the clamped value through when it moved so
+                # the store never carries an over-budget number.
+                remaining = min(
+                    int(entry.get("remaining", times)) if entry else times,
+                    times,
                 )
+                if entry is not None and entry.get("remaining") != remaining:
+                    new_entry["remaining"] = remaining
                 if reset_rise:
                     new_entry["remaining"] = times  # 恢复满 X (verdict holds)
                 elif gate_rise:
@@ -493,7 +500,13 @@ class ConditionEngine:
                         new_entry["verdict"] = False  # 剩余=0 → 拦截
             else:  # COND_TALLY
                 count = entry.get("count", 0) if entry else 0
-                new_entry["verdict"] = gate_now  # 透传：出口随门电平
+                # 透传：出口随门电平 — the verdict key is written only on a
+                # CHANGE (a missing key reads as False, the seed default) so
+                # a never-acted tally stays entry-free and the first-movement
+                # guard below keeps its meaning (R2#2); the count/reset
+                # actions are unchanged.
+                if gate_now != (bool(entry.get("verdict")) if entry else False):
+                    new_entry["verdict"] = gate_now
                 if reset_rise:
                     new_entry["count"] = 0  # 归零（同拍优先于计数）
                 elif gate_rise:
@@ -502,12 +515,16 @@ class ConditionEngine:
             if kind == COND_COUNTDOWN:
                 # 归零即锁存 true — checked for every countdown every cycle
                 # (a running deadline crossing zero needs no gate edge; the
-                # directed wakeup at the deadline guarantees this step runs)
+                # directed wakeup at the deadline guarantees this step runs).
+                # as_utc is the LAST line of defense only (R2#1, 教训 R7):
+                # the manager's load ladder normalizes naive deadlines at
+                # its single tz gate — an aware/naive mix here would
+                # TypeError the whole evaluation cycle.
                 deadline = new_entry.get("deadline")
                 if (
                     deadline is not None
                     and not new_entry.get("verdict")
-                    and now >= deadline
+                    and now >= dt_util.as_utc(deadline)
                 ):
                     new_entry["verdict"] = True
 

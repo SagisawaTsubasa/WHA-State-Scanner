@@ -164,7 +164,10 @@ class ControllerManager:
         # difference (倒计时按 wall-clock 差值继续走到零). A malformed
         # deadline nulls itself loudly and KEEPS the rest of the entry (a
         # hand-edited field must not unlatch the node); the hub load ladder
-        # already dropped wrong-typed fields, this pass handles str→datetime.
+        # already dropped wrong-typed fields, this pass handles str→datetime
+        # (an offset-less naive ISO is ACCEPTED and normalized to UTC here —
+        # the single tz gate for this field, R2#1 / 教训 R7: naive is
+        # salvageable data, not a bad value).
         saved_stateful: dict[str, dict] = {}
         if hub is not None:
             for nid, entry in (
@@ -188,6 +191,11 @@ class ControllerManager:
                             clean["deadline"],
                         )
                         clean["deadline"] = None
+                    elif parsed.tzinfo is None:
+                        # R2#1: normalize the naive form right here — the
+                        # engine compares against aware utcnow and a naive
+                        # deadline would TypeError every cycle
+                        clean["deadline"] = dt_util.as_utc(parsed)
                     else:
                         clean["deadline"] = parsed
                 saved_stateful[nid] = clean
@@ -713,7 +721,7 @@ class ControllerManager:
             # stale stored verdict would swallow the next rising edge after
             # a rebuild
             self._persist_gates_if_changed(gates_before)
-        await self._step_stateful_and_persist(targets)
+        restep_snaps = await self._step_stateful_and_persist(targets)
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -737,7 +745,12 @@ class ControllerManager:
             records.append(record)
 
         if self.logging_enabled:
-            snap_records = self._snapshot_log_records(snap_events)
+            # R2#3: merge the convergence re-step's snapshot events into
+            # the same cycle's log rows — a capture fired by a stateful
+            # flip in the re-step used to be persisted but never logged
+            snap_records = self._snapshot_log_records(
+                {**snap_events, **restep_snaps}
+            )
             if records or snap_records:
                 await self.logger.log_cycle(records + snap_records)
 
@@ -830,10 +843,15 @@ class ControllerManager:
                 "Failed persisting snapshot gates for %s", self.controller_id
             )
 
-    async def _step_stateful_and_persist(self, targets: set[str] | None) -> None:
+    async def _step_stateful_and_persist(
+        self, targets: set[str] | None
+    ) -> dict[str, dict]:
         """Run the stateful step (0.14.0) with its persistence and the
         same-cycle convergence re-steps — shared by every evaluation entry
         point so engine state is never stepped differently per path.
+        Returns the re-step's snapshot events ({} when none) so callers can
+        merge them into their decision-log records (R2#3: a convergence
+        capture/clear used to be persisted but never logged).
 
         Call AFTER the flag/snapshot pass. Action events (verdict flips,
         countdown start/reset/zero, consumes, counts) persist immediately
@@ -852,7 +870,7 @@ class ControllerManager:
         st_events = await self.engine.step_stateful()
         if not st_events:
             self._persist_stateful_if_changed(st_before)
-            return
+            return {}
         await self._persist_stateful()
         if targets is not None:
             for nid, ev in st_events.items():
@@ -879,6 +897,7 @@ class ControllerManager:
                         targets |= self._cond_to_outs.get(fid) or set()
         else:
             self._persist_gates_if_changed(gates_before)
+        return snap_events
 
     def _stateful_payload(self) -> dict:
         """Engine stateful values → the JSON-safe store shape: the countdown
@@ -1085,6 +1104,14 @@ class ControllerManager:
             "last_cycle": self.last_cycle,
             "triggers": len(self.triggers),
             "trigger_errors": self.trigger_manager.register_errors,
+            # R2#9 + F-461 minimal read faces: the fifth-table runtime
+            # mirror (deadline ISO via _stateful_payload, everything else
+            # verbatim) and the snapshot latch values — tally counts, quota
+            # remaining, countdown deadlines and latched snapshot values
+            # have no other read surface (the panel renders none of them
+            # yet; scripts / future views read them from /config runtime).
+            "stateful": self._stateful_payload(),
+            "snapshots": dict(self.engine.snapshots()),
         }
 
     async def async_evaluate_with_details(self) -> dict:
@@ -1112,7 +1139,7 @@ class ControllerManager:
                 await self._persist_flag_states()
         else:
             self._persist_gates_if_changed(gates_before)  # R2-1
-        await self._step_stateful_and_persist(None)
+        restep_snaps = await self._step_stateful_and_persist(None)
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
         records: list[dict] = []
@@ -1136,7 +1163,10 @@ class ControllerManager:
                 conditions.update((details or {}).get(key) or {})
 
         if self.logging_enabled:
-            snap_records = self._snapshot_log_records(snap_events)
+            # R2#3: same merge as _async_evaluate_locked
+            snap_records = self._snapshot_log_records(
+                {**snap_events, **restep_snaps}
+            )
             if records or snap_records:
                 await self.logger.log_cycle(records + snap_records)
 
@@ -1256,7 +1286,7 @@ class ControllerManager:
                     await self._persist_flag_states()
             else:
                 self._persist_gates_if_changed(gates_before)  # R2-1
-            await self._step_stateful_and_persist(None)
+            restep_snaps = await self._step_stateful_and_persist(None)
             try:
                 record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:
@@ -1265,7 +1295,10 @@ class ControllerManager:
                 )
                 return
             if self.logging_enabled:
-                snap_records = self._snapshot_log_records(snap_events)
+                # R2#3: same merge as _async_evaluate_locked
+                snap_records = self._snapshot_log_records(
+                    {**snap_events, **restep_snaps}
+                )
                 if record or snap_records:
                     await self.logger.log_cycle(
                         ([record] if record else []) + snap_records
