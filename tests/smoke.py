@@ -4088,6 +4088,47 @@ async def main():
         assert len(sch_records) == n_off, (
             f"an on-chain cooldown is legitimate — no warning: {sch_records}"
         )
+        # ①k (0.15.0 face ① narrowing): a cooldown that reaches the off
+        # chain ONLY through a duration's start edge (on=and[leaf, cooldown]
+        # arming the duration whose gate hangs on the off chain) must NOT
+        # warn — the cooldown never gates the off verdict itself there, so
+        # the off-side polarity trap cannot exist. Group-member expansion
+        # onto an off chain keeps warning (the trap is real there).
+        n_start_edge = len(sch_records)
+        hz_c3 = "cond_" + "c" * 32
+        hz_c4 = "cond_" + "d" * 32
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": hz_c2, "type": "cooldown", "seconds": 30},
+            {"id": hz_c3, "type": "and", "conditions": [hz_c1, hz_c2]},
+            {"id": hz_c4, "type": "duration", "seconds": 60,
+             "start": hz_c3, "abort": None},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c3], "off_conditions": [hz_c4]},
+        ]})
+        assert len(sch_records) == n_start_edge, (
+            "a cooldown arming a duration.start lives on the on side — the "
+            "off-chain drag-in must not warn (0.15.0 face ① narrowing): "
+            f"{sch_records[n_start_edge:]}"
+        )
+        hz_c5 = "cond_" + "f" * 32
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": hz_c2, "type": "cooldown", "seconds": 30},
+            {"id": hz_c5, "type": "and", "conditions": [hz_c2]},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1], "off_conditions": [hz_c5]},
+        ]})
+        assert sum("off 条件链" in r
+                   for r in sch_records[n_start_edge:]) == 1, (
+            "a cooldown expanded through group members onto an off chain "
+            "still warns (face ① keeps the real trap covered): "
+            f"{sch_records[n_start_edge:]}"
+        )
         # ② route to an unreachable condition → warning (a legal leaf no
         # output chain reaches — wired on the canvas, wakes nothing)
         orphan_c = "cond_" + "e" * 32

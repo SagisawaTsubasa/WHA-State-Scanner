@@ -1137,6 +1137,7 @@ def _reachable_from_chains(
     chain_keys: tuple[str, ...],
     include_flag_edges: bool,
     respect_enabled: bool = False,
+    follow_gate_inputs: bool = True,
 ) -> dict[str, set[str]]:
     """Per-output reachable condition ids from the named output chains.
 
@@ -1148,6 +1149,15 @@ def _reachable_from_chains(
     ``True`` mirrors the runtime routing index —
     controller._build_route_index walks the same edge set — for the
     trigger-target reachability warning, so the two can never drift.
+
+    ``follow_gate_inputs=False`` additionally skips the duration
+    start/abort input edges (0.15.0, face ① narrowing): the walk then
+    expands GROUP MEMBERSHIP only, so a cooldown that arms a duration's
+    start from the on side (on=and[leaf, cooldown] feeding a duration
+    whose gate hangs on the off chain) is no longer dragged onto the off
+    chain — the cooldown never gates the off verdict itself there, so the
+    off-side polarity trap cannot exist. Only face ① uses this; the
+    routing/wakeup faces must keep the full evaluation edge set.
 
     ``respect_enabled=True`` prunes every DISABLED condition's outgoing
     edges (the node itself stays reachable — the engine short-circuits it
@@ -1187,10 +1197,11 @@ def _reachable_from_chains(
             stack.extend(
                 m for m in cond.get("conditions") or [] if isinstance(m, str)
             )
-            for ref_key in (CONF_START, CONF_ABORT):
-                ref = cond.get(ref_key)
-                if isinstance(ref, str):
-                    stack.append(ref)
+            if follow_gate_inputs:
+                for ref_key in (CONF_START, CONF_ABORT):
+                    ref = cond.get(ref_key)
+                    if isinstance(ref, str):
+                        stack.append(ref)
             # compare a/b cond references walk with the evaluation edges
             # (0.13.0) — the routing index (_build_route_index) walks the
             # same set, so the two cannot drift
@@ -1236,7 +1247,12 @@ def _warn_static_hazards(
     batch was filed for): with no flip history the cooldown reads True, and
     while the output is already off an off verdict applies nothing and so
     never records a flip — the constant True then out-ranks the on-chain
-    forever (off wins first). ② an output whose only gate is a calendar
+    forever (off wins first). Since 0.15.0 the reachable face is GROUP
+    MEMBERSHIP expansion only (duration start/abort input edges are not
+    followed): a cooldown that arms a duration's start from the on side is
+    not dragged onto the off chain — it never gates the off verdict there,
+    so the trap cannot exist (the on-branch arming shape stays legitimate,
+    e.g. the drying branch's anti-short-cycle cooldown).② an output whose only gate is a calendar
     (F-320): calendar boundaries raise no HA event, wakeups are best-effort.
     ③ a trigger route wired to a condition no output can reach (F-326) —
     silently evaluates nothing while the panel still shows it wired. ④ an
@@ -1280,10 +1296,15 @@ def _warn_static_hazards(
     # keeps the disabled node itself reachable and prunes only its outgoing
     # edges — a cooldown or empty group chained DIRECTLY to an output is
     # still reached and still warns exactly as before (faces ①/④), while
-    # members buried in a disabled subtree stop being judged.
+    # members buried in a disabled subtree stop being judged. Since
+    # 0.15.0 face ① judges the GROUP-MEMBERSHIP expansion only
+    # (follow_gate_inputs=False): a cooldown that arms a duration's start
+    # from the on side is not dragged onto the off chain (the on-branch
+    # arming shape is legitimate — the cooldown never gates the off
+    # verdict itself).
     off_reach = _reachable_from_chains(
         conditions, outputs, out_ids, ("off_conditions",), False,
-        respect_enabled=True,
+        respect_enabled=True, follow_gate_inputs=False,
     )
     chain_reach = _reachable_from_chains(
         conditions, outputs, out_ids, eval_chains, False,
