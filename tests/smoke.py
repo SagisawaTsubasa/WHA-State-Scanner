@@ -2973,8 +2973,9 @@ async def main():
         "ctrl_ab12cd34", {sn_num: 16.7, "k": "on"}, {sn_num: True}
     )
     payload13 = hub_p13._flag_store.saved[-1]
+    # 0.14.0: the fifth runtime table (stateful) rides every save
     assert set(payload13) == {
-        "flags", "last_flip", "snapshots", "snapshot_gates",
+        "flags", "last_flip", "snapshots", "snapshot_gates", "stateful",
     }, payload13
     assert payload13["snapshot_gates"] == {"ctrl_ab12cd34": {sn_num: True}}
     hub_p13._flag_store.load_result = payload13

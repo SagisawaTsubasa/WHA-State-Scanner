@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.const import CONF_ENTITY_ID
@@ -39,6 +40,8 @@ from .const import (
     CONF_CAPTURE,
     CONF_CLEAR,
     CONF_CONDITIONS,
+    CONF_CONSUME_CONDITIONS,
+    CONF_COUNT_CONDITIONS,
     CONF_INPUT_A,
     CONF_INPUT_B,
     CONF_LOGGING,
@@ -47,6 +50,7 @@ from .const import (
     CONF_ROUTES,
     CONF_SET_CONDITIONS,
     CONF_START,
+    CONF_START_CONDITIONS,
     CONF_TRIGGERS,
     COND_COMPARE,
     COND_SNAPSHOT,
@@ -154,6 +158,37 @@ class ControllerManager:
                 else:
                     value = entry  # legacy bare scalar: origin unknown
                 saved_snapshots[sid] = value
+        # Stateful node seeding (0.14.0): the stored value dicts carry the
+        # countdown deadline as an ISO string — the manager converts it to
+        # a datetime for the engine, so a restart continues by wall-clock
+        # difference (倒计时按 wall-clock 差值继续走到零). A malformed
+        # deadline nulls itself loudly and KEEPS the rest of the entry (a
+        # hand-edited field must not unlatch the node); the hub load ladder
+        # already dropped wrong-typed fields, this pass handles str→datetime.
+        saved_stateful: dict[str, dict] = {}
+        if hub is not None:
+            for nid, entry in (
+                hub.stateful_states.get(controller_id) or {}
+            ).items():
+                if not isinstance(entry, dict):
+                    continue  # hub ladder already dropped non-objects
+                clean = dict(entry)
+                if clean.get("deadline") is not None:
+                    try:
+                        parsed = dt_util.parse_datetime(clean["deadline"])
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if parsed is None:
+                        _LOGGER.warning(
+                            "Controller %s: nulling malformed stateful "
+                            "deadline for node %s (%r) — the countdown "
+                            "restarts idle; the other fields are kept",
+                            controller_id,
+                            nid,
+                            clean["deadline"],
+                        )
+                        clean["deadline"] = None
+                saved_stateful[nid] = clean
         self.engine = ConditionEngine(
             hass,
             self.conditions,
@@ -167,6 +202,11 @@ class ControllerManager:
             # overwrite the latched value with the CURRENT reading.
             snapshot_values=saved_snapshots,
             snapshot_gates=saved_gates,
+            # stateful node values ride the fifth runtime table (0.14.0):
+            # seeded here (deadlines converted), written back on actions
+            # (_persist_stateful) and on prev-gate movements
+            # (_persist_stateful_if_changed).
+            stateful_values=saved_stateful,
         )
         # trigger-logic groups: groups named by any trigger's signal coverage.
         # Coverage is topological (0.7.3 F-151 resolution, superseding the
@@ -394,6 +434,12 @@ class ControllerManager:
                     CONF_RESET_CONDITIONS,
                     CONF_CAPTURE,
                     CONF_CLEAR,
+                    # stateful gate edges (0.14.0): same story as the flag/
+                    # snapshot edges — without them a stateful-driven chain's
+                    # gate leaves drop out of the routing index
+                    CONF_START_CONDITIONS,
+                    CONF_CONSUME_CONDITIONS,
+                    CONF_COUNT_CONDITIONS,
                 ):
                     for member in cond.get(key) or []:
                         if isinstance(member, str):
@@ -665,6 +711,7 @@ class ControllerManager:
             # stale stored verdict would swallow the next rising edge after
             # a rebuild
             self._persist_gates_if_changed(gates_before)
+        await self._step_stateful_and_persist(targets)
         source_desc = ", ".join(sources or ["unknown"])
 
         records: list[dict] = []
@@ -779,6 +826,115 @@ class ControllerManager:
             # verdicts stay authoritative; the next moving cycle retries
             _LOGGER.exception(
                 "Failed persisting snapshot gates for %s", self.controller_id
+            )
+
+    async def _step_stateful_and_persist(self, targets: set[str] | None) -> None:
+        """Run the stateful step (0.14.0) with its persistence and the
+        same-cycle convergence re-steps — shared by every evaluation entry
+        point so engine state is never stepped differently per path.
+
+        Call AFTER the flag/snapshot pass. Action events (verdict flips,
+        countdown start/reset/zero, consumes, counts) persist immediately
+        and widen ``targets`` with the flipped nodes' outputs (same story
+        as flag flips); prev-gate-only movements sync via the debounced
+        if-changed compare (the snapshot-gates split, F-434/R2-1). The
+        stateful verdicts moved in this pass are read by flag/snapshot
+        gates one pass LATE, so the readers re-step here (the F-427/R1-2
+        mirror, bounded like the main pass): flags first, then snapshots —
+        which may fire new events and earn ONE more flag pass. The residual
+        depth-2 staleness (a stateful gate reading a snapshot that captured
+        in the re-step) is the same accepted shortcut class as the
+        snapshot-vs-snapshot config-order read (step_snapshots docstring).
+        """
+        st_before = self._stateful_payload()
+        st_events = await self.engine.step_stateful()
+        if not st_events:
+            self._persist_stateful_if_changed(st_before)
+            return
+        await self._persist_stateful()
+        if targets is not None:
+            for nid, ev in st_events.items():
+                if ev.get("flipped"):
+                    targets |= self._cond_to_outs.get(nid) or set()
+        reflipped = await self.engine.step_flags()
+        if reflipped:
+            await self._persist_flag_states()
+            if targets is not None:
+                for fid in reflipped:
+                    targets |= self._cond_to_outs.get(fid) or set()
+        gates_before = self.engine.snapshot_gates()
+        snap_events = await self.engine.step_snapshots()
+        if snap_events:
+            await self._persist_snapshots()
+            if targets is not None:
+                for sid in snap_events:
+                    targets |= self._cond_to_outs.get(sid) or set()
+            reflipped = await self.engine.step_flags()
+            if reflipped:
+                await self._persist_flag_states()
+                if targets is not None:
+                    for fid in reflipped:
+                        targets |= self._cond_to_outs.get(fid) or set()
+        else:
+            self._persist_gates_if_changed(gates_before)
+
+    def _stateful_payload(self) -> dict:
+        """Engine stateful values → the JSON-safe store shape: the countdown
+        deadline datetime serializes to ISO (the load side parses it back —
+        wall-clock 续走 reads the ABSOLUTE instant, so the serialized form
+        never freezes the remaining time)."""
+        payload: dict[str, dict] = {}
+        for nid, entry in self.engine.stateful_values().items():
+            clean = dict(entry)
+            if isinstance(clean.get("deadline"), datetime):
+                clean["deadline"] = clean["deadline"].isoformat()
+            payload[nid] = clean
+        return payload
+
+    async def _persist_stateful(self) -> None:
+        """Persist stateful node values via the hub (survive reloads and
+        restarts). Same teardown guard and failure contract as
+        _persist_flag_states: a dead manager must not write back into the
+        hub store, and a failed save never breaks the evaluation cycle —
+        the in-memory values stay authoritative and the next action retries
+        the write."""
+        if self._stopped:
+            return
+        hub = self.hass.data.get(DOMAIN)
+        if hub is None:
+            return
+        try:
+            await hub.async_save_stateful(
+                self.controller_id, self._stateful_payload()
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Failed persisting stateful states for %s", self.controller_id
+            )
+
+    def _persist_stateful_if_changed(self, before: dict) -> None:
+        """Sync the stateful table to the hub whenever it moved without an
+        action event (prev-gate transitions — a stale stored verdict would
+        swallow the next rising edge after a rebuild, the F-434 lesson).
+        Debounced like the snapshot gate table (R2-1/F-339): gate levels
+        can flip every cycle and an immediate whole-table write per edge
+        would serialize inside the eval lock; the in-memory table updates
+        immediately (that IS the rebuild seed source)."""
+        if self._stopped:
+            return
+        after = self._stateful_payload()
+        if after == before:
+            return
+        hub = self.hass.data.get(DOMAIN)
+        if hub is None:
+            return
+        try:
+            hub.async_save_stateful_moved(self.controller_id, after)
+        except Exception:
+            # same contract as the other persist helpers: the in-engine
+            # values stay authoritative; the next moving cycle retries
+            _LOGGER.exception(
+                "Failed persisting stateful gates for %s", self.controller_id
             )
 
     def _snapshot_log_records(self, snap_events: dict[str, dict]) -> list[dict]:
@@ -954,6 +1110,7 @@ class ControllerManager:
                 await self._persist_flag_states()
         else:
             self._persist_gates_if_changed(gates_before)  # R2-1
+        await self._step_stateful_and_persist(None)
         outputs: dict[str, dict] = {}
         conditions: dict[str, bool] = {}
         records: list[dict] = []
@@ -1011,6 +1168,10 @@ class ControllerManager:
                 # takes their "cond" key)
                 CONF_CAPTURE,
                 CONF_CLEAR,
+                # stateful gate members (0.14.0) join the same walk
+                CONF_START_CONDITIONS,
+                CONF_CONSUME_CONDITIONS,
+                CONF_COUNT_CONDITIONS,
                 CONF_INPUT_A,
                 CONF_INPUT_B,
             )
@@ -1093,6 +1254,7 @@ class ControllerManager:
                     await self._persist_flag_states()
             else:
                 self._persist_gates_if_changed(gates_before)  # R2-1
+            await self._step_stateful_and_persist(None)
             try:
                 record, _details = await self._async_evaluate_output(out_cfg)
             except Exception:

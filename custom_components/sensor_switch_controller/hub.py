@@ -43,6 +43,22 @@ from .schema import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Fifth runtime table (0.14.0): stateful step-node values, keyed
+# controller id → node id → {verdict, deadline?, remaining?, count?,
+# prev_gate, prev_reset}. The load ladder keeps only fields whose TYPE
+# matches (bools stay bools, integers are not bools, the countdown deadline
+# is an ISO string or null); everything else is dropped loudly and the
+# engine refills the missing fields from its defaults — bad values self-heal
+# instead of poisoning the step (教训 R7: 读取出口单点规整).
+_STATEFUL_FIELD_TYPES = {
+    "deadline": (str, type(None)),
+    "verdict": bool,
+    "remaining": int,
+    "count": int,
+    "prev_gate": bool,
+    "prev_reset": bool,
+}
+
 
 def _for_seconds(for_cfg) -> int:
     """0.5.x FOR dict {"hours","minutes","seconds"} → total seconds."""
@@ -367,7 +383,7 @@ def _migrate_controller_v2(cfg: dict) -> dict:
 
 
 class _MigratingStore(Store):
-    """Store with the v2/v3/v4/v5/v6/v7→8 migrations wired in.
+    """Store with the v2/v3/v4/v5/v6/v7/v8→9 migrations wired in.
 
     ``Store`` has no ``migrate_func=`` constructor argument; a subclass
     overrides ``_async_migrate_func(old_major_version, old_minor_version,
@@ -426,6 +442,12 @@ class _MigratingStore(Store):
                 ),
                 6: (_migrate_controller_v7, _migrate_controller_v8),
                 7: (_migrate_controller_v8,),
+                # 8→9 (0.14.0): no controller-config field changed — the
+                # stateful step nodes persist in the RUNTIME (_flags) store's
+                # fifth table, whose payload loads with missing-key
+                # tolerance. The empty chain still re-saves every payload at
+                # v9 so the version epoch advances with the format.
+                8: (),
             }
             chain = steps.get(old_major_version, ())
             for cid, cfg in raw.items():
@@ -476,6 +498,13 @@ class ScannerHub:
         # across reloads/restarts (a still-high gate must NOT re-capture).
         # {controller_id: {snapshot_cond_id: bool}}, same store payload.
         self.snapshot_gates: dict[str, dict[str, bool]] = {}
+        # Stateful step-node values (0.14.0): {controller_id: {node_id:
+        # {verdict, deadline?, remaining?, count?, prev_gate, prev_reset}}}.
+        # Fifth runtime table, same store payload and persistence story as
+        # the flag latches above; the countdown deadline is an ISO string
+        # here (datetime inside the engine — the manager converts at both
+        # boundaries) so a restart continues by wall-clock difference.
+        self.stateful_states: dict[str, dict[str, dict]] = {}
         # Last applied flip (ISO string) per output, per controller — the
         # cooldown conditions' flip history, persisted with the same store
         # payload as the flag latches so it survives reloads/restarts
@@ -631,6 +660,7 @@ class ScannerHub:
             self.last_flips = {}
             self.snapshot_states = {}
             self.snapshot_gates = {}
+            self.stateful_states = {}
             return
         states: dict[str, dict[str, bool]] = {}
         for cid, value in raw.items():
@@ -817,10 +847,87 @@ class ScannerHub:
                         type(value).__name__,
                     )
             self.snapshot_gates = gates
+        # Stateful step-node values (0.14.0): same tolerance ladder — a
+        # missing key is the pre-0.14 normal shape (stay silent), a
+        # present-but-unusable value warns and degrades to empty. Per node,
+        # only known-typed fields are kept (教训 R7): bad values are dropped
+        # loudly and the engine refills them from its defaults.
+        raw_stateful = (data or {}).get("stateful")
+        present_stateful = isinstance(data, dict) and "stateful" in data
+        if not isinstance(raw_stateful, dict):
+            if present_stateful:
+                _LOGGER.warning(
+                    "Stored %s_flags 'stateful' payload is not an object (%r); ignored",
+                    STORE_KEY,
+                    type(raw_stateful).__name__,
+                )
+            self.stateful_states = {}
+        else:
+            stateful: dict[str, dict[str, dict]] = {}
+            for cid, value in raw_stateful.items():
+                # same per-controller guard as the flag states: a non-object
+                # value would explode dict() in the managers
+                if isinstance(cid, str) and isinstance(value, dict):
+                    clean: dict[str, dict] = {}
+                    dropped = 0
+                    for nid, entry in value.items():
+                        if not isinstance(nid, str) or not isinstance(entry, dict):
+                            dropped += 1
+                            continue
+                        node: dict[str, Any] = {}
+                        bad = 0
+                        for field, fval in entry.items():
+                            ftype = _STATEFUL_FIELD_TYPES.get(field)
+                            if ftype is bool:
+                                ok = isinstance(fval, bool)
+                            elif ftype is int:
+                                # bool is an int subclass — never a count
+                                ok = isinstance(fval, int) and not isinstance(
+                                    fval, bool
+                                )
+                            elif isinstance(ftype, tuple):
+                                ok = isinstance(fval, ftype)
+                            else:
+                                ok = False  # unknown field (or missing type)
+                            if ok:
+                                node[field] = fval
+                            else:
+                                bad += 1
+                        if bad:
+                            _LOGGER.warning(
+                                "Dropping %d malformed stateful fields for "
+                                "node %s in controller %s (deadline str|null, "
+                                "verdict/prev gates boolean, remaining/count "
+                                "integer); the node refills them from defaults",
+                                bad,
+                                nid,
+                                cid,
+                            )
+                        clean[nid] = node
+                    if dropped:
+                        _LOGGER.warning(
+                            "Dropping %d malformed stateful entries for "
+                            "controller %s (values must be objects)",
+                            dropped,
+                            cid,
+                        )
+                    stateful[cid] = clean
+                else:
+                    _LOGGER.warning(
+                        "Dropping malformed stateful state for controller "
+                        "%r (%s)",
+                        cid,
+                        type(value).__name__,
+                    )
+            self.stateful_states = stateful
 
     @staticmethod
     def _flag_store_payload(
-        flag_states: dict, last_flips: dict, snapshot_states: dict, snapshot_gates: dict
+        flag_states: dict,
+        last_flips: dict,
+        snapshot_states: dict,
+        snapshot_gates: dict,
+        stateful_states: dict,
     ) -> dict:
         """Snapshot the runtime tables for the store write (F-325): the
         Store keeps the payload reference alive across await points (the
@@ -832,12 +939,17 @@ class ScannerHub:
         synchronous event-loop walk, so this is a state-semantics
         hardening, not a RuntimeError fix.) Since 0.13.0 the payload carries
         ``snapshots`` and, since R1-3, ``snapshot_gates`` (older files load
-        without the keys; every save writes them)."""
+        without the keys; every save writes them). Since 0.14.0 the payload
+        carries ``stateful`` too (older files load without the key)."""
         return {
             "flags": {c: dict(v) for c, v in flag_states.items()},
             "last_flip": {c: dict(v) for c, v in last_flips.items()},
             "snapshots": {c: dict(v) for c, v in snapshot_states.items()},
             "snapshot_gates": {c: dict(v) for c, v in snapshot_gates.items()},
+            "stateful": {
+                c: {nid: dict(v) for nid, v in table.items()}
+                for c, table in stateful_states.items()
+            },
         }
 
     async def async_save_flag_states(self, cid: str, states: dict) -> None:
@@ -846,7 +958,7 @@ class ScannerHub:
         await self._flag_store.async_save(
             self._flag_store_payload(
                 self.flag_states, self.last_flips, self.snapshot_states,
-                self.snapshot_gates,
+                self.snapshot_gates, self.stateful_states,
             )
         )
 
@@ -861,7 +973,7 @@ class ScannerHub:
         await self._flag_store.async_save(
             self._flag_store_payload(
                 self.flag_states, self.last_flips, self.snapshot_states,
-                self.snapshot_gates,
+                self.snapshot_gates, self.stateful_states,
             )
         )
 
@@ -880,7 +992,35 @@ class ScannerHub:
         self._flag_store.async_delay_save(
             lambda: self._flag_store_payload(
                 self.flag_states, self.last_flips, self.snapshot_states,
-                self.snapshot_gates,
+                self.snapshot_gates, self.stateful_states,
+            ),
+            1,
+        )
+
+    async def async_save_stateful(self, cid: str, values: dict) -> None:
+        """Persist one controller's stateful node values — the ACTION path
+        (verdict flips, countdown start/reset/zero-cross, consumes, counts),
+        mirroring the flag-flip save: the whole-table write happens inside
+        the eval lock like the snapshot event save."""
+        self.stateful_states[cid] = values
+        await self._flag_store.async_save(
+            self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates, self.stateful_states,
+            )
+        )
+
+    def async_save_stateful_moved(self, cid: str, values: dict) -> None:
+        """Persist prev-gate-only movements via the DEBOUNCED write — the
+        same split as the snapshot gate table (R2-1): gate levels move
+        every cycle while actions are eventful; the in-memory table updates
+        immediately (it IS the rebuild seed source) and the disk write
+        defers through Store.async_delay_save (F-339)."""
+        self.stateful_states[cid] = values
+        self._flag_store.async_delay_save(
+            lambda: self._flag_store_payload(
+                self.flag_states, self.last_flips, self.snapshot_states,
+                self.snapshot_gates, self.stateful_states,
             ),
             1,
         )
@@ -904,23 +1044,25 @@ class ScannerHub:
         self._flag_store.async_delay_save(
             lambda: self._flag_store_payload(
                 self.flag_states, self.last_flips, self.snapshot_states,
-                self.snapshot_gates,
+                self.snapshot_gates, self.stateful_states,
             ),
             1,
         )
 
     async def async_drop_flag_states(self, cid: str) -> None:
         """Forget and persist-erase one controller's flag states (and its
-        cooldown flip history, snapshot latches and gate table — the
-        controller is gone either way)."""
+        cooldown flip history, snapshot latches, gate table and stateful
+        node values — the controller is gone either way; the stateful drop
+        pairs with the table's introduction, F-449 先例)."""
         self.flag_states.pop(cid, None)
         self.last_flips.pop(cid, None)
         self.snapshot_states.pop(cid, None)
         self.snapshot_gates.pop(cid, None)
+        self.stateful_states.pop(cid, None)
         await self._flag_store.async_save(
             self._flag_store_payload(
                 self.flag_states, self.last_flips, self.snapshot_states,
-                self.snapshot_gates,
+                self.snapshot_gates, self.stateful_states,
             )
         )
 

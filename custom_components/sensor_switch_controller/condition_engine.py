@@ -48,9 +48,13 @@ from .const import (
     CONF_WEEKDAYS,
     COMPARE_OPS,
     COND_COMPARE,
+    COND_COUNTDOWN,
     COND_FLAG,
     COND_LITERAL,
+    COND_QUOTA,
     COND_SNAPSHOT,
+    STATEFUL_GATE_KEYS,
+    STATEFUL_TYPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -116,6 +120,7 @@ class ConditionEngine:
         flag_states: dict[str, bool] | None = None,
         snapshot_values: dict[str, Any] | None = None,
         snapshot_gates: dict[str, bool] | None = None,
+        stateful_values: dict[str, dict] | None = None,
     ) -> None:
         """Initialize."""
         self.hass = hass
@@ -138,6 +143,15 @@ class ConditionEngine:
         # / hand-edited payload) keeps the legacy degrade: first true cycle
         # captures once — idempotent while the source value is unchanged.
         self._snapshot_prev: dict[str, bool] = dict(snapshot_gates or {})
+        # Stateful step-node values (0.14.0), same persistence story: seeded
+        # from the hub's fifth runtime table, written back on change. The
+        # per-node value dict carries the node's verdict plus its kind state
+        # (countdown deadline datetime | quota remaining | tally count) and
+        # the previous-cycle gate verdicts (edge detection, same seed story
+        # as _snapshot_prev). Nodes that never moved keep NO entry — the
+        # step applies virtual defaults (quota full / tally zero / countdown
+        # idle) so a fresh node writes nothing until its first action.
+        self._stateful_values: dict[str, dict] = dict(stateful_values or {})
         self._conditions: dict[str, dict] = {}
         for cond in conditions or []:
             if not isinstance(cond, dict):
@@ -366,6 +380,156 @@ class ConditionEngine:
                 self._snapshot_prev[cid] = gate_now
         return events
 
+    def stateful_values(self) -> dict[str, dict]:
+        """Current stateful node values (for hub persistence). The entries
+        are the engine's own dicts — the caller must copy before handing
+        them across an await (the controller's payload helper does)."""
+        return self._stateful_values
+
+    async def step_stateful(self) -> dict[str, dict]:
+        """Advance every stateful node's gate pair once; returns changed ids.
+
+        Stepping order mirrors the flag/snapshot family (flags → snapshots →
+        this one, once per evaluation cycle, before outputs are evaluated)
+        so every output in the cycle sees the same stateful snapshot. BOTH
+        gates are RISING-EDGE triggered (通用口径: a level held high acts
+        once — 防连环扣/连环加); within one cycle reset wins over the primary
+        gate (safe side, mirrors the flag reset-wins rule) and the swallowed
+        gate edge is consumed. Disabled nodes are skipped (state frozen).
+        The previous-cycle gate verdicts ride the persisted value dicts, so
+        the edge semantics stay exact across reloads/restarts (the
+        snapshot_gates lesson, R1-3/F-434): a stale prev would re-fire a
+        still-high gate after a rebuild.
+
+        One mechanism, three parameterizations (per STATEFUL_GATE_KEYS):
+        - countdown: start rise → (re)start, deadline = now + seconds
+          (回满重走), verdict False; reset rise → stop, deadline None; when
+          a running deadline passes → verdict True and LATCHES (归零锁存;
+          the latch survives via the persisted deadline, which self-heals a
+          lost verdict after a restart by re-crossing zero).
+        - quota: consume rise → remaining > 0 ? (remaining - 1, verdict
+          True) : verdict False (拦截); reset rise → remaining = times. The
+          verdict is the LAST consume attempt's result — a consume that took
+          the last unit reports True (the attempt was allowed), the next
+          attempt at zero reports False.
+        - tally: verdict passes the count gate's LEVEL through (透传); a
+          rising edge adds +1 (副作用); reset rise → count = 0. No threshold,
+          no latch — the count is observability state.
+
+        Returns {node_id: {"flipped": bool}} for the nodes whose ACTION
+        state changed this cycle (verdict / deadline / remaining / count —
+        it drives the immediate persistence and target widening; ``flipped``
+        marks a verdict change, the only change that can alter an output's
+        verdict this cycle). Prev-gate-only movements write through to the
+        value table but emit NO event — the controller syncs them via the
+        if-changed compare (debounced, the same split the snapshot family
+        uses between capture/clear events and the gate table, F-434).
+
+        shortcut: a gate referencing ANOTHER stateful node reads that
+        node's verdict in CONFIG order within this single loop (earlier-
+        listed nodes step first) — the same documented shortcut as the
+        snapshot step; referencing a flag/snapshot is always fresh (they
+        stepped before this pass).
+        """
+        now = dt_util.utcnow()
+
+        async def gate_any(members: list | None) -> bool:
+            # no short-circuit: every member evaluates every cycle so its
+            # FOR/duration timers stay fresh (same rule as the flag step)
+            met = False
+            for member in members or []:
+                if await self._evaluate_id(member, set()):
+                    met = True
+            return met
+
+        events: dict[str, dict] = {}
+        for cid, cond in self._conditions.items():
+            if not isinstance(cond, dict):
+                continue
+            kind = cond.get("type")
+            gate_key = STATEFUL_GATE_KEYS.get(kind)
+            if gate_key is None:
+                continue
+            if cond.get("enabled") is False:
+                continue  # frozen: no gate move, no action (mirrors flags)
+            entry = self._stateful_values.get(cid)
+            gate_now = await gate_any(cond.get(gate_key))
+            reset_now = await gate_any(cond.get(CONF_RESET_CONDITIONS))
+            gate_rise = gate_now and not (
+                entry.get("prev_gate", False) if entry else False
+            )
+            reset_rise = reset_now and not (
+                entry.get("prev_reset", False) if entry else False
+            )
+            # copy-on-write: the new dict differs from the entry only when
+            # something actually changed, which IS the change detection
+            new_entry = dict(entry) if entry else {}
+            new_entry["prev_gate"] = gate_now
+            new_entry["prev_reset"] = reset_now
+
+            if kind == COND_COUNTDOWN:
+                seconds = float(cond.get(CONF_SECONDS, 0) or 0)
+                if reset_rise:
+                    # 停止并回满（未启动态）: an already-idle reset is a no-op
+                    # (fields unchanged → no event)
+                    new_entry["verdict"] = False
+                    new_entry["deadline"] = None
+                elif gate_rise:
+                    # 启动/重启动（回满重走）; 再次 start 瞬间翻 false
+                    new_entry["verdict"] = False
+                    new_entry["deadline"] = now + timedelta(seconds=seconds)
+            elif kind == COND_QUOTA:
+                times = int(cond.get("times", 1))
+                remaining = (
+                    entry.get("remaining", times) if entry else times
+                )
+                if reset_rise:
+                    new_entry["remaining"] = times  # 恢复满 X (verdict holds)
+                elif gate_rise:
+                    if remaining > 0:
+                        new_entry["remaining"] = remaining - 1
+                        new_entry["verdict"] = True
+                    else:
+                        new_entry["verdict"] = False  # 剩余=0 → 拦截
+            else:  # COND_TALLY
+                count = entry.get("count", 0) if entry else 0
+                new_entry["verdict"] = gate_now  # 透传：出口随门电平
+                if reset_rise:
+                    new_entry["count"] = 0  # 归零（同拍优先于计数）
+                elif gate_rise:
+                    new_entry["count"] = count + 1
+
+            if kind == COND_COUNTDOWN:
+                # 归零即锁存 true — checked for every countdown every cycle
+                # (a running deadline crossing zero needs no gate edge; the
+                # directed wakeup at the deadline guarantees this step runs)
+                deadline = new_entry.get("deadline")
+                if (
+                    deadline is not None
+                    and not new_entry.get("verdict")
+                    and now >= deadline
+                ):
+                    new_entry["verdict"] = True
+
+            if entry is None:
+                # first movement: keep the node entry-free until an ACTION
+                # happened (a bare prev table for a never-acted node is churn)
+                if set(new_entry) == {"prev_gate", "prev_reset"}:
+                    continue
+            elif new_entry == entry:
+                continue  # nothing moved at all (e.g. a reset while idle)
+            self._stateful_values[cid] = new_entry
+            action_changed = entry is None or any(
+                key not in ("prev_gate", "prev_reset")
+                and new_entry[key] != entry.get(key)
+                for key in new_entry
+            )
+            if action_changed:
+                old_verdict = bool(entry.get("verdict")) if entry else False
+                new_verdict = bool(new_entry.get("verdict"))
+                events[cid] = {"flipped": new_verdict != old_verdict}
+        return events
+
     def _capture_value(self, cond: dict, cid: str) -> Any:
         """Snapshot the source entity's current reading, auto-typed
         (attribute hint FIRST, R1-7).
@@ -519,6 +683,8 @@ class ConditionEngine:
             )
         if ctype == COND_FLAG:
             return None  # latched read — not statically decidable
+        if ctype in STATEFUL_TYPES:
+            return None  # latched read (step_stateful) — not statically decidable
         if ctype == COND_LITERAL:
             # constant node — but a `for` makes the first N seconds False
             # (the generic _apply_for path), so it is only PROVABLY true
@@ -622,6 +788,15 @@ class ConditionEngine:
                 self._offer_range_edges(cond, now_local, offer, outs)
             elif ctype == "sun":
                 self._offer_sun_edges(cond, now_local, offer, outs)
+            elif ctype == COND_COUNTDOWN:
+                # 0.14.0: a running countdown flips at its deadline with no
+                # HA event — offer the persisted wall-clock deadline (the
+                # duration-timer offer, same offer() source). Idle (no
+                # deadline) and already-latched nodes offer nothing.
+                entry = self._stateful_values.get(cid)
+                deadline = entry.get("deadline") if entry else None
+                if deadline is not None and not entry.get("verdict"):
+                    offer(deadline, outs)
             elif ctype == "calendar":
                 # F-320: calendar verdicts flip at event boundaries
                 # (start - hours / event.end) that raise no HA event. Two
@@ -880,6 +1055,12 @@ class ConditionEngine:
             return self._flag_states.get(
                 cond.get("id"), bool(cond.get(CONF_INITIAL, False))
             )
+        if ctype in STATEFUL_TYPES:
+            # latched verdict from the per-cycle step (step_stateful, 0.14.0);
+            # same shape as the flag read — the gates are NOT re-evaluated
+            # here (stepped once per cycle, after flags/snapshots)
+            entry = self._stateful_values.get(cond.get("id"))
+            return bool(entry.get("verdict")) if entry else False
         if ctype == "duration":
             return await self._evaluate_duration(cond, path, visited, trace, out_id)
         if ctype == "debounce":

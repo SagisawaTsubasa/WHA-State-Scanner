@@ -8,7 +8,11 @@ ENTRY_TITLE = "HA 全屋状态扫描"
 # Storage (single config entry, all controllers in one Store)
 # ------------------------------------------------------------------
 STORE_KEY = DOMAIN
-STORE_VERSION = 8
+# v9 (0.14.0): the stateful step nodes land their runtime values in a fifth
+# table of the runtime (_flags) store; the main-store bump re-epochs the
+# format (the v8→v9 controller chain is an empty passthrough — no controller
+# config field changed — but every stored payload is re-saved at v9).
+STORE_VERSION = 9
 CONF_CONTROLLERS = "controllers"
 CTRL_ID_PREFIX = "ctrl_"
 
@@ -56,15 +60,37 @@ COND_FLAG = "flag"
 COND_SNAPSHOT = "snapshot"
 COND_LITERAL = "literal"
 COND_COMPARE = "compare"
+COND_COUNTDOWN = "countdown"
+COND_QUOTA = "quota"
+COND_TALLY = "tally"
 COND_AND = "and"
 COND_OR = "or"
 COND_NOT = "not"
+
+# Stateful step nodes (0.14.0): one step mechanism, three parameterizations.
+# Each kind has a primary gate (rising edge) and the shared reset gate
+# (rising edge, same-cycle reset wins); the verdict is stepped once per
+# evaluation cycle and persists across restarts (fifth runtime table).
+STATEFUL_TYPES = (COND_COUNTDOWN, COND_QUOTA, COND_TALLY)
+# Primary-gate config key per kind — single source shared by the schema
+# validation and the engine step so the two cannot drift.
+STATEFUL_GATE_KEYS = {
+    COND_COUNTDOWN: "start_conditions",
+    COND_QUOTA: "consume_conditions",
+    COND_TALLY: "count_conditions",
+}
 
 # Flag (latch) condition fields: set/reset reference condition ids, the
 # verdict is a latched virtual boolean stepped once per evaluation cycle.
 CONF_SET_CONDITIONS = "set_conditions"
 CONF_RESET_CONDITIONS = "reset_conditions"
 CONF_INITIAL = "initial"
+
+# Stateful step-node gate fields (0.14.0): the primary gate per kind is
+# keyed in STATEFUL_GATE_KEYS; every kind shares reset_conditions.
+CONF_START_CONDITIONS = "start_conditions"
+CONF_CONSUME_CONDITIONS = "consume_conditions"
+CONF_COUNT_CONDITIONS = "count_conditions"
 
 # Snapshot (memory) condition fields: capture/clear reference condition ids
 # (capture = rising-edge of the capture gate, clear = level, reset wins);
@@ -117,6 +143,7 @@ SUN_OFFSET_LIMIT = 86400
 COOLDOWN_MAX = 86400
 DURATION_MAX = 86400
 DEBOUNCE_MAX = 86400
+QUOTA_MAX = 86400
 CALENDAR_HOURS_MAX = 168
 EVAL_DEBOUNCE_SECONDS = 0.2
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
