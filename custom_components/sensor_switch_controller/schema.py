@@ -1146,7 +1146,7 @@ def _warn_static_hazards(
 ) -> None:
     """Save-time static hazard warnings — NEVER rejecting (the upgrade
     compatibility rule is warn-only, same as the flag dead-branch history):
-    existing legal configs must keep saving after an upgrade. Four faces,
+    existing legal configs must keep saving after an upgrade. Five faces,
     each judged on the graph its claim needs (they are NOT one shared
     graph, R2#1): face ④ the live evaluation-edge set, face ① its OFF-chain
     subset (both R3#2 — disabled subtrees pruned, direct chains still
@@ -1166,6 +1166,13 @@ def _warn_static_hazards(
     silently evaluates nothing while the panel still shows it wired. ④ an
     empty non-signal-anchor group reachable from an output chain (F-327) —
     constant False (constant True under NOT), only the flag branch warned.
+    ⑤ an output whose live chain has enabled nodes but no wakeup source at
+    all (R5-6): no wall-clock gate, no live duration/`for` timer, no
+    enabled trigger's signal coverage, no entity-end join — snapshot
+    capture/clear gates do NOT count (next_wakeup never schedules a
+    snapshot wakeup and step_snapshots runs only inside an existing cycle,
+    R6-fix#2), so the output evaluates once at startup and then only on
+    manual evaluate.
     """
     signal_covered = {
         member
@@ -1233,8 +1240,12 @@ def _warn_static_hazards(
     # R4-1 entity-coverage join: compare nodes whose entity end an ENABLED
     # state trigger listens to — the runtime routing index pulls their
     # outputs into that trigger's dispatch targets (controller
-    # ._build_route_index); the static hazard faces must credit the same
-    # wakeup source.
+    # ._build_route_index) and does NOT filter the compare's own enabled:
+    # the join is a dispatch fact (a disabled compare still re-evaluates
+    # its outputs when the listened entity changes), so the static hazard
+    # faces must credit the same wakeup source without an extra filter,
+    # else save-time warnings contradict the runtime and the canvas badge
+    # (panel._triggerCoverage walks the same unfiltered set, R6-fix#3).
     listened_entities = {
         eid
         for trg in triggers or []
@@ -1250,7 +1261,6 @@ def _warn_static_hazards(
         cid
         for cid, cond in by_id.items()
         if cond.get("type") == COND_COMPARE
-        and cond.get("enabled") is not False
         and any(
             isinstance(cond.get(k), dict)
             and cond[k].get("kind") == "entity"
@@ -1382,16 +1392,25 @@ def _warn_static_hazards(
         # ledger item): the output's chain carries nothing that can ever
         # flip on its own or be woken — no wall-clock gate, no live
         # duration/`for` timer, no enabled trigger's signal coverage, no
-        # entity-end join, no enabled snapshot capture/clear gate. The
-        # output evaluates once at startup and then only on manual
-        # evaluate. Same two-tier set discipline as face ② (R3#1):
-        # wall-clock/calendar gates qualify from the TOPOLOGICAL set (a
-        # disabled subtree still wakes the chain), duration/`for` timers
-        # only from the live set. Calendars count as a (heartbeat-backed)
-        # source here — their dedicated face ② already warns about the
-        # heartbeat lag. Only outputs whose LIVE chain has at least one
+        # entity-end join. The output evaluates once at startup and then
+        # only on manual evaluate. Same two-tier set discipline as face ②
+        # (R3#1): wall-clock/calendar gates qualify from the TOPOLOGICAL
+        # set (a disabled subtree still wakes the chain), duration/`for`
+        # timers only from the live set. Calendars count as a (heartbeat-
+        # backed) source here — their dedicated face ② already warns about
+        # the heartbeat lag. Only outputs whose LIVE chain has at least one
         # ENABLED node warn — a chain wholly behind a disabled group is
         # dead wiring (R3#2's face), not a frozen output. Warn-only.
+        # Snapshot capture/clear gates are NOT sources (R6-fix#2): the
+        # engine's next_wakeup never schedules a snapshot wakeup (its
+        # sources are timers/debounce/cooldown/time/sun/calendar only) and
+        # step_snapshots runs only INSIDE an existing cycle (trigger /
+        # wakeup / manual), so a snapshot-only chain freezes exactly like
+        # a flag-only chain — same treatment as flag flip, which this face
+        # has never counted. The gate CONDITIONS stay in wakeup_ids (the
+        # routing walk includes the step edges), so a capture/clear gate
+        # wired to a wall-clock or timer leaf still silences this face
+        # through those branches.
         live_active = {
             cid for cid in live_ids
             if by_id.get(cid, {}).get("enabled") is not False
@@ -1407,16 +1426,12 @@ def _warn_static_hazards(
                          or by_id.get(cid, {}).get("for")))
                 or cid in wakeup_covered
                 or cid in entity_end_covered
-                or (by_id.get(cid, {}).get("type") == COND_SNAPSHOT
-                    and by_id.get(cid, {}).get("enabled") is not False
-                    and (by_id.get(cid, {}).get(CONF_CAPTURE)
-                         or by_id.get(cid, {}).get(CONF_CLEAR)))
                 for cid in wakeup_ids
             )
             if not has_wake:
                 _LOGGER.warning(
                     "输出「%s」的条件链上没有任何可唤醒源（壁钟门/计时门/触发器"
-                    "信号覆盖/求值实体监听/快照拍清门）：该输出只会在初始评估或手动"
+                    "信号覆盖/求值实体监听）：该输出只会在初始评估或手动"
                     "「立即评估」时更新——请把触发器信号线连到链上条件，或让 state "
                     "触发器监听求值读取的实体",
                     out_label,
@@ -1563,6 +1578,68 @@ def _check_graph(
                         "AND 组混入冷却、NOT 组含恒真成员、持续门起点恒假"
                         "或中止恒真同理；请修正该门"
                     )
+            # R6-fix#1 (extends R5-3 from the DIRECT self reference to the
+            # whole evaluation closure): the gate's dependency closure —
+            # group member expansion, duration start edges and compare a/b
+            # cond edges, the edges the engine recurses through when it
+            # evaluates this gate in step_snapshots (_evaluate_id) —
+            # reaching this snapshot reads its own "a snapshot exists"
+            # verdict, permanently False while the store is empty: a
+            # capture gate can never rise from the self path (the node
+            # never captures, only invisible debug lines) and a clear gate
+            # self-reads True right after a capture (instant self-clear).
+            # Step edges (flag set/reset, snapshot capture/clear) stay
+            # excluded like in the flag cascade walk above — they read
+            # latched memories, so a gate referencing ANOTHER snapshot/
+            # flag is a legal memory read, not a live self-dependency.
+            # The duration ABORT edge is likewise left out: the engine
+            # reads it only to reset the gate (_evaluate_duration), so a
+            # self-read through it blocks re-arming instead of producing
+            # the never-fires empty-store trap this check targets.
+            seen: set[str] = set()
+            stack: list[tuple[str, tuple[str, ...]]] = [
+                (m, (m,)) for m in cond[key]
+            ]
+            while stack:
+                node, path = stack.pop()
+                if node == cond["id"]:
+                    shown = "→".join(
+                        (by_id[n].get("label") or n)
+                        + ("（本快照）" if n == cond["id"] else "")
+                        for n in path
+                    )
+                    if key == CONF_CAPTURE:
+                        why = (
+                            "拍下门读到本快照的「快照存在」判定——无快照时恒假，"
+                            "该门永远无法上升，节点永不拍下"
+                        )
+                    else:
+                        why = (
+                            "清空门读到本快照的「快照存在」判定——拍下后门即为真，"
+                            "下一拍自清且门保持期间不再拍摄"
+                        )
+                    _fail(
+                        f"快照条件「{label}」的 {key}（经 {shown} 间接）引用了"
+                        f"自身：{why}；请把该门改为不依赖本快照的条件"
+                    )
+                if node in seen:
+                    continue
+                seen.add(node)
+                ncond = by_id[node]
+                if ncond.get("enabled") is False:
+                    continue  # disabled nodes short-circuit: never read
+                nxt_edges = list(ncond.get("conditions") or [])
+                if isinstance(ncond.get(CONF_START), str):
+                    nxt_edges.append(ncond[CONF_START])
+                for side_key in (CONF_INPUT_A, CONF_INPUT_B):
+                    side = ncond.get(side_key)
+                    if isinstance(side, dict) and isinstance(
+                        side.get("cond"), str
+                    ):
+                        nxt_edges.append(side["cond"])
+                for nxt in nxt_edges:
+                    if nxt not in seen:
+                        stack.append((nxt, path + (nxt,)))
 
     # Cycle detection over group references and duration start/abort edges
     # (iterative DFS with colors).
@@ -1706,8 +1783,9 @@ def _check_graph(
 
     # Save-time static hazard warnings (never rejecting): the off-chain
     # cooldown trap, calendar-only outputs, routes to unreachable
-    # conditions, and empty output-chain groups. Warnings only — existing
-    # legal configs must keep saving after an upgrade.
+    # conditions, empty output-chain groups, and outputs with no wakeup
+    # source at all. Warnings only — existing legal configs must keep
+    # saving after an upgrade.
     _warn_static_hazards(conditions, outputs, triggers, by_id)
 
 

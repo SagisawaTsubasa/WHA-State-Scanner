@@ -2243,6 +2243,56 @@ async def main():
     )
     print("[PASS] data-node schema: self-snap rejected, oversized int 400-face, literal+for verdict (R5-2/3/4)")
 
+    # R6-fix#1: INDIRECT snapshot self-reference rejected — the capture/
+    # clear gate reaching the snapshot through the EVALUATION closure
+    # (group members / duration start / compare a/b cond edges) reads its
+    # own "a snapshot exists" verdict, permanently False while the store
+    # is empty, so the node would never capture; the error must name the
+    # indirect path. A group NOT reaching the snapshot stays saveable
+    # (reachability is the criterion, not "any group")
+    r6_grp = "cond_" + "41" * 16
+    r6_dur = "cond_" + "42" * 16
+    r6_cmp = "cond_" + "43" * 16
+    r6_okg = "cond_" + "44" * 16
+    for r6_arm, r6_gate in (
+        ("group", {"id": r6_grp, "type": "and", "label": "自引组",
+                   "conditions": [sn_num]}),
+        ("duration", {"id": r6_dur, "type": "duration", "label": "自引持续",
+                      "seconds": 30, "start": sn_num}),
+        ("compare", {"id": r6_cmp, "type": "compare", "label": "自引求值",
+                     "op": "above",
+                     "a": {"kind": "snapshot", "cond": sn_num},
+                     "b": {"kind": "literal", "cond": lit_25}}),
+    ):
+        r6_ind = json.loads(json.dumps(dn_cfg))
+        r6_ind["conditions"].append(r6_gate)
+        r6_ind["conditions"] = [
+            c if c["id"] != sn_num
+            else {**c, "capture": [r6_gate["id"]], "clear": []}
+            for c in r6_ind["conditions"]
+        ]
+        try:
+            _vc(r6_ind)
+        except _CVE as r6_err:
+            assert (
+                r6_gate["label"] in str(r6_err) and "（本快照）" in str(r6_err)
+            ), f"indirect self-ref message must name the path ({r6_arm}): {r6_err}"
+        else:
+            raise AssertionError(
+                "schema accepted an indirect snapshot self-reference via "
+                f"{r6_arm} (R6-fix#1)"
+            )
+    r6_ok = json.loads(json.dumps(dn_cfg))
+    r6_ok["conditions"].append(
+        {"id": r6_okg, "type": "and", "conditions": [sn_gate]}
+    )
+    r6_ok["conditions"] = [
+        c if c["id"] != sn_num else {**c, "capture": [r6_okg], "clear": []}
+        for c in r6_ok["conditions"]
+    ]
+    _vc(r6_ok)  # capture gate through a non-reaching group: must NOT raise
+    print("[PASS] data-node schema: indirect snapshot self-ref rejected via group/duration/compare, non-reaching group saveable (R6-fix#1)")
+
     # engine faces via the manager (hub-seeded persistence path included)
     from custom_components.sensor_switch_controller.hub import ScannerHub as _SH
     hass_dn = _Hass()
@@ -2767,6 +2817,134 @@ async def main():
     finally:
         _slg5.removeHandler(_scap5)
     print("[PASS] data-node hazards: no-wakeup-source freeze warns, join silences it (R5-6)")
+
+    # R6-fix#2: snapshot capture/clear gates are NOT wakeup sources —
+    # next_wakeup never schedules a snapshot wakeup and step_snapshots
+    # runs only INSIDE an existing cycle, so a snapshot-only chain with
+    # no trigger freezes exactly like a flag-only chain: face ⑤ must warn
+    # (R5-6's snapshot branch swallowed it), and an enabled trigger whose
+    # signal covers the capture gate's leaf silences it again
+    r6_sn = "cond_" + "45" * 16
+    r6_drv = "cond_" + "46" * 16
+    r6_snout = "ssc_" + "a" * 31 + "1"
+
+    def _snap_only_cfg(listen):
+        return {
+            "name": "r6-snap-only", "enabled": True,
+            "logging_enabled": False,
+            "triggers": (
+                [{"id": "trg_" + "5" * 31 + "1", "type": "state",
+                  "entity_id": "sensor.b",
+                  "routes": {"conditions": [r6_drv]}}]
+                if listen
+                else []
+            ),
+            "conditions": [
+                {"id": r6_drv, "type": "state", "entity_id": "sensor.b",
+                 "state": "on"},
+                {"id": r6_sn, "type": "snapshot", "entity_id": "sensor.a",
+                 "capture": [r6_drv], "clear": []},
+            ],
+            "outputs": [
+                {"name": "r6sn", "type": "switch", "entity_id": r6_snout,
+                 "on_conditions": [r6_sn], "off_conditions": []},
+            ],
+        }
+
+    _scap6 = _Cap()
+    _slg6 = _logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _slg6.addHandler(_scap6)
+    try:
+        _vc(_snap_only_cfg(False))  # snapshot-only, zero triggers → warns
+        assert any(
+            "没有任何可唤醒源" in r.getMessage() for r in _scap6.records
+        ), [r.getMessage() for r in _scap6.records]
+        _scap6.records.clear()
+        _vc(_snap_only_cfg(True))  # live trigger covers the capture leaf
+        assert not any(
+            "没有任何可唤醒源" in r.getMessage() for r in _scap6.records
+        ), [r.getMessage() for r in _scap6.records]
+    finally:
+        _slg6.removeHandler(_scap6)
+    print("[PASS] data-node hazards: snapshot-only chain warns without a trigger, capture-leaf coverage silences it (R6-fix#2)")
+
+    # R6-fix#3: the entity join does NOT filter disabled compares — the
+    # runtime routing index (controller._build_route_index) lends targets
+    # for every compare with a matching entity end, enabled or not, so a
+    # disabled compare behind a listening trigger must NOT raise the
+    # no-wakeup-source (face ⑤) or calendar heartbeat-only (face ②)
+    # warnings; with the listener gone both faces fire again
+    r6_dcal = "cond_" + "47" * 16
+    r6_dlit = "cond_" + "48" * 16
+    r6_dcmp = "cond_" + "49" * 16
+    r6_dout = "ssc_" + "b" * 31 + "2"
+
+    def _dis_cmp_cfg(listen, with_cal):
+        chain = [
+            {"id": r6_dlit, "type": "literal",
+             "value_type": "number", "value": 5},
+            {"id": r6_dcmp, "type": "compare", "op": "above",
+             "a": {"kind": "entity", "entity_id": "sensor.a"},
+             "b": {"kind": "literal", "cond": r6_dlit},
+             "enabled": False},
+        ]
+        # the ENABLED literal sits DIRECTLY on the output chain: a disabled
+        # compare prunes its own edges from the live set (respect_enabled),
+        # so face ⑤ would see an empty live chain and skip entirely
+        on_chain = [r6_dcmp, r6_dlit]
+        if with_cal:
+            chain.insert(0, {"id": r6_dcal, "type": "calendar",
+                             "entity_id": "calendar.x", "hours": 24.0})
+            on_chain = [r6_dcal] + on_chain
+        return {
+            "name": "r6-dis-cmp", "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{
+                "id": "trg_" + "6" * 31 + "1",
+                "type": "state",
+                "entity_id": "sensor.a",
+                "enabled": listen,
+                "routes": {"conditions": []},
+            }],
+            "conditions": chain,
+            "outputs": [
+                {"name": "r6d", "type": "switch", "entity_id": r6_dout,
+                 "on_conditions": on_chain, "off_conditions": []},
+            ],
+        }
+
+    _scap7 = _Cap()
+    _slg7 = _logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _slg7.addHandler(_scap7)
+    try:
+        # face ⑤ arm: chain = disabled compare + literal
+        _vc(_dis_cmp_cfg(True, False))  # join credits the DISABLED compare
+        assert not any(
+            "没有任何可唤醒源" in r.getMessage() for r in _scap7.records
+        ), [r.getMessage() for r in _scap7.records]
+        _scap7.records.clear()
+        _vc(_dis_cmp_cfg(False, False))  # nobody listens → freeze warns
+        assert any(
+            "没有任何可唤醒源" in r.getMessage() for r in _scap7.records
+        ), [r.getMessage() for r in _scap7.records]
+        _scap7.records.clear()
+        # face ② arm: same chain + a calendar gate
+        _vc(_dis_cmp_cfg(True, True))  # join silences heartbeat-only
+        assert not any(
+            "依赖日历条件" in r.getMessage() for r in _scap7.records
+        ), [r.getMessage() for r in _scap7.records]
+        _scap7.records.clear()
+        _vc(_dis_cmp_cfg(False, True))  # nobody listens → heartbeat warns
+        assert any(
+            "依赖日历条件" in r.getMessage() for r in _scap7.records
+        ), [r.getMessage() for r in _scap7.records]
+    finally:
+        _slg7.removeHandler(_scap7)
+    print("[PASS] data-node hazards: disabled compare credited by the entity join, faces ②/⑤ align with runtime (R6-fix#3)")
 
     # hub store: three tables in one payload; pre-0.13 payloads (no
     # snapshots key) load silently; bool-poisoned values drop loudly
