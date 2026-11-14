@@ -527,7 +527,12 @@ def _map_legacy_scan_interval(data: dict) -> list[dict]:
     interval = data.get(CONF_SCAN_INTERVAL)
     try:
         interval = int(interval)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
+        # R1#4: JSON `1e999` parses to float('inf') and int(inf) raises
+        # OverflowError (not ValueError) — uncaught it escaped the 400 /
+        # invalid face (web PUT → 500; an Infinity written into the store
+        # by hand would take down the whole entry setup via async_load).
+        # Same tuple as every other numeric intake in this module.
         interval = DEFAULT_SCAN_INTERVAL
     interval = max(EVERY_SECONDS_MIN, min(interval, EVERY_SECONDS_MAX))
     seed = f"scan_interval:{data.get('name')}:{data.get(CONF_SCAN_INTERVAL)}"
@@ -1225,6 +1230,43 @@ def _reachable_from_chains(
     return reach
 
 
+def _start_armed_by_cooldown(
+    start_ref: str,
+    by_id: dict[str, dict],
+    _path: frozenset = frozenset(),
+) -> bool:
+    """R1#3: True when a duration's start subtree is composed ONLY of
+    cooldowns — the cooldown itself, and/or AND/OR groups whose members all
+    satisfy the same predicate (``_path`` guards a pathological cycle and
+    keeps diamond-shared members honest per walk). A NOT group or any other
+    leaf type makes the subtree impure — the cooldown then shares the start
+    verdict with live signals, which is the legitimate on-branch arming
+    shape face ① deliberately stopped warning about. A DISABLED node is
+    skipped (the engine short-circuits it to True, so it contributes no
+    gate), and a subtree empty after skipping is not judged here (the
+    constant-group family, F-327)."""
+    cond = by_id.get(start_ref)
+    if not cond or start_ref in _path:
+        return False
+    if cond.get("enabled") is False:
+        return False
+    ctype = cond.get("type")
+    if ctype == COND_COOLDOWN:
+        return True
+    if ctype not in (COND_AND, COND_OR):
+        return False
+    members = [
+        m
+        for m in cond.get("conditions") or []
+        if isinstance(m, str)
+        and (by_id.get(m) or {}).get("enabled") is not False
+    ]
+    if not members:
+        return False
+    path = _path | {start_ref}
+    return all(_start_armed_by_cooldown(m, by_id, path) for m in members)
+
+
 def _warn_static_hazards(
     conditions: list[dict],
     outputs: list[dict],
@@ -1252,7 +1294,11 @@ def _warn_static_hazards(
     followed): a cooldown that arms a duration's start from the on side is
     not dragged onto the off chain — it never gates the off verdict there,
     so the trap cannot exist (the on-branch arming shape stays legitimate,
-    e.g. the drying branch's anti-short-cycle cooldown).② an output whose only gate is a calendar
+    e.g. the drying branch's anti-short-cycle cooldown). The one residual
+    the narrowing left — a duration ON the off chain whose start subtree is
+    composed solely of cooldowns (R1#3) — still traps with a delay of N
+    seconds and is warned by the dedicated narrow face ①n right after ①.
+    ② an output whose only gate is a calendar
     (F-320): calendar boundaries raise no HA event, wakeups are best-effort.
     ③ a trigger route wired to a condition no output can reach (F-326) —
     silently evaluates nothing while the panel still shows it wired. ④ an
@@ -1386,6 +1432,35 @@ def _warn_static_hazards(
                 "请勿把冷却挂到 off 链（防频翻请挂 on 链或改用持续条件）",
                 out_label,
                 cond.get("label") or cid,
+            )
+        # ①n (R1#3, 0.15.0 residual): the start-only-cooldown shape —
+        # off=[D], D=duration(start=C), C=cooldown directly or via an
+        # AND/OR group composed solely of cooldowns. follow_gate_inputs=
+        # False above no longer drags C onto the off chain, but this
+        # degenerate shape keeps the polarity trap with a delay: cold start
+        # C reads True (no flip history), so D arms itself N seconds in
+        # while the output is already off — the off verdict applies
+        # nothing, records no flip, C stays constant-True and off
+        # out-ranks on forever. Warn-only, same trap defense as ①.
+        for cid in off_reach.get(out["entity_id"], set()):
+            dur = by_id.get(cid)
+            if not dur or dur["type"] != COND_DURATION:
+                continue
+            if dur.get("enabled") is False:
+                continue
+            start_ref = dur.get(CONF_START)
+            if not isinstance(start_ref, str) or not _start_armed_by_cooldown(
+                start_ref, by_id
+            ):
+                continue
+            _LOGGER.warning(
+                "输出「%s」的 off 链持续条件「%s」的 start 仅由冷却构成（直接或经"
+                "纯冷却组）：冷启动时冷却无翻转史恒为 True，持续门 N 秒后自行放"
+                "行，而输出已处于 off 时 off 判定不产生新翻转记录，冷却将永远恒 "
+                "True 并以 off 优先永久压制 on 链——与直接挂 off 链同型的延迟版陷"
+                "阱，请把冷却挂 on 链或给 start 混入活信号",
+                out_label,
+                dur.get("label") or cid,
             )
         # ② calendar as the only gate of an output (F-320). The wakeup arm
         # splits by wakeup kind (R3#1 — the R2#1 live-graph split is only

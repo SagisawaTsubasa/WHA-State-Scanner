@@ -107,6 +107,14 @@ class ControllerManager:
                         raw,
                     )
                     continue
+                if parsed.tzinfo is None:
+                    # R1#5: an offset-less ISO (hand-edited/external store)
+                    # seeds a naive value the cooldown comparison
+                    # (utcnow − last) would TypeError on every cycle and
+                    # permanently fail-close the gate — normalize to UTC
+                    # right here, same shape as the stateful deadline
+                    # seeding above (R2#1).
+                    parsed = dt_util.as_utc(parsed)
                 saved_last_flip[out_id] = parsed
         # Snapshot latch seeding (R2-6): persisted entries carry their
         # source entity; a latch captured from a DIFFERENT entity than the

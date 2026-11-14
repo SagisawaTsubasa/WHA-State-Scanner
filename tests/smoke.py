@@ -4129,6 +4129,66 @@ async def main():
             "still warns (face ① keeps the real trap covered): "
             f"{sch_records[n_start_edge:]}"
         )
+        # ①n (R1#3): the narrow residual face the 0.15.0 narrowing left —
+        # a duration ON the off chain whose start subtree is composed
+        # SOLELY of cooldowns (direct, or via an AND/OR group of only
+        # cooldowns) still traps with a delay: cold start the cooldown
+        # reads True, the duration arms itself N seconds in while the
+        # output is already off, no flip is ever recorded and the off
+        # chain out-ranks on forever. Mixing any live signal into the
+        # start group stays the legitimate arming shape — no warning.
+        n_1n = len(sch_records)
+        hz_c6 = "cond_" + "6" * 32
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": hz_c2, "type": "cooldown", "seconds": 30},
+            {"id": hz_c6, "type": "duration", "seconds": 60,
+             "start": hz_c2, "abort": None},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
+        ]})
+        assert sum("start 仅由冷却构成" in r for r in sch_records[n_1n:]) == 1, (
+            "a duration on the off chain armed solely by a cooldown keeps "
+            "the delayed off-polarity trap — must warn (R1#3): "
+            f"{sch_records[n_1n:]}"
+        )
+        n_1ng = len(sch_records)
+        hz_c8 = "cond_" + "8" * 32
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": hz_c2, "type": "cooldown", "seconds": 30},
+            {"id": hz_c8, "type": "and", "conditions": [hz_c2]},
+            {"id": hz_c6, "type": "duration", "seconds": 60,
+             "start": hz_c8, "abort": None},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
+        ]})
+        assert sum("start 仅由冷却构成" in r for r in sch_records[n_1ng:]) == 1, (
+            "a pure-cooldown GROUP arming the start is the same delayed "
+            f"trap shape as the direct one — must warn (R1#3): "
+            f"{sch_records[n_1ng:]}"
+        )
+        n_1nm = len(sch_records)
+        _vc({**json.loads(json.dumps(hz_base)), "conditions": [
+            {"id": hz_c1, "type": "state", "entity_id": "switch.c",
+             "state": "on"},
+            {"id": hz_c2, "type": "cooldown", "seconds": 30},
+            {"id": hz_c8, "type": "and", "conditions": [hz_c1, hz_c2]},
+            {"id": hz_c6, "type": "duration", "seconds": 60,
+             "start": hz_c8, "abort": None},
+        ], "outputs": [
+            {"name": "o", "type": "switch", "entity_id": hz_o1,
+             "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
+        ]})
+        assert len(sch_records) == n_1nm, (
+            "mixing a live signal into the start group is the legitimate "
+            "arming shape — the cooldown never gates the off verdict alone "
+            f"there, no warning (R1#3 boundary): {sch_records[n_1nm:]}"
+        )
         # ② route to an unreachable condition → warning (a legal leaf no
         # output chain reaches — wired on the canvas, wakes nothing)
         orphan_c = "cond_" + "e" * 32
@@ -5040,6 +5100,97 @@ async def main():
         _dtmod.as_utc = _saved_as_utc
         _clock["utc"] = _saved_utc
     print("[PASS] stateful R2#1: naive deadline seeds aware, cycle runs, latch fires")
+
+    # ------------------------------------------------------------------
+    # R1#5 (P3): naive ISO last_flip — the cooldown sibling of the R2#1
+    # deadline fix. A hand-edited offset-less flip timestamp must seed
+    # AWARE (as_utc at the manager's seeding exit) and the cooldown
+    # comparison must evaluate instead of TypeError-ing every cycle
+    # (aware utcnow − naive flip → the per-cid except fail-closes the
+    # gate to False forever and the stale value is never overwritten).
+    # Also pins the hub-side parseability gate: an unparseable flip
+    # string is dropped loudly at the store exit. The stub clock is naive
+    # by default — same aware-ify swap as the R2#1 pin above.
+    # ------------------------------------------------------------------
+    _saved_as_utc5 = _dtmod.as_utc
+    _saved_utc5 = _clock["utc"]
+    _dtmod.as_utc = lambda v: (
+        v.replace(tzinfo=timezone.utc)
+        if v is not None and getattr(v, "tzinfo", None) is None
+        else v
+    )
+    _clock["utc"] = _saved_utc5.replace(tzinfo=timezone.utc)
+
+    class _R15Cap(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list = []
+
+        def emit(self, record):
+            self.records.append(record.getMessage())
+
+    _r15_logger = _logging.getLogger(
+        "custom_components.sensor_switch_controller.hub"
+    )
+    _r15_handler = _R15Cap()
+    _r15_logger.addHandler(_r15_handler)
+    try:
+        hub_mf = ScannerHub(_Hass())
+        hub_mf._flag_store = _StStore()
+        mf_out = "ssc_" + "7" * 32
+        hub_mf._flag_store.load_result = {
+            "flags": {},
+            "last_flip": {
+                "ctrl_mflip": {
+                    mf_out: "2026-10-06T01:00:00",  # naive ISO (R1#5 shape)
+                    "ssc_bad": "not-a-date",  # unparseable → dropped loudly
+                },
+            },
+            "snapshots": {}, "snapshot_gates": {}, "stateful": {},
+        }
+        await hub_mf.async_load_flag_states()
+        assert set(hub_mf.last_flips.get("ctrl_mflip") or {}) == {mf_out}, (
+            f"the store exit must drop only the unparseable flip entry "
+            f"and keep the parseable naive ISO: {hub_mf.last_flips}"
+        )
+        assert any(
+            "Dropping 1 malformed last-flip" in m for m in _r15_handler.records
+        ), _r15_handler.records
+        mf_cfg = _vc(json.loads(json.dumps({
+            "name": "flip-naive", "enabled": True, "logging_enabled": False,
+            "triggers": [{"id": "trg_" + "7" * 32, "type": "state",
+                          "entity_id": "switch.c",
+                          "routes": {"conditions": ["cond_" + "5" * 32]}}],
+            "conditions": [
+                {"id": "cond_" + "5" * 32, "type": "cooldown", "seconds": 60},
+            ],
+            "outputs": [
+                {"name": "out-mf", "type": "switch", "entity_id": mf_out,
+                 "on_conditions": ["cond_" + "5" * 32], "off_conditions": []},
+            ],
+        })))
+        hass_mf = _Hass()
+        hass_mf.data[_DOM] = hub_mf
+        mgr_mf = ControllerManager(hass_mf, "ctrl_mflip", mf_cfg)
+        seeded_mf = mgr_mf.last_flip_at(mf_out)
+        assert seeded_mf is not None and seeded_mf.tzinfo is not None, (
+            "the seeding exit must normalize a naive flip to aware "
+            f"(R1#5, R2#1 shape): {seeded_mf!r}"
+        )
+        met_mf, det_mf = await mgr_mf.engine.evaluate_detailed(
+            ["cond_" + "5" * 32], mf_out
+        )
+        assert met_mf is True, (
+            "the cooldown must evaluate (1h since flip > 60s) — a "
+            f"TypeError regression would fail-close it to False: {det_mf}"
+        )
+        mgr_mf.async_unload()
+    finally:
+        _dtmod.as_utc = _saved_as_utc5
+        _clock["utc"] = _saved_utc5
+        _r15_logger.removeHandler(_r15_handler)
+    print("[PASS] R1#5: naive last_flip seeds aware + cooldown evaluates; "
+          "unparseable dropped at load")
 
     # store version epoch: v9 with an empty v8→v9 controller chain — a real
     # 0.13.0-shaped payload migrates and still validates (教训 R2: 迁移产物

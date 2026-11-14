@@ -16,6 +16,7 @@ from homeassistant.const import CONF_ENTITY_ID
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import (
     COND_DURATION,
@@ -713,16 +714,32 @@ class ScannerHub:
                 # same per-controller guard as the flag states: a
                 # non-object value would explode dict() in the managers
                 if isinstance(cid, str) and isinstance(value, dict):
-                    clean = {
-                        k: v
-                        for k, v in value.items()
-                        if isinstance(k, str) and isinstance(v, str)
-                    }
-                    if len(clean) != len(value):
+                    clean: dict[str, str] = {}
+                    dropped = 0
+                    for k, v in value.items():
+                        if not (isinstance(k, str) and isinstance(v, str)):
+                            dropped += 1
+                            continue
+                        # R1#5 parseability gate: a string that cannot parse
+                        # as a datetime would be dropped again (loudly) at
+                        # the manager's seeding exit — drop it here so the
+                        # store exit honors the same tolerance ladder; a
+                        # parseable offset-less ISO is kept and normalized
+                        # at that seeding exit (controller, R2#1 shape).
+                        try:
+                            if dt_util.parse_datetime(v) is None:
+                                dropped += 1
+                                continue
+                        except (TypeError, ValueError):
+                            dropped += 1
+                            continue
+                        clean[k] = v
+                    if dropped:
                         _LOGGER.warning(
                             "Dropping %d malformed last-flip entries for "
-                            "controller %s (values must be ISO strings)",
-                            len(value) - len(clean),
+                            "controller %s (values must be parseable ISO "
+                            "datetimes)",
+                            dropped,
                             cid,
                         )
                     flips[cid] = clean
