@@ -210,9 +210,25 @@ const LANG = {
     portA: "A",
     portB: "B",
     compareBadWire: "连线被拒：求值的 A/B 口只接受快照或常量节点（实体端在表单填）；A/B 各只接一根线。",
-    snapshotNoSignal: "连线被拒：快照/求值/常量没有信号口；触发器信号线请连到具体条件或逻辑组。",
+    snapshotNoSignal: "连线被拒：快照/求值/常量/状态节点（倒计时/次数余量/累计计数）没有信号口；触发器信号线请连到具体条件或逻辑组。",
     logCapture: "拍下",
     logClear: "清空快照",
+    condCountdown: "倒计时",
+    condQuota: "次数余量",
+    condTally: "累计计数",
+    countdownHint: "倒计时=定时锁存：开始门升沿启动/重走（时限=当下+秒数，回满重走）；复位门升沿=停止并回满（未启动态）；出口=归零后 true 并锁存，再次开始瞬间翻 false，复位翻 false；重启按 wall-clock 差值继续走到零。",
+    countdownSeconds: "倒计时秒数",
+    quotaHint: "次数余量=预算闸门：消耗门升沿剩余>0→扣 1→出口 true；剩余=0→出口 false（拦截）；复位门升沿=恢复满 X；出口=最近一次消耗的结果。",
+    quotaTimes: "次数上限 X",
+    tallyHint: "累计计数=透传+副作用：计数门升沿 +1；出口随计数门电平透传（门假→出口假）；复位门升沿=归零；不判阈值不锁存，计数供面板/日志/未来判断面观测。",
+    portConsume: "消耗",
+    portCount: "计数",
+    wiredConsume: "消耗（由连线决定）",
+    wiredCount: "计数（由连线决定）",
+    wiredReset: "复位（由连线决定）",
+    summaryGatePrefix: "门×",
+    summaryResetPrefix: "复×",
+    statefulIdle: "未配置门",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -402,9 +418,25 @@ const LANG = {
     portA: "A",
     portB: "B",
     compareBadWire: "Wire rejected: compare A/B ports take snapshot or literal nodes only (the entity end is a form field); one wire per port.",
-    snapshotNoSignal: "Wire rejected: snapshot/compare/literal have no signal port; route trigger signal wires to a concrete condition or logic group.",
+    snapshotNoSignal: "Wire rejected: snapshot/compare/literal/stateful nodes (countdown/quota/tally) have no signal port; route trigger signal wires to a concrete condition or logic group.",
     logCapture: "captured",
     logClear: "cleared",
+    condCountdown: "Countdown",
+    condQuota: "Quota",
+    condTally: "Tally",
+    countdownHint: "A countdown latches on time: a rising start gate starts/restarts (deadline = now + seconds, full refill); a rising reset gate stops and refills (idle); the verdict goes true when zero is crossed and LATCHES — the next start flips it false instantly, reset flips it false; after a restart it continues by wall-clock difference to zero.",
+    countdownSeconds: "Countdown seconds",
+    quotaHint: "A quota is a budget gate: a rising consume gate with remaining > 0 takes 1 and reports true; at 0 it reports false (blocked); a rising reset gate restores the full X; the verdict is the LAST consume attempt's result.",
+    quotaTimes: "Limit X (times)",
+    tallyHint: "A tally passes its count gate through and counts: a rising count edge adds +1; the verdict follows the count gate's LEVEL (gate false → verdict false); a rising reset gate zeroes the count; no threshold, no latch — the count is observability state.",
+    portConsume: "consume",
+    portCount: "count",
+    wiredConsume: "Consume (wired)",
+    wiredCount: "Count (wired)",
+    wiredReset: "Reset (wired)",
+    summaryGatePrefix: "gate×",
+    summaryResetPrefix: "rst×",
+    statefulIdle: "no gates wired",
   },
 };
 
@@ -437,6 +469,9 @@ const TYPE_LABEL_KEY = {
   snapshot: "condSnapshot",
   literal: "condLiteral",
   compare: "condCompare",
+  countdown: "condCountdown",
+  quota: "condQuota",
+  tally: "condTally",
   and: "condAnd",
   or: "condOr",
   not: "condNot",
@@ -456,6 +491,9 @@ const TYPE_ICON = {
   snapshot: "📷",
   literal: "#",
   compare: "⚖",
+  countdown: "⏲",
+  quota: "🎫",
+  tally: "🧮",
   and: "⊕",
   or: "⊗",
   not: "¬",
@@ -464,6 +502,18 @@ const TYPE_ICON = {
 const TRIGGER_ICON = { state: "⚡", time: "🕐", sun: "🌤", homeassistant: "🏠" };
 const TRIGGER_LABEL_KEY = { state: "triggerState", time: "triggerTime", sun: "triggerSun", homeassistant: "triggerStart" };
 const isGroupType = (t) => t === "and" || t === "or" || t === "not";
+
+// Stateful step nodes (0.14.0): primary gate key per kind (reset is
+// "reset_conditions" for all three). Single source for the canvas import,
+// live sync, export and the node defaults — every type-specific branch
+// derives from this map so the faces cannot drift (R1 教训：分支内直取
+// 单一来源).
+const STATEFUL_GATE_KEY = {
+  countdown: "start_conditions",
+  quota: "consume_conditions",
+  tally: "count_conditions",
+};
+const isStatefulType = (t) => t in STATEFUL_GATE_KEY;
 
 function conditionSummary(cond, tr) {
   // `tr` is the panel's translation fn — node summaries follow hass.language
@@ -527,6 +577,23 @@ function conditionSummary(cond, tr) {
       const sideTxt = (side) =>
         !side ? "?" : side.kind === "entity" ? side.entity_id || "?" : `${side.kind}:${side.cond ? side.cond.slice(5, 11) : "?"}`;
       text = `${sideTxt(cond.a)} ${cond.op || "?"} ${sideTxt(cond.b)}`;
+      break;
+    }
+    case "countdown":
+    case "quota":
+    case "tally": {
+      const g = (cond[STATEFUL_GATE_KEY[cond.type]] || []).length;
+      const r = (cond.reset_conditions || []).length;
+      const parts = [];
+      if (g) parts.push(`${trk("summaryGatePrefix")}${g}`);
+      if (r) parts.push(`${trk("summaryResetPrefix")}${r}`);
+      const param =
+        cond.type === "countdown"
+          ? ` ${cond.seconds ?? "?"}s`
+          : cond.type === "quota"
+            ? ` ×${cond.times ?? "?"}`
+            : "";
+      text = `${TYPE_ICON[cond.type] || ""}${param}｜${parts.join(" / ") || trk("statefulIdle")}`;
       break;
     }
     default:
@@ -1060,7 +1127,7 @@ class ScannerPanel extends HTMLElement {
               .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag", "snapshot", "literal", "compare"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag", "snapshot", "literal", "compare", "countdown", "quota", "tally"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("logicGroups"))}</h3>
@@ -1369,6 +1436,9 @@ class ScannerPanel extends HTMLElement {
     flag: { input_1: "portSet", input_2: "portReset", output_1: "portOut" },
     snapshot: { input_1: "portCapture", input_2: "portClear", output_1: "portOut" },
     compare: { input_1: "portA", input_2: "portB", output_1: "portOut" },
+    countdown: { input_1: "portStart", input_2: "portReset", output_1: "portOut" },
+    quota: { input_1: "portConsume", input_2: "portReset", output_1: "portOut" },
+    tally: { input_1: "portCount", input_2: "portReset", output_1: "portOut" },
     literal: { output_1: "portOut" },
     group: { input_1: "portMembers", input_3: "portSignal", output_1: "portOut" },
     leaf: { input_3: "portSignal", output_1: "portOut" },
@@ -1465,13 +1535,15 @@ class ScannerPanel extends HTMLElement {
     if (!condId) return null;
     const cond = ed.controller.conditions.find((c) => c.id === condId);
     if (!cond) return null;
-    if (
-      ed.nodeToTrg.has(Number(e.output_id)) &&
-      (cond.type === "snapshot" || cond.type === "compare" || cond.type === "literal")
-    ) {
-      // signal wire onto a data node (0.13.0): no signal port exists
-      return this.tr("snapshotNoSignal");
-    }
+      if (
+        ed.nodeToTrg.has(Number(e.output_id)) &&
+        (cond.type === "snapshot" || cond.type === "compare" || cond.type === "literal" ||
+          isStatefulType(cond.type))
+      ) {
+        // signal wire onto a data/stateful node (0.13.0/0.14.0): no signal
+        // port exists
+        return this.tr("snapshotNoSignal");
+      }
     if (cond.type === "compare") {
       // wrong source kind (not a snapshot/literal) or a second wire on a
       // single-value A/B port — both land in the same explanation
@@ -1705,6 +1777,10 @@ class ScannerPanel extends HTMLElement {
         if (c.abort) stack.push(c.abort);
         stack.push(...(c.set_conditions || []), ...(c.reset_conditions || []));
         stack.push(...(c.capture || []), ...(c.clear || []));
+        // stateful gate edges (0.14.0) — same walk as the runtime index
+        for (const gk of Object.values(STATEFUL_GATE_KEY)) {
+          stack.push(...(c[gk] || []));
+        }
         if (c.a?.cond) stack.push(c.a.cond);
         if (c.b?.cond) stack.push(c.b.cond);
       }
@@ -1892,7 +1968,9 @@ class ScannerPanel extends HTMLElement {
           if (c.abort === condId) delete c.abort;
           // 0.13.0 data-node references cascade the same way (flag
           // set/reset keep the legacy dangling-reference face — the schema
-          // rejects the save visibly, unchanged behavior)
+          // rejects the save visibly, unchanged behavior); the 0.14.0
+          // stateful gates follow the FLAG face (dangling ref → visible
+          // schema rejection), reset_conditions likewise
           if (c.capture) c.capture = c.capture.filter((m) => m !== condId);
           if (c.clear) c.clear = c.clear.filter((m) => m !== condId);
           for (const k of ["a", "b"]) {
@@ -1972,6 +2050,18 @@ class ScannerPanel extends HTMLElement {
         }
       }
     }
+    // stateful gate wires (0.14.0): primary gate → input_1, reset → input_2
+    // (same shape as the flag/snapshot step gates)
+    for (const cond of conds) {
+      if (!isStatefulType(cond.type)) continue;
+      const tid = ed.condToNode.get(cond.id);
+      for (const [key, port] of [[STATEFUL_GATE_KEY[cond.type], "input_1"], ["reset_conditions", "input_2"]]) {
+        for (const m of cond[key] || []) {
+          const mid = ed.condToNode.get(m);
+          if (mid && tid) df.addConnection(String(mid), String(tid), "output_1", port);
+        }
+      }
+    }
     for (const cond of conds) {
       if (cond.type !== "compare") continue;
       const did = ed.condToNode.get(cond.id);
@@ -2008,7 +2098,8 @@ class ScannerPanel extends HTMLElement {
         const dstCond = ed.controller.conditions.find((c) => c.id === cid);
         if (
           dstCond?.type === "duration" || dstCond?.type === "flag" ||
-          dstCond?.type === "snapshot" || dstCond?.type === "compare" || dstCond?.type === "literal"
+          dstCond?.type === "snapshot" || dstCond?.type === "compare" || dstCond?.type === "literal" ||
+          isStatefulType(dstCond?.type)
         ) continue; // none of these carry input_3
         df.addConnection(String(srcNode), String(dst), "output_1", "input_3");
       }
@@ -2090,6 +2181,20 @@ class ScannerPanel extends HTMLElement {
           .filter(Boolean);
         const sbody = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
         if (sbody) sbody.textContent = conditionSummary(cond, (k) => this.tr(k));
+        continue;
+      }
+      if (isStatefulType(cond.type)) {
+        const nid = ed.condToNode.get(cond.id);
+        if (nid === undefined) continue;
+        const inputs = data[String(nid)]?.inputs || {};
+        cond[STATEFUL_GATE_KEY[cond.type]] = (inputs.input_1?.connections || [])
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean);
+        cond.reset_conditions = (inputs.input_2?.connections || [])
+          .map((c) => ed.nodeToCond.get(Number(c.node)))
+          .filter(Boolean);
+        const stbody = ed.df.container?.querySelector(`#node-${nid} [data-nbody]`);
+        if (stbody) stbody.textContent = conditionSummary(cond, (k) => this.tr(k));
         continue;
       }
       if (cond.type === "compare") {
@@ -2176,10 +2281,11 @@ class ScannerPanel extends HTMLElement {
       if (!dst) return false;
       if (
         dst.type === "duration" || dst.type === "flag" ||
-        dst.type === "snapshot" || dst.type === "compare" || dst.type === "literal"
+        dst.type === "snapshot" || dst.type === "compare" || dst.type === "literal" ||
+        isStatefulType(dst.type)
       ) {
-        // 0.13.0: data nodes carry no signal port (literal has no inputs
-        // at all) — same rejection face as duration/flag
+        // 0.13.0/0.14.0: data/stateful nodes carry no signal port (literal
+        // has no inputs at all) — same rejection face as duration/flag
         return false;
       }
       if (isGroupType(dst.type)) {
@@ -2211,6 +2317,11 @@ class ScannerPanel extends HTMLElement {
         if (dst && dst.type === "snapshot") {
           // capture/clear ports: multiple wires, each side evaluated as OR
           // (same face as flag set/reset)
+          return e.input_class === "input_1" || e.input_class === "input_2";
+        }
+        if (dst && isStatefulType(dst.type)) {
+          // stateful gate/reset ports: multiple wires, each side evaluated
+          // as OR (same face as flag set/reset / snapshot capture/clear)
           return e.input_class === "input_1" || e.input_class === "input_2";
         }
         if (dst && dst.type === "compare") {
@@ -2321,7 +2432,7 @@ class ScannerPanel extends HTMLElement {
     // has no inputs at all.
     const isGroup = isGroupType(cond.type);
     const isFlag = cond.type === "flag";
-    const twoPort = cond.type === "duration" || isFlag || cond.type === "snapshot" || cond.type === "compare";
+    const twoPort = cond.type === "duration" || isFlag || cond.type === "snapshot" || cond.type === "compare" || isStatefulType(cond.type);
     const inputs = cond.type === "literal" ? 0 : twoPort ? 2 : 3;
     const nodeId = ed.df.addNode(
       cond.type,
@@ -2340,6 +2451,7 @@ class ScannerPanel extends HTMLElement {
       : isFlag ? "flag"
       : cond.type === "snapshot" ? "snapshot"
       : cond.type === "compare" ? "compare"
+      : isStatefulType(cond.type) ? cond.type
       : cond.type === "literal" ? "literal"
       : isGroupType(cond.type) ? "group"
       : "leaf";
@@ -2407,6 +2519,17 @@ class ScannerPanel extends HTMLElement {
       cond.op = "above";
       cond.a = { kind: "entity", entity_id: "" };
       cond.b = { kind: "entity", entity_id: "" };
+    } else if (type === "countdown") {
+      cond.seconds = 60;
+      cond.start_conditions = [];
+      cond.reset_conditions = [];
+    } else if (type === "quota") {
+      cond.times = 3;
+      cond.consume_conditions = [];
+      cond.reset_conditions = [];
+    } else if (type === "tally") {
+      cond.count_conditions = [];
+      cond.reset_conditions = [];
     } else {
       cond.conditions = [];
     }
@@ -2613,7 +2736,7 @@ class ScannerPanel extends HTMLElement {
       ${isGroup
         ? `<p class="wha-sub">${esc(this.tr("members"))}: ${(cond.conditions || []).length}</p>`
         : this._condFieldsHtml(cond)}
-      ${isGroup || cond.type === "duration" || cond.type === "debounce" || cond.type === "flag"
+      ${isGroup || cond.type === "duration" || cond.type === "debounce" || cond.type === "flag" || isStatefulType(cond.type)
         ? ""
         : `<label class="field"><span>${esc(this.tr("forDuration"))}</span><span class="wha-row">
             <input class="wha-input" type="number" min="0" max="24" style="width:64px" data-for="hours" value="${esc(f.hours)}">:
@@ -2626,6 +2749,15 @@ class ScannerPanel extends HTMLElement {
       ${cond.type === "snapshot"
         ? `<p class="wha-sub">${esc(this.tr("wiredCapture"))}：${(cond.capture || []).length}<br>${esc(this.tr("wiredClear"))}：${(cond.clear || []).length}</p>`
         : ""}
+      ${cond.type === "countdown"
+        ? `<p class="wha-sub">${esc(this.tr("wiredStart"))}：${(cond.start_conditions || []).length}<br>${esc(this.tr("wiredReset"))}：${(cond.reset_conditions || []).length}</p>`
+        : ""}
+      ${cond.type === "quota"
+        ? `<p class="wha-sub">${esc(this.tr("wiredConsume"))}：${(cond.consume_conditions || []).length}<br>${esc(this.tr("wiredReset"))}：${(cond.reset_conditions || []).length}</p>`
+        : ""}
+      ${cond.type === "tally"
+        ? `<p class="wha-sub">${esc(this.tr("wiredCount"))}：${(cond.count_conditions || []).length}<br>${esc(this.tr("wiredReset"))}：${(cond.reset_conditions || []).length}</p>`
+        : ""}
       ${this._trialHtml()}`;
 
     box.querySelectorAll("[data-insk]").forEach((input) =>
@@ -2636,6 +2768,8 @@ class ScannerPanel extends HTMLElement {
           v = v === "" ? null : Number(v);
         } else if (k === "seconds") {
           v = Number(v) || 60;
+        } else if (k === "times") {
+          v = Number(v) || 1; // quota 次数：字符串会挂 schema 整数校验
         } else if (k === "state") {
           const parts = String(v).split(",").map((s) => s.trim()).filter(Boolean);
           v = parts.length > 1 ? parts : parts[0] || "on";
@@ -2760,6 +2894,16 @@ class ScannerPanel extends HTMLElement {
             </select></label>
           <label class="field"><span>${esc(trk("literalValue"))}</span><input class="wha-input" ${cond.value_type === "number" ? 'type="number" step="any"' : ""} data-insk="value" value="${esc(cond.value ?? "")}"></label>
           <p class="wha-sub">${esc(trk("literalHint"))}</p>`;
+      case "countdown":
+        return `
+          <label class="field"><span>${esc(trk("countdownSeconds"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="seconds" value="${esc(cond.seconds ?? 60)}"></label>
+          <p class="wha-sub">${esc(trk("countdownHint"))}</p>`;
+      case "quota":
+        return `
+          <label class="field"><span>${esc(trk("quotaTimes"))}</span><input class="wha-input" type="number" min="1" max="86400" data-insk="times" value="${esc(cond.times ?? 3)}"></label>
+          <p class="wha-sub">${esc(trk("quotaHint"))}</p>`;
+      case "tally":
+        return `<p class="wha-sub">${esc(trk("tallyHint"))}</p>`;
       case "compare": {
         const sideHtml = (which, labelKey) => {
           const side = cond[which] || {};
@@ -2850,6 +2994,9 @@ class ScannerPanel extends HTMLElement {
       } else if (cond.type === "snapshot") {
         cond.capture = nodeRefs(nid, "input_1");
         cond.clear = nodeRefs(nid, "input_2");
+      } else if (isStatefulType(cond.type)) {
+        cond[STATEFUL_GATE_KEY[cond.type]] = nodeRefs(nid, "input_1");
+        cond.reset_conditions = nodeRefs(nid, "input_2");
       } else if (cond.type === "compare") {
         cond.a = compareSide(nid, "input_1", cond.a);
         cond.b = compareSide(nid, "input_2", cond.b);

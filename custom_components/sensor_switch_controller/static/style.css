@@ -398,17 +398,27 @@ details.wha-json pre {
 /* plain leaves have no gate-input semantics - hide the dead ports
    (flag is exempt: its input_1/2 are the live set/reset ports, 审查 WHA-FIX R1-1;
    snapshot/compare are exempt too: their input_1/2 are the live capture/clear
-   and A/B ports — WHA-SNAPSHOT-121 R1-1, admission JS and CSS must agree) */
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare) .input_1,
-.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare) .input_2 {
+   and A/B ports — WHA-SNAPSHOT-121 R1-1, admission JS and CSS must agree;
+   the 0.14.0 stateful nodes are exempt likewise: input_1/2 are the live
+   gate/reset ports — WHA-STATEFUL-123, admission JS and CSS must agree) */
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare):not(.cond-countdown):not(.cond-quota):not(.cond-tally) .input_1,
+.parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare):not(.cond-countdown):not(.cond-quota):not(.cond-tally) .input_2 {
   display: none;
 }
 
-/* snapshot capture/clear ports: blue = capture (memory write), red = clear */
-.parent-drawflow .drawflow .wha-node.cond-snapshot .input_1 {
+/* snapshot capture/clear ports: blue = capture (memory write), red = clear;
+   the stateful gate/reset ports share the semantics (blue = action gate,
+   red = reset) */
+.parent-drawflow .drawflow .wha-node.cond-snapshot .input_1,
+.parent-drawflow .drawflow .wha-node.cond-countdown .input_1,
+.parent-drawflow .drawflow .wha-node.cond-quota .input_1,
+.parent-drawflow .drawflow .wha-node.cond-tally .input_1 {
   background: var(--wha-accent, #03a9f4);
 }
-.parent-drawflow .drawflow .wha-node.cond-snapshot .input_2 {
+.parent-drawflow .drawflow .wha-node.cond-snapshot .input_2,
+.parent-drawflow .drawflow .wha-node.cond-countdown .input_2,
+.parent-drawflow .drawflow .wha-node.cond-quota .input_2,
+.parent-drawflow .drawflow .wha-node.cond-tally .input_2 {
   background: var(--wha-bad, #db4437);
 }
 /* compare A/B input ports: slate like the gate wiring (value reads) */

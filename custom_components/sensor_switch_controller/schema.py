@@ -49,6 +49,7 @@ from .const import (
     COND_CALENDAR,
     COND_COOLDOWN,
     COND_COMPARE,
+    COND_COUNTDOWN,
     COND_DEBOUNCE,
     COND_DURATION,
     COND_FLAG,
@@ -56,9 +57,11 @@ from .const import (
     COND_NOT,
     COND_NUMERIC_STATE,
     COND_OR,
+    COND_QUOTA,
     COND_SNAPSHOT,
     COND_STATE,
     COND_SUN,
+    COND_TALLY,
     COND_TEMPLATE,
     COND_TIME,
     CONF_ABORT,
@@ -88,7 +91,10 @@ from .const import (
     DURATION_MAX,
     OUTPUT_BINARY_SENSOR,
     OUTPUT_SWITCH,
+    QUOTA_MAX,
     SUN_OFFSET_LIMIT,
+    STATEFUL_GATE_KEYS,
+    STATEFUL_TYPES,
     TRG_HOMEASSISTANT,
     TRG_ID_PREFIX,
     TRG_STATE,
@@ -134,6 +140,9 @@ NON_SIGNAL_TYPES = (
     COND_SNAPSHOT,
     COND_LITERAL,
     COND_COMPARE,
+    # stateful step nodes (0.14.0): latched verdicts, no signal port —
+    # same rejection face as the 0.13.0 data nodes
+    *STATEFUL_TYPES,
 )
 OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR)
 TRIGGER_TYPES = (TRG_STATE, TRG_TIME, TRG_SUN, TRG_HOMEASSISTANT)
@@ -454,6 +463,10 @@ def _covered_condition_ids(conditions: list, outputs: list, out_ids: list[str]) 
             # leaves drop out of the materialized coverage
             CONF_CAPTURE,
             CONF_CLEAR,
+            # stateful gate edges (0.14.0): same story — without them a
+            # stateful-driven chain's gate leaves drop out of the
+            # materialized coverage
+            *STATEFUL_GATE_KEYS.values(),
         ):
             stack.extend(m for m in cond.get(key) or [] if isinstance(m, str))
         # compare a/b cond references (0.13.0): the referenced snapshot/
@@ -560,7 +573,7 @@ def _validate_condition(cond) -> dict:
     if not isinstance(cond, dict):
         _fail("条件必须是对象")
     ctype = cond.get("type")
-    if ctype not in LEAF_TYPES + GROUP_TYPES + (COND_FLAG,):
+    if ctype not in LEAF_TYPES + GROUP_TYPES + (COND_FLAG,) + STATEFUL_TYPES:
         _fail(f"未知条件类型：{ctype!r}")
 
     cid = cond.get("id")
@@ -829,6 +842,64 @@ def _validate_condition(cond) -> dict:
             _fail(f"求值条件的 op 必须是 {'/'.join(COMPARE_OPS)}")
         result[CONF_OP] = op
 
+    elif ctype in STATEFUL_TYPES:
+        # Stateful step nodes (0.14.0): one mechanism, three parameterizations
+        # — countdown (start/reset), quota (consume/reset), tally
+        # (count/reset). Both gates are condition-id lists stepped once per
+        # evaluation cycle; ALL gates are rising-edge (通用口径: a level held
+        # high acts once) and same-cycle reset wins. No `for` (the verdict
+        # is stepped/latched like a flag — hold-before-true composes via a
+        # duration node); the per-kind parameter is range-checked below.
+        if cond.get("for"):
+            _fail("状态节点不支持 for：出口由步进/锁存决定，持续前置请用持续条件组合")
+        if ctype == COND_COUNTDOWN:
+            seconds = cond.get(CONF_SECONDS)
+            if isinstance(seconds, float) and not seconds.is_integer():
+                _fail("倒计时条件的 seconds 必须是整数秒")
+            try:
+                seconds = int(seconds)
+            except (OverflowError, TypeError, ValueError):
+                _fail("倒计时条件的 seconds 必须是秒数整数")
+            if not 1 <= seconds <= DURATION_MAX:
+                _fail(f"倒计时条件的 seconds 必须在 1-{DURATION_MAX} 秒之间")
+            result[CONF_SECONDS] = seconds
+        elif ctype == COND_QUOTA:
+            times = cond.get("times")
+            if isinstance(times, float) and not times.is_integer():
+                _fail("次数余量条件的 times 必须是整数")
+            try:
+                times = int(times)
+            except (OverflowError, TypeError, ValueError):
+                _fail("次数余量条件的 times 必须是次数整数")
+            if not 1 <= times <= QUOTA_MAX:
+                _fail(f"次数余量条件的 times 必须在 1-{QUOTA_MAX} 次之间")
+            result["times"] = times
+        gate_key = STATEFUL_GATE_KEYS[ctype]
+        gate_label = {
+            COND_COUNTDOWN: "开始",
+            COND_QUOTA: "消耗",
+            COND_TALLY: "计数",
+        }[ctype]
+        for key in (gate_key, CONF_RESET_CONDITIONS):
+            members = cond.get(key) or []
+            if not isinstance(members, list) or not all(
+                isinstance(m, str) for m in members
+            ):
+                _fail(f"状态节点条件的 {key} 必须是条件 id 字符串列表")
+            if len(set(members)) != len(members):
+                _fail(f"状态节点条件的 {key} 成员不能重复")
+            if cid in members:
+                # F-451 同型拒存：门引用自身读到本节点的出口判定——开始/消耗/
+                # 计数门读到的恒是上一拍旧值且边沿永不上升，复位门会拍后自清；
+                # 间接引用由 _check_graph 的闭包走查拒绝
+                _fail(
+                    f"状态节点条件不能直接以自身作为{gate_label}/复位条件："
+                    "门读到本节点自己的出口判定，语义不确定；请经其他条件驱动"
+                )
+            result[key] = list(dict.fromkeys(members))
+        if not result[gate_key] and not result[CONF_RESET_CONDITIONS]:
+            _fail(f"状态节点条件必须提供 {gate_key} 或 {CONF_RESET_CONDITIONS}")
+
     else:  # and / or / not
         members = cond.get("conditions") or []
         # an EMPTY group is provisionally allowed here: trigger-logic mode
@@ -945,6 +1016,8 @@ def _condition_neighbors(cond: dict, include_flag_edges: bool = True) -> list[st
             CONF_RESET_CONDITIONS,
             CONF_CAPTURE,
             CONF_CLEAR,
+            # stateful gate edges (0.14.0) — step edges, same treatment
+            *STATEFUL_GATE_KEYS.values(),
         ):
             val = cond.get(key)
             if isinstance(val, list):
@@ -992,6 +1065,8 @@ def _flag_branch_verdict(
             verdict = False  # no output context during the flag step
         elif ctype == COND_FLAG:
             verdict = None  # latched read; non-self callers already failed
+        elif ctype in STATEFUL_TYPES:
+            verdict = None  # latched read (step_stateful); same clemency
         elif ctype == COND_LITERAL:
             # constant node — but a `for` makes the first N seconds False
             # (the generic _apply_for path), so it is only PROVABLY true
@@ -1129,6 +1204,7 @@ def _reachable_from_chains(
                     CONF_RESET_CONDITIONS,
                     CONF_CAPTURE,
                     CONF_CLEAR,
+                    *STATEFUL_GATE_KEYS.values(),
                 ):
                     stack.extend(
                         m
@@ -1592,10 +1668,14 @@ def _check_graph(
             # excluded like in the flag cascade walk above — they read
             # latched memories, so a gate referencing ANOTHER snapshot/
             # flag is a legal memory read, not a live self-dependency.
-            # The duration ABORT edge is likewise left out: the engine
-            # reads it only to reset the gate (_evaluate_duration), so a
-            # self-read through it blocks re-arming instead of producing
-            # the never-fires empty-store trap this check targets.
+            # The duration ABORT edge splits by direction (R8#1/F-459):
+            # the CLEAR gate's walk INCLUDES it (clear=[
+            # duration(start=X, abort=self)] reads the snapshot's own
+            # "a snapshot exists" verdict through the abort input — clear
+            # is level-triggered and wins over capture, so the gate holds
+            # the snapshot empty forever), while the CAPTURE walk keeps
+            # excluding it (a one-shot self-reset via abort is legal — the
+            # abort fires only AFTER the capture landed, by design).
             seen: set[str] = set()
             stack: list[tuple[str, tuple[str, ...]]] = [
                 (m, (m,)) for m in cond[key]
@@ -1631,6 +1711,94 @@ def _check_graph(
                 nxt_edges = list(ncond.get("conditions") or [])
                 if isinstance(ncond.get(CONF_START), str):
                     nxt_edges.append(ncond[CONF_START])
+                # R8#1/F-459: the duration ABORT edge joins the CLEAR-gate
+                # walk only (see the comment above the walk for the split)
+                if key == CONF_CLEAR and isinstance(ncond.get(CONF_ABORT), str):
+                    nxt_edges.append(ncond[CONF_ABORT])
+                for side_key in (CONF_INPUT_A, CONF_INPUT_B):
+                    side = ncond.get(side_key)
+                    if isinstance(side, dict) and isinstance(
+                        side.get("cond"), str
+                    ):
+                        nxt_edges.append(side["cond"])
+                for nxt in nxt_edges:
+                    if nxt not in seen:
+                        stack.append((nxt, path + (nxt,)))
+
+    # Stateful gate checks (0.14.0): the same two faces as the flag/snapshot
+    # step-gate faces. (a) A provably-dead gate member (a cooldown has no
+    # output context in ANY step pass) would make the node's gate silently
+    # never fire; an empty non-signal group stays None (wiring anchor
+    # clemency, R6-3) and a mixed OR group keeps working via its other
+    # members. (b) The self-reference closure: the gate's evaluation-edge
+    # dependency closure reaching the node itself reads the node's OWN
+    # verdict — dead config, rejected (F-451 同型). The walk includes the
+    # duration ABORT edge for the RESET gate only (the R8#1/F-459 split:
+    # reset=[duration(start=X, abort=self)] self-reads through the abort
+    # input; the primary gate keeps the one-shot self-reset via abort legal).
+    for cond in conditions:
+        if cond["type"] not in STATEFUL_TYPES:
+            continue
+        if cond.get("enabled") is False:
+            # disabled stateful nodes are frozen (step_stateful skips them)
+            # — saveable as canvas anchors, same clemency as disabled flags
+            continue
+        label = cond.get("label") or cond["id"]
+        gate_key = STATEFUL_GATE_KEYS[cond["type"]]
+        for key in (gate_key, CONF_RESET_CONDITIONS):
+            if not cond[key]:
+                continue
+            memo: dict[str, bool | None] = {}
+            for member in cond[key]:
+                if _flag_branch_verdict(by_id[member], by_id, memo) is False:
+                    _fail(
+                        f"状态节点「{label}」的 {key}（直接或经组/持续门间接）恒不"
+                        "成立：冷却条件在状态节点步进时没有输出上下文（恒 False），"
+                        "AND 组混入冷却、NOT 组含恒真成员、持续门起点恒假"
+                        "或中止恒真同理；请修正该门"
+                    )
+            seen: set[str] = set()
+            stack: list[tuple[str, tuple[str, ...]]] = [
+                (m, (m,)) for m in cond[key]
+            ]
+            while stack:
+                node, path = stack.pop()
+                if node == cond["id"]:
+                    shown = "→".join(
+                        (by_id[n].get("label") or n)
+                        + ("（本节点）" if n == cond["id"] else "")
+                        for n in path
+                    )
+                    if key == gate_key:
+                        why = (
+                            "门读到本节点的出口判定——未动作时恒为假，该门永远无法"
+                            "上升，节点永不动作"
+                        )
+                    else:
+                        why = (
+                            "复位门读到本节点的出口判定——动作后门即为真，下一拍"
+                            "自复位且门保持期间重复触发"
+                        )
+                    _fail(
+                        f"状态节点「{label}」的 {key}（经 {shown} 间接）引用了"
+                        f"自身：{why}；请把该门改为不依赖本节点的条件"
+                    )
+                if node in seen:
+                    continue
+                seen.add(node)
+                ncond = by_id[node]
+                if ncond.get("enabled") is False:
+                    continue  # disabled nodes short-circuit: never read
+                nxt_edges = list(ncond.get("conditions") or [])
+                if isinstance(ncond.get(CONF_START), str):
+                    nxt_edges.append(ncond[CONF_START])
+                # the ABORT edge joins the RESET-gate walk only (the
+                # R8#1/F-459 split — see the snapshot block above)
+                if (
+                    key == CONF_RESET_CONDITIONS
+                    and isinstance(ncond.get(CONF_ABORT), str)
+                ):
+                    nxt_edges.append(ncond[CONF_ABORT])
                 for side_key in (CONF_INPUT_A, CONF_INPUT_B):
                     side = ncond.get(side_key)
                     if isinstance(side, dict) and isinstance(
@@ -1722,6 +1890,11 @@ def _check_graph(
             + list(cond.get(CONF_RESET_CONDITIONS) or [])
             + list(cond.get(CONF_CAPTURE) or [])
             + list(cond.get(CONF_CLEAR) or [])
+            + [
+                m
+                for key in STATEFUL_GATE_KEYS.values()
+                for m in cond.get(key) or []
+            ]
         )
         if isinstance(m, str)
     }
@@ -1776,9 +1949,9 @@ def _check_graph(
                 # cannot be drawn and the next canvas save would silently
                 # drop it
                 _fail(
-                    f"触发器「{label}」的信号线连到了持续门、旗标或数据节点"
-                    "（快照/常量/求值）：它们都不是信号起点，"
-                    "请连到具体条件或逻辑组"
+                    f"触发器「{label}」的信号线连到了持续门、旗标、数据节点"
+                    "或状态节点（快照/常量/求值/倒计时/次数余量/累计计数）："
+                    "它们都不是信号起点，请连到具体条件或逻辑组"
                 )
 
     # Save-time static hazard warnings (never rejecting): the off-chain
