@@ -283,35 +283,65 @@ def main():
             assert status3.find("ok") >= 0, status3
             print(f"[interact] domain switch repopulated level 2 {svc_opts2}; re-pick restores the ok face")
 
-            # --- R1#9: the vendor drag handling must not swallow real mouse
-            # events on the pickers — panel.js sets df.draggable_inputs=false
-            # (the vendor default true turns a select mousedown into a node
-            # DRAG, making the dropdowns unusable). Pin the flag AND the
-            # user-visible consequence: a real click on the select leaves
-            # the node exactly where it was.
+            # --- R1#9/R2#5: the vendor drag handling must not swallow real
+            # mouse events on node-body form elements — panel.js sets
+            # df.draggable_inputs=false. Empirical shape correction (R2#5):
+            # the vendored drawflow exempts SELECT targets in BOTH modes
+            # (its true-branch is `"SELECT" !== e.target.tagName`), so the
+            # discriminating face for this flag is an INPUT target —
+            # under the vendor default a pressed-drag on an in-node input
+            # MOVES the node; with the flag false it must not. Pin both:
+            # the assignment, and the user-visible consequence via a REAL
+            # pressed-drag-release sequence over an injected in-node input.
             flag = page.evaluate("() => window.__panel._editor.df.draggable_inputs")
             assert flag is False, (
-                f"df.draggable_inputs must stay false — the vendor default true "
-                f"makes the node-body pickers undraggable/unusable (R1#9): {flag}"
+                f"df.draggable_inputs must stay false — the INPUT/TEXTAREA "
+                f"face of the vendor drag guard (R1#9/R2#5): {flag}"
             )
             node_sel = page.evaluate(
                 "() => { const out = %s.querySelectorAll('.drawflow .wha-out')[0];"
                 " return '#node-' + out.id.slice(5); }" % canvas
             )
-            tf_before = page.evaluate(
-                "([sel]) => %s.querySelector(sel).style.transform" % canvas, [node_sel]
+            # the output column sits at _outX() — BEYOND the canvas wrap's
+            # overflow-hidden clip at the harness viewport, so raw mouse
+            # events would hit the host (hit-test miss, pin silently green —
+            # verified empirically R2#5). Bring the node into the visible
+            # clip first; drawflow reads the position back from style on
+            # drag, so the assertion reads left/top movement.
+            page.evaluate(
+                "([sel]) => { const el = %s.querySelector(sel);"
+                " el.style.left = '100px'; el.style.top = '60px'; }" % canvas,
+                [node_sel],
             )
-            page.click(f"{node_sel} .wha-svc-domain")
-            page.keyboard.press("Escape")
+            page.evaluate(
+                "([sel]) => { const node = %s.querySelector(sel);"
+                " const inp = document.createElement('input');"
+                " inp.className = 'wha-input'; inp.id = 'r2drag-input';"
+                " inp.style.width = '80px';"
+                " node.querySelector('.wha-svc-pick').appendChild(inp); }" % canvas,
+                [node_sel],
+            )
+            css_before = page.evaluate(
+                "([sel]) => %s.querySelector(sel).style.cssText" % canvas, [node_sel]
+            )
+            box = page.locator("#r2drag-input").bounding_box()
+            page.mouse.move(box["x"] + 10, box["y"] + 5)
+            page.mouse.down()
+            page.mouse.move(box["x"] + 90, box["y"] + 60, steps=5)
+            page.mouse.up()
             page.wait_for_timeout(150)
-            tf_after = page.evaluate(
-                "([sel]) => %s.querySelector(sel).style.transform" % canvas, [node_sel]
+            css_after = page.evaluate(
+                "([sel]) => %s.querySelector(sel).style.cssText" % canvas, [node_sel]
             )
-            assert tf_before == tf_after, (
-                f"a real mousedown on the picker started a node DRAG "
-                f"(draggable_inputs regression): {tf_before!r} -> {tf_after!r}"
+            page.evaluate(
+                "() => window.__panel.shadowRoot.getElementById('r2drag-input').remove()"
             )
-            print(f"[mouse] real click on the picker keeps the node planted ({node_sel})")
+            assert css_before == css_after, (
+                f"a real press-drag on an in-node INPUT MOVED the node "
+                f"(draggable_inputs regression — the vendor default drags "
+                f"input targets): {css_before!r} -> {css_after!r}"
+            )
+            print(f"[mouse] real press-drag on an in-node input keeps the node planted ({node_sel})")
 
             # --- palette path: a freshly added service node carries the
             # picker body and starts on the hint face

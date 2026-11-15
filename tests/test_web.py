@@ -1037,3 +1037,76 @@ def test_fumiha_service_registered_zero_args_save_is_silent(caplog):
         )
     assert resp.status == 200, getattr(resp, "text", resp)
     assert [r for r in caplog.records if "trip_count.depart" in r.getMessage()] == []
+
+
+def _post_request(hass, body):
+    req = _make_request(hass)
+
+    async def _json():
+        return body
+
+    req.json = _json
+    return req
+
+
+def test_fumiha_service_save_warning_wired_into_post(caplog):
+    """R2#2 (F-630) 接线钉对称面：POST（ControllersView.post）与 PUT 是两份
+    接线代码——删掉 web.py 的 POST 调用点时本钉必红（F-340/F-343 同型：
+    两点各一钉）。走真实 validate_controller，端点答 200 且 caplog 出现
+    保存告警。"""
+    hass = _hass_with_config_entries()
+    hass.bus = FakeBus()
+    hass.services = types.SimpleNamespace(
+        has_service=lambda d, s: False,
+        async_services=lambda: {},
+    )
+    _make_crud_hub(hass)
+    caplog.clear()
+    body = {
+        "name": "svc-post",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [],
+        "conditions": [],
+        "outputs": [
+            {
+                "name": "ghost",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "4" * 32,
+                "domain": "glm_quota",
+                "service": "reset",
+            }
+        ],
+    }
+    with caplog.at_level(
+        "WARNING", logger="custom_components.sensor_switch_controller.web"
+    ):
+        resp = asyncio.run(web_mod.ControllersView().post(_post_request(hass, body)))
+    assert resp.status == 200, getattr(resp, "text", resp)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("ghost" in m and "glm_quota.reset" in m for m in warned), warned
+    assert any("保存继续" in m for m in warned), warned
+
+
+def test_logs_view_accepts_call_decision_filter():
+    """R2#4：LogsView 的 decision 白名单含 call（删掉 web.py 的 "call" 时
+    本钉必红——面板日志过滤器会 400）。空日志库 → 200 + 空 records。"""
+    hass = _hass_with_config_entries()
+    async def _exec_job(fn, *a):  # decision_log 读盘面（须可 await）
+        return fn(*a)
+    hass.async_add_executor_job = _exec_job
+    hass.config = types.SimpleNamespace(config_dir="/tmp")  # 无日志库 → 空
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "x", "outputs": []}
+    req = types.SimpleNamespace(
+        app={"hass": hass},
+        query={
+            "controller_id": "ctrl_ab12cd34",
+            "date": "2026-11-15",
+            "limit": "10",
+            "decision": "call",
+        },
+    )
+    resp = asyncio.run(web_mod.LogsView().get(req))
+    assert resp.status == 200, getattr(resp, "text", resp)
+    assert '"records": []' in getattr(resp, "text", ""), getattr(resp, "text", resp)

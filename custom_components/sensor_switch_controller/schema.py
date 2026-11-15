@@ -1113,6 +1113,7 @@ def _flag_branch_verdict(
     cond: dict,
     by_id: dict[str, dict],
     memo: dict[str, bool | None],
+    signal_covered: set[str] | None = None,
 ) -> bool | None:
     """Abstract verdict of one branch as the flag step evaluates it
     (审查 R6-1/R6-3): False = provably dead in flag context (a cooldown
@@ -1136,6 +1137,17 @@ def _flag_branch_verdict(
     Empty groups read as None too: they are wiring anchors whose members
     may come later (the member_referenced check accepts flag wiring,
     R6-3). Cycle-safe via a None placeholder before recursing.
+
+    ``signal_covered`` (R2#3/F-631, used ONLY by the countdown-credit
+    caller _countdown_can_start) switches the EMPTY-GROUP verdict to the
+    ENGINE's view: a non-signal-anchor empty group is constant False
+    (_evaluate_cond) and a signal-anchored one is a pass-through True —
+    the None clemency above is a save-time face and must not lend wakeup
+    credit to a group the engine can never satisfy. The mode must be
+    consistent within one ``memo`` (mode-dependent values share the
+    cache); nested empty groups resolve through the normal Kleene merge
+    (and[empty, live] → False, or[empty, live] → None, not[empty] →
+    True — mirroring the engine).
     """
     cid = cond.get("id")
     if cid in memo:
@@ -1159,10 +1171,15 @@ def _flag_branch_verdict(
         elif ctype in GROUP_TYPES:
             members = cond.get("conditions") or []
             if not members:
-                verdict = None
+                if signal_covered is None:
+                    verdict = None
+                else:
+                    # engine view (F-631): anchored → pass-through True,
+                    # otherwise the engine's constant False
+                    verdict = True if cid in signal_covered else False
             else:
                 verdicts = [
-                    _flag_branch_verdict(by_id[member], by_id, memo)
+                    _flag_branch_verdict(by_id[member], by_id, memo, signal_covered)
                     for member in members
                 ]
                 # Kleene merge with constant dominance (审查 R7-2): the
@@ -1192,12 +1209,12 @@ def _flag_branch_verdict(
             start = by_id.get(cond.get(CONF_START))
             abort = by_id.get(cond.get(CONF_ABORT))
             start_v = (
-                _flag_branch_verdict(start, by_id, memo)
+                _flag_branch_verdict(start, by_id, memo, signal_covered)
                 if start is not None
                 else None
             )
             abort_v = (
-                _flag_branch_verdict(abort, by_id, memo)
+                _flag_branch_verdict(abort, by_id, memo, signal_covered)
                 if abort is not None
                 else None
             )
@@ -1374,26 +1391,19 @@ def _countdown_can_start(
     offers anything, so crediting it as a wakeup source muted faces ②/⑤
     for chains whose only "waker" could never wake anything. Same judge as
     the stateful dead-gate face in _check_graph, so the two cannot drift.
-    R1#4: an EMPTY GROUP member reads None in that judge (wiring-anchor
-    clemency), but the engine judges a NON-signal-anchor empty group
-    constant False (_evaluate_cond) — so an empty group member is NOT
-    viable unless a trigger's signal coverage anchors it (``signal_covered``
-    from _warn_static_hazards; without the set, conservatively treat every
-    empty group as the False the engine computes)."""
+    R1#4/R2#3 (F-631): the judge runs in the ENGINE's empty-group mode
+    (``signal_covered`` passed through) — a non-signal-anchor empty group
+    is constant False and the verdict resolves through the whole closure,
+    so DIRECT and NESTED empty groups alike lose the credit (and[
+    and[], live] → False via the Kleene merge), while a signal-anchored
+    empty group stays a viable pass-through True."""
     members = countdown.get(STATEFUL_GATE_KEYS[COND_COUNTDOWN]) or []
     memo: dict[str, bool | None] = {}
     for member in members:
         cond = by_id.get(member)
         if cond is None:
             continue
-        if _flag_branch_verdict(cond, by_id, memo) is False:
-            continue
-        if (
-            cond.get("type") in GROUP_TYPES
-            and not cond.get("conditions")
-            and (signal_covered is None or member not in signal_covered)
-        ):
-            # empty group the engine evaluates False (not a signal anchor)
+        if _flag_branch_verdict(cond, by_id, memo, signal_covered) is False:
             continue
         return True
     return False

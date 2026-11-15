@@ -5572,7 +5572,7 @@ async def main():
     svc_mgr_cfg = {
         "name": "svc-run",
         "enabled": True,
-        "logging_enabled": False,
+        "logging_enabled": True,  # R2#4: the call decision-log face is real
         "triggers": [{"id": "trg_" + "d" * 32, "type": "state",
                       "entity_id": "switch.c", "enabled": True,
                       "routes": {"conditions": [svc_leaf]}}],
@@ -5588,12 +5588,26 @@ async def main():
     # first-eval gate: the entity-less output must not block the cycle (it
     # used to wait for the 30s fallback with _expected_out_ids non-empty)
     assert mgr_svc._expected_out_ids == set(), mgr_svc._expected_out_ids
+    recs_svc = _log_cycles("ctrl_svc01")
     await mgr_svc._async_evaluate(None, ["init"], None)
     assert svc_calls == [("trip_count", "depart")], svc_calls
     assert mgr_svc.last_results[svc_out]["decision"] == "call"
     assert mgr_svc.last_results[svc_out]["applied"] is True
-    # held gate: the next cycle must NOT re-fire (rising edge)
+    # R2#4: the call row lands in the decision log (the segment head has
+    # claimed this face since 0.16.0 — it was pinned only here, R2-fix)
+    svc_log_rows = _log_tail(recs_svc, "ctrl_svc01")
+    assert any(
+        r.get("decision") == "call" and r.get("output") == "call-out"
+        for r in svc_log_rows
+    ), svc_log_rows
+    # held gate: the next cycle must NOT re-fire (rising edge)…
     await mgr_svc._async_evaluate(None, ["again"], None)
+    assert svc_calls == [("trip_count", "depart")], svc_calls
+    # …and NEITHER must the one after it (R2#1: the old
+    # `bool(gate and applied)` zeroed the ledger the cycle after a success —
+    # a level-held gate re-fired every SECOND cycle; this pin is red on the
+    # pre-fix code)
+    await mgr_svc._async_evaluate(None, ["again-2"], None)
     assert svc_calls == [("trip_count", "depart")], svc_calls
     # gate drops and rises → fires again
     svc_h.states._d["switch.c"] = "off"
@@ -5998,6 +6012,64 @@ async def main():
             f"an empty-group start gate must not credit the countdown "
             f"(engine judges it False): {_r1y_cap.records}"
         )
+        # R2#3 (F-631): the narrowing resolves through the WHOLE closure —
+        # a NESTED empty group (directly, or mixed with a live leaf in an
+        # AND) is constant False in the engine too, so both shapes must
+        # warn instead of silently freezing the faces.
+        r1y_grp2 = "cond_" + "8b" * 16
+        n_1y = sum("没有任何可唤醒源" in m for m in _r1y_cap.records)
+        validate_controller({
+            "name": "f471-nested-empty",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "switch.c", "enabled": True,
+                          "routes": {"conditions": []}}],
+            "conditions": [
+                {"id": r1y_cd, "type": "countdown", "label": "",
+                 "enabled": True, "seconds": 60,
+                 "start_conditions": [r1y_grp2], "reset_conditions": [r1y_x]},
+                {"id": r1y_grp2, "type": "and", "label": "", "enabled": True,
+                 "conditions": [r1y_grp]},
+                {"id": r1y_grp, "type": "and", "label": "", "enabled": True,
+                 "conditions": []},
+                {"id": r1y_x, "type": "state", "label": "", "enabled": True,
+                 "entity_id": "switch.c", "state": "on"},
+            ],
+            "outputs": [{"name": "o", "type": "switch", "entity_id": r1y_out,
+                         "on_conditions": [r1y_cd], "off_conditions": []}],
+        })
+        assert sum(
+            "没有任何可唤醒源" in m for m in _r1y_cap.records
+        ) == n_1y + 1, _r1y_cap.records
+        # nested empty group mixed with a live leaf in an AND — the AND
+        # merge is constant False, same freeze shape
+        r1y_grp3 = "cond_" + "8c" * 16
+        n_1y2 = sum("没有任何可唤醒源" in m for m in _r1y_cap.records)
+        validate_controller({
+            "name": "f471-nested-empty-mixed",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "switch.c", "enabled": True,
+                          "routes": {"conditions": []}}],
+            "conditions": [
+                {"id": r1y_cd, "type": "countdown", "label": "",
+                 "enabled": True, "seconds": 60,
+                 "start_conditions": [r1y_grp3], "reset_conditions": [r1y_x]},
+                {"id": r1y_grp3, "type": "and", "label": "", "enabled": True,
+                 "conditions": [r1y_grp, r1y_x]},
+                {"id": r1y_grp, "type": "and", "label": "", "enabled": True,
+                 "conditions": []},
+                {"id": r1y_x, "type": "state", "label": "", "enabled": True,
+                 "entity_id": "switch.c", "state": "on"},
+            ],
+            "outputs": [{"name": "o", "type": "switch", "entity_id": r1y_out,
+                         "on_conditions": [r1y_cd], "off_conditions": []}],
+        })
+        assert sum(
+            "没有任何可唤醒源" in m for m in _r1y_cap.records
+        ) == n_1y2 + 1, _r1y_cap.records
         # RED-green discriminator: the SAME shape with the empty group
         # signal-covered (a trigger anchors it pass-through=True) IS viable
         # — the empty-group face must NOT fire for the anchor (F-327/F-151)

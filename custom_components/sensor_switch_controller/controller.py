@@ -1208,10 +1208,15 @@ class ControllerManager:
                     domain,
                     service,
                 )
-        # Edge bookkeeping: consume on a successful call; a failed/missing
-        # call keeps the edge alive (retry next cycle); a dropped gate
-        # re-arms naturally.
-        self._service_prev[out_id] = bool(gate and applied)
+        # Edge bookkeeping: consume on a successful call and KEEP the
+        # consumption while the gate holds (R2#1: the old
+        # ``bool(gate and applied)`` recomputed the ledger every cycle, so
+        # the cycle AFTER a successful call wrote False — a level-held gate
+        # re-fired every SECOND cycle. 门真∧(本拍成功或上拍已记账)=保持；
+        # a failed/missing call keeps the edge alive (retry next cycle); a
+        # dropped gate re-arms naturally.
+        prev_held = self._service_prev.get(out_id, False)
+        self._service_prev[out_id] = bool(gate and (prev_held or applied))
 
         record = {
             "output": out_cfg.get("name"),

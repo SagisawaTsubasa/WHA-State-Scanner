@@ -1977,11 +1977,15 @@ class ScannerPanel extends HTMLElement {
   _initCanvas(container) {
     const ed = this._editor;
     const df = new window.Drawflow(container);
-    // 0.16.0: the 文羽服务 node body hosts interactive <select> pickers —
-    // vendor default (draggable_inputs=true) starts a node DRAG from a
-    // select mousedown, making the dropdowns unusable. False = inputs/
-    // selects/textareas never start a drag (verified against the vendored
-    // drawflow.min.js click handler).
+    // 0.16.0 (comment corrected R2#5): the 文羽服务 node body hosts
+    // interactive <select> pickers — the vendored drawflow EXEMPTS select
+    // targets from node dragging in BOTH modes of draggable_inputs (its
+    // true-branch is `"SELECT" !== e.target.tagName && (this.drag = true)`;
+    // verified empirically in dev/test_fumiha.py), so this flag is NOT
+    // load-bearing for the pickers themselves. It is set false DEFENSIVELY
+    // for the INPUT/TEXTAREA face — in-node text inputs (none today, the
+    // flag guards future ones) DO start a node drag under the vendor
+    // default, which is the discriminating shape the DOM pin pins.
     df.draggable_inputs = false;
     df.start();
     ed.df = df;
