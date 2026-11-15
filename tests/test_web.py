@@ -829,7 +829,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 def _svc_hass(registered: set[str]):
     hass = types.SimpleNamespace()
     hass.services = types.SimpleNamespace(
-        has_service=lambda domain, service: f"{domain}.{service}" in registered
+        has_service=lambda domain, service: f"{domain}.{service}" in registered,
+        # R1#2: the required-args judge reads the Service descriptors; the
+        # helper stubs carry no schema-bearing services
+        async_services=lambda: {},
     )
     return hass
 
@@ -907,3 +910,130 @@ def test_fumiha_domain_list_matches_panel():
         if m and not m.startswith("//")
     ]
     assert tuple(js_domains) == tuple(FUMIHA_SERVICE_DOMAINS), js_domains
+
+
+def test_fumiha_service_save_warning_wired_into_put(caplog):
+    """R1#8 接线钉：_warn_fumiha_services 挂在 PUT 视图上——删掉 web.py 的
+    调用点时本钉必红（helper-only 的钉抓不住接线回归，F-340/F-343 同型）。
+    走真实 validate_controller，端点答 200 且 caplog 出现保存告警。"""
+    hass = _hass_with_config_entries()
+    hass.bus = FakeBus()
+    hass.services = types.SimpleNamespace(has_service=lambda d, s: False)
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "old", "outputs": []}
+    caplog.clear()
+    body = {
+        "name": "svc",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [],
+        "conditions": [],
+        "outputs": [
+            {
+                "name": "ghost",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "2" * 32,
+                "domain": "glm_quota",
+                "service": "reset",
+            }
+        ],
+    }
+    with caplog.at_level(
+        "WARNING", logger="custom_components.sensor_switch_controller.web"
+    ):
+        resp = asyncio.run(
+            web_mod.ControllerDetailView().put(_put_request(hass, body), "ctrl_ab12cd34")
+        )
+    assert resp.status == 200, getattr(resp, "text", resp)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("ghost" in m and "glm_quota.reset" in m for m in warned), warned
+    assert any("保存继续" in m for m in warned), warned
+
+
+def test_fumiha_service_required_args_warning_wired_into_put(caplog):
+    """R1#2 服务端面：已注册但 schema 含 Required 的服务——PUT 保存时
+    WARN「仅支持零参服务」，不拒存（面板下拉已过滤，此钉覆盖 API 手写面）。"""
+    import voluptuous as vol
+    from types import SimpleNamespace as _NS
+
+    hass = _hass_with_config_entries()
+    hass.bus = FakeBus()
+    hass.services = types.SimpleNamespace(
+        has_service=lambda d, s: True,
+        async_services=lambda: {
+            "sensor_switch_controller": {
+                "force_evaluate": _NS(
+                    schema=vol.Schema({vol.Required("entity_id"): str})
+                )
+            }
+        },
+    )
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "old", "outputs": []}
+    caplog.clear()
+    body = {
+        "name": "svc",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [],
+        "conditions": [],
+        "outputs": [
+            {
+                "name": "args",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "9" * 32,
+                "domain": "sensor_switch_controller",
+                "service": "force_evaluate",
+            }
+        ],
+    }
+    with caplog.at_level(
+        "WARNING", logger="custom_components.sensor_switch_controller.web"
+    ):
+        resp = asyncio.run(
+            web_mod.ControllerDetailView().put(_put_request(hass, body), "ctrl_ab12cd34")
+        )
+    assert resp.status == 200, getattr(resp, "text", resp)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("必填参数" in m and "仅支持零参服务" in m for m in warned), warned
+
+
+def test_fumiha_service_registered_zero_args_save_is_silent(caplog):
+    """零参已注册服务：保存无告警（_required_args 判据不误伤）。"""
+    from types import SimpleNamespace as _NS
+
+    hass = _hass_with_config_entries()
+    hass.bus = FakeBus()
+    hass.services = types.SimpleNamespace(
+        has_service=lambda d, s: True,
+        async_services=lambda: {
+            "trip_count": {"depart": _NS(schema=None)},
+        },
+    )
+    hub = _make_crud_hub(hass)
+    hub.controllers["ctrl_ab12cd34"] = {"name": "old", "outputs": []}
+    caplog.clear()
+    body = {
+        "name": "svc",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [],
+        "conditions": [],
+        "outputs": [
+            {
+                "name": "ok",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "1" * 32,
+                "domain": "trip_count",
+                "service": "depart",
+            }
+        ],
+    }
+    with caplog.at_level(
+        "WARNING", logger="custom_components.sensor_switch_controller.web"
+    ):
+        resp = asyncio.run(
+            web_mod.ControllerDetailView().put(_put_request(hass, body), "ctrl_ab12cd34")
+        )
+    assert resp.status == 200, getattr(resp, "text", resp)
+    assert [r for r in caplog.records if "trip_count.depart" in r.getMessage()] == []

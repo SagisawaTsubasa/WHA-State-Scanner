@@ -3,13 +3,15 @@
 
 The R6 lesson (WHA-F-106): an admission criterion can be right on one end
 and still ship a dead feature when the CSS hides what the JS allows — the
-two ends must be checked in the SAME direction on the live DOM. This pin
+two ends must be checked in the same direction on the live DOM. This pin
 loads the REAL panel module with a controller carrying the three trip
 leaves and two 文羽服务 outputs, and asserts on DOM truth:
 
   1. trip leaves ARE signal origins on the canvas — input_3 visible, the
-     dead gate ports input_1/2 hidden (CSS :not() hide list extended for
-     the trip family; admission JS never rejected them);
+     dead gate ports input_1/2 hidden. Trip leaves are PLAIN leaves: the
+     default :not() hide rule already covers them and they must NEVER be
+     added to the :not() exemption chain (that chain lists leaves whose
+     input_1/2 are LIVE ports — flag/snapshot/compare/stateful; R1#7).
   2. the trigger's signal wire to a trip leaf is actually drawn;
   3. the service node body hosts the two-level pickers: level 1 = built-in
      list ∩ integrations present in the hass stub's services map, level 2
@@ -63,17 +65,28 @@ _PAGE_HTML = """<!doctype html>
         { name: "svc-ghost", type: "fumiha_service", entity_id: "ssc_g%H%",
           domain: "fumiha_lighting", service: "scene_on",
           on_conditions: ["cond_td"], off_conditions: [] },
+        { name: "svc-args", type: "fumiha_service", entity_id: "ssc_a%H%",
+          domain: "trip_count", service: "force_evaluate",
+          on_conditions: ["cond_tdu"], off_conditions: [] },
       ],
     };
     // services map face: ONLY two built-in domains installed — the level-1
     // dropdown must show exactly those two ("没装自然就没有"); trip_count
-    // registers two services; fumiha_lighting (a SAVED output's domain) is
-    // deliberately absent → the unavailable face.
+    // registers four services, one of which (force_evaluate) carries a
+    // required field (descriptor form = services.yaml passed through, R1#2)
+    // → the level-2 dropdown must filter it out; a SAVED output pointing at
+    // it shows the needs-arguments face and keeps it selectable;
+    // fumiha_lighting (a SAVED output's domain) is deliberately absent →
+    // the unavailable face, and its saved service must stay visible too
+    // (R1#10).
     const hassStub = {
       language: "zh-Hans",
       states: {},
       services: {
-        trip_count: { depart: {}, back: {}, mark_day: {} },
+        trip_count: {
+          depart: {}, back: {}, mark_day: {},
+          force_evaluate: { fields: { entity_id: { required: true } } },
+        },
         auto_night_light: { turn_on: {} },
       },
       async fetchWithAuth(url, opts = {}) {
@@ -167,7 +180,7 @@ def main():
             picks = page.evaluate(
                 "() => %s.querySelectorAll('.drawflow .wha-svc-pick').length" % canvas
             )
-            assert picks == 2, f"expected 2 service picker bodies, got {picks}"
+            assert picks == 3, f"expected 3 service picker bodies, got {picks}"
             # level 1 = built-in ∩ installed, built-in order: the stub has
             # trip_count + auto_night_light → exactly those two (+ the "—")
             dom_opts = page.evaluate(
@@ -177,14 +190,18 @@ def main():
             )
             assert dom_opts == ["", "trip_count", "auto_night_light"], dom_opts
             print(f"[level1] domain options = {dom_opts} (built-in ∩ installed)")
-            # level 2 = the chosen domain's registered services
+            # level 2 = the chosen domain's registered services MINUS
+            # required-field services (R1#2 filter face)
             svc_opts = page.evaluate(
                 "() => { const out = %s.querySelectorAll('.drawflow .wha-out')[0];"
                 " return Array.from(out.querySelectorAll('.wha-svc-service option'))"
                 ".map((o) => o.value); }" % canvas
             )
             assert svc_opts == ["", "back", "depart", "mark_day"], svc_opts
-            print(f"[level2] service options = {svc_opts} (sorted)")
+            assert "force_evaluate" not in svc_opts, (
+                "a required-field service must be filtered from level 2 (R1#2)"
+            )
+            print(f"[level2] service options = {svc_opts} (required-field service filtered)")
             # the ghost output (saved domain NOT installed) keeps its value
             # selectable — the dropdown never silently swallows it (决策 4)
             ghost_opts = page.evaluate(
@@ -194,6 +211,34 @@ def main():
             )
             assert ghost_opts == ["", "fumiha_lighting", "trip_count", "auto_night_light"], ghost_opts
             print(f"[level1] ghost output keeps its saved domain selectable: {ghost_opts}")
+            # R1#10: the ghost domain ALSO keeps its saved service visible
+            ghost_svc = page.evaluate(
+                "() => { const out = %s.querySelectorAll('.drawflow .wha-out')[1];"
+                " return Array.from(out.querySelectorAll('.wha-svc-service option'))"
+                ".map((o) => o.value); }" % canvas
+            )
+            assert "scene_on" in ghost_svc, (
+                f"the saved service must stay selectable on a ghost domain (R1#10): {ghost_svc}"
+            )
+            print(f"[level2] ghost output keeps its saved service selectable: {ghost_svc}")
+            # R1#2: a SAVED output pointing at a required-field service shows
+            # the needs-arguments face and keeps the service selectable
+            args_status = page.evaluate(
+                "() => { const out = %s.querySelectorAll('.drawflow .wha-out')[2];"
+                " const st = out.querySelector('.wha-svc-status');"
+                " return { cls: st.className, text: st.textContent }; }" % canvas
+            )
+            assert args_status["cls"].find("bad") >= 0, args_status
+            assert "必填参数" in args_status["text"], args_status
+            args_svc = page.evaluate(
+                "() => { const out = %s.querySelectorAll('.drawflow .wha-out')[2];"
+                " return Array.from(out.querySelectorAll('.wha-svc-service option'))"
+                ".map((o) => o.value); }" % canvas
+            )
+            assert "force_evaluate" in args_svc, (
+                f"the saved required-args service must stay selectable (R1#2): {args_svc}"
+            )
+            print(f"[status] needs-arguments face live + service kept: {args_status['text'][:16]}…")
             # status face: the ok output shows ✓, the ghost one shows the
             # explicit unavailable face (.bad) — 决策 4
             statuses = page.evaluate(
@@ -237,6 +282,36 @@ def main():
             )
             assert status3.find("ok") >= 0, status3
             print(f"[interact] domain switch repopulated level 2 {svc_opts2}; re-pick restores the ok face")
+
+            # --- R1#9: the vendor drag handling must not swallow real mouse
+            # events on the pickers — panel.js sets df.draggable_inputs=false
+            # (the vendor default true turns a select mousedown into a node
+            # DRAG, making the dropdowns unusable). Pin the flag AND the
+            # user-visible consequence: a real click on the select leaves
+            # the node exactly where it was.
+            flag = page.evaluate("() => window.__panel._editor.df.draggable_inputs")
+            assert flag is False, (
+                f"df.draggable_inputs must stay false — the vendor default true "
+                f"makes the node-body pickers undraggable/unusable (R1#9): {flag}"
+            )
+            node_sel = page.evaluate(
+                "() => { const out = %s.querySelectorAll('.drawflow .wha-out')[0];"
+                " return '#node-' + out.id.slice(5); }" % canvas
+            )
+            tf_before = page.evaluate(
+                "([sel]) => %s.querySelector(sel).style.transform" % canvas, [node_sel]
+            )
+            page.click(f"{node_sel} .wha-svc-domain")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+            tf_after = page.evaluate(
+                "([sel]) => %s.querySelector(sel).style.transform" % canvas, [node_sel]
+            )
+            assert tf_before == tf_after, (
+                f"a real mousedown on the picker started a node DRAG "
+                f"(draggable_inputs regression): {tf_before!r} -> {tf_after!r}"
+            )
+            print(f"[mouse] real click on the picker keeps the node planted ({node_sel})")
 
             # --- palette path: a freshly added service node carries the
             # picker body and starts on the hint face

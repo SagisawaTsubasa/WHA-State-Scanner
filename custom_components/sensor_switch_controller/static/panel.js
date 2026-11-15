@@ -242,6 +242,7 @@ const LANG = {
     svcDomainLabel: "集成",
     svcServiceLabel: "服务",
     svcUninstalled: "⚠ 所选集成未安装或服务不存在——节点显式不可用，运行时将记 ERROR 且不执行",
+    svcNeedsArgs: "⚠ 所选服务含必填参数——服务输出不带参数，调用会每周期失败；请改选零参服务",
     svcPickHint: "选集成→选服务；连上条件线即生效（升沿调用一次）",
     svcInspectorNote: "集成与服务在画布节点体内选择（非本表单）",
   },
@@ -465,6 +466,7 @@ const LANG = {
     svcDomainLabel: "Integration",
     svcServiceLabel: "Service",
     svcUninstalled: "⚠ The chosen integration is not installed or the service does not exist — the node is explicitly unavailable; runtime logs an ERROR and does nothing",
+    svcNeedsArgs: "⚠ The chosen service requires arguments — the service output sends none, so every call would fail; pick a zero-argument service",
     svcPickHint: "Pick integration → service; wire conditions to activate (one call per rising edge)",
     svcInspectorNote: "Integration and service are picked on the canvas node body (not this form)",
   },
@@ -2557,13 +2559,29 @@ class ScannerPanel extends HTMLElement {
   _serviceOptions() {
     // runtime snapshot face (决策 1 两级下拉): level 1 = the closed built-in
     // list ∩ integrations actually loaded in hass.services ("没装自然就
-    // 没有"); level 2 = the services the chosen domain currently registers.
+    // 没有"); level 2 = the services the chosen domain currently registers,
+    // MINUS services whose fields carry required:true (R1#2 — the service
+    // output calls with NO service_data, so a schema-required field can
+    // never be satisfied; descriptor form verified against HA 2026.1.3
+    // helpers/service.py:async_get_all_descriptions — fields pass the
+    // integration's services.yaml through verbatim).
     const svcMap = (this._hass && this._hass.services) || {};
+    const needsArgs = (domain, service) => {
+      const desc = domain && svcMap[domain] && svcMap[domain][service];
+      if (!desc) return false;
+      const fields = desc.fields || {};
+      return Object.keys(fields).some((f) => fields[f] && fields[f].required);
+    };
     const domains = FUMIHA_DOMAINS.filter((d) => svcMap[d]);
     return {
       domains,
+      needsArgs,
       servicesOf: (domain) =>
-        domain && svcMap[domain] ? Object.keys(svcMap[domain]).sort() : [],
+        domain && svcMap[domain]
+          ? Object.keys(svcMap[domain])
+              .filter((s) => !needsArgs(domain, s))
+              .sort()
+          : [],
     };
   }
 
@@ -2581,16 +2599,21 @@ class ScannerPanel extends HTMLElement {
     if (!el || !out) return;
     const body = el.querySelector("[data-nbody]");
     if (!body) return;
-    const { domains, servicesOf } = this._serviceOptions();
+    const { domains, servicesOf, needsArgs } = this._serviceOptions();
     const picked = out.domain || "";
     const pickedMissing = !!picked && !domains.includes(picked);
     const svcList = servicesOf(picked);
-    const svcMissing = !!picked && !svcList.includes(out.service || "") && !pickedMissing;
+    const savedService = out.service || "";
+    const svcNeedsArgs = !!picked && !!savedService && needsArgs(picked, savedService);
+    const svcMissing = !!picked && !!savedService && !svcList.includes(savedService) && !pickedMissing;
     // a saved-but-now-uninstalled domain/service stays selectable so the
     // user can see and fix it; the status line carries the warning (决策 4 —
-    // the dropdown must never silently swallow the saved value)
-    const domainList = picked && !domains.includes(picked) ? [picked, ...domains] : domains;
-    const svcAll = svcMissing ? [out.service, ...svcList] : svcList;
+    // the dropdown must never silently swallow the saved value; R1#10: the
+    // ghost-domain face used to drop the saved service from level 2)
+    const domainList = pickedMissing ? [picked, ...domains] : domains;
+    const svcAll = (pickedMissing || svcMissing || svcNeedsArgs) && savedService
+      ? [savedService, ...svcList]
+      : svcList;
     const domainOpts = [
       `<option value="">—</option>`,
       ...domainList.map(
@@ -2608,7 +2631,11 @@ class ScannerPanel extends HTMLElement {
     let status = "";
     if (!picked || !out.service) {
       status = `<div class="wha-svc-status muted">${esc(this.tr("svcPickHint"))}</div>`;
-    } else if (pickedMissing || svcMissing) {
+    } else if (pickedMissing) {
+      status = `<div class="wha-svc-status bad">${esc(this.tr("svcUninstalled"))}</div>`;
+    } else if (svcNeedsArgs) {
+      status = `<div class="wha-svc-status bad">${esc(this.tr("svcNeedsArgs"))}</div>`;
+    } else if (svcMissing) {
       status = `<div class="wha-svc-status bad">${esc(this.tr("svcUninstalled"))}</div>`;
     } else {
       status = `<div class="wha-svc-status ok">✓ ${esc(picked)}.${esc(out.service)}</div>`;

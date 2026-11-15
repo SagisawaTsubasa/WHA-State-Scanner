@@ -4150,7 +4150,7 @@ async def main():
             {"name": "o", "type": "switch", "entity_id": hz_o1,
              "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
         ]})
-        assert sum("start 由冷却支配" in r for r in sch_records[n_1n:]) == 1, (
+        assert sum("start 恒真化" in r for r in sch_records[n_1n:]) == 1, (
             "a duration on the off chain armed solely by a cooldown keeps "
             "the delayed off-polarity trap — must warn (R1#3): "
             f"{sch_records[n_1n:]}"
@@ -4168,7 +4168,7 @@ async def main():
             {"name": "o", "type": "switch", "entity_id": hz_o1,
              "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
         ]})
-        assert sum("start 由冷却支配" in r for r in sch_records[n_1ng:]) == 1, (
+        assert sum("start 恒真化" in r for r in sch_records[n_1ng:]) == 1, (
             "a pure-cooldown GROUP arming the start is the same delayed "
             f"trap shape as the direct one — must warn (R1#3): "
             f"{sch_records[n_1ng:]}"
@@ -5347,6 +5347,8 @@ async def main():
         raise AssertionError(f"expected failure containing {frag!r}")
 
     _trip_fail("trip_day", "必须是天数整数", day="two")
+    _trip_fail("trip_day", "必须是天数整数", day=2.5)  # R1#6: no silent truncation
+    _trip_fail("trip_day", "必须是天数整数", day=True)  # R1#6: bool is not a day
     _trip_fail("trip_day", "必须在 1-365 天之间", day=0)
     _trip_fail("trip_day", "必须在 1-365 天之间", day=366)
     _trip_fail("trip_duration", "必须是小时数", hours="x")
@@ -5420,6 +5422,25 @@ async def main():
         assert any(
             "trip since missing" in m for m in _warn_cap.records
         ), _warn_cap.records
+        # R1#1: a NOT-on state is the normal verdict — False with NO WARN
+        # in both attribute shapes (trip_count keeps the day_n/since keys
+        # with None values while off, cross-repo verified). The pre-fix
+        # code fired the missing-attribute WARN on every ordinary off
+        # evaluation.
+        n_off_warns = len(_warn_cap.records)
+        eng_h.states._d["binary_sensor.trip"] = "off"
+        eng_h.states._attrs["binary_sensor.trip"] = {
+            "day_n": 2, "since": "2026-10-04T10:00:00",
+        }
+        assert await eng_trp._evaluate_id(trp_day, set()) is False
+        assert await eng_trp._evaluate_id(trp_dur, set()) is False
+        eng_h.states._attrs["binary_sensor.trip"] = {"day_n": None, "since": None}
+        assert await eng_trp._evaluate_id(trp_day, set()) is False
+        assert await eng_trp._evaluate_id(trp_dur, set()) is False
+        assert len(_warn_cap.records) == n_off_warns, (
+            f"an off trip must stay silent (normal state, not unavailable): "
+            f"{_warn_cap.records[n_off_warns:]}"
+        )
         # wakeup edges: duration offers since+hours (future), day offers the
         # next local midnight, trip_on offers nothing. Expectations derive
         # from the LIVE stub clock — earlier segments advance it (the 续走
@@ -5682,7 +5703,7 @@ async def main():
             }
 
         def _f556_n_warn():
-            return sum("start 由冷却支配" in r for r in _f556_cap.records)
+            return sum("start 恒真化" in r for r in _f556_cap.records)
 
         # RED: OR[cooldown, live leaf] arming the off-chain duration —
         # one cooldown member dominates the OR verdict at cold start
@@ -5902,6 +5923,191 @@ async def main():
     assert mgr_473.engine.stateful_values()[f473_nid]["deadline"] is None
     mgr_473.async_unload()
     print("[PASS] F-473: bad deadline self-heals into the hub table + debounced disk write")
+
+    # ------------------------------------------------------------------
+    # R1#3 判别钉: trip_on is a state-shaped leaf, NOT a wall-clock gate —
+    # a chain whose only "waker" is a trip_on leaf must still warn (face ⑤;
+    # next_wakeup offers nothing for trip_on, same face as COND_STATE).
+    # ------------------------------------------------------------------
+    r1x_on = "cond_" + "9a" * 16
+    r1x_out = "ssc_" + "9a" * 16
+    _r1x_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _r1x_cap = _WarnCap()
+    _r1x_logger.addHandler(_r1x_cap)
+    try:
+        validate_controller({
+            "name": "trip-on-freeze",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "binary_sensor.trip", "enabled": True,
+                          "routes": {"conditions": []}}],
+            "conditions": [{"id": r1x_on, "type": "trip_on", "label": "",
+                            "enabled": True,
+                            "entity_id": "binary_sensor.trip"}],
+            "outputs": [{"name": "o", "type": "switch", "entity_id": r1x_out,
+                         "on_conditions": [r1x_on], "off_conditions": []}],
+        })
+        assert any("没有任何可唤醒源" in m for m in _r1x_cap.records), (
+            f"a trip_on-only chain must still warn (no clock edge, no signal "
+            f"coverage): {_r1x_cap.records}"
+        )
+    finally:
+        _r1x_logger.removeHandler(_r1x_cap)
+    print("[PASS] R1#3: trip_on-only chain warns (not a wall-clock gate)")
+
+    # ------------------------------------------------------------------
+    # R1#4 判别钉: F-471 credit narrowed — an EMPTY non-signal-anchor group
+    # as the countdown's start gate is NOT viable (the engine judges it
+    # constant False), so the chain must warn instead of the credit muting
+    # faces ②/⑤. The shape is saveable (member_referenced covers stateful
+    # gate members).
+    # ------------------------------------------------------------------
+    r1y_cd = "cond_" + "9b" * 16
+    r1y_grp = "cond_" + "9c" * 16
+    r1y_x = "cond_" + "9d" * 16
+    r1y_out = "ssc_" + "9b" * 16
+    _r1y_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _r1y_cap = _WarnCap()
+    _r1y_logger.addHandler(_r1y_cap)
+    try:
+        validate_controller({
+            "name": "f471-empty-group",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "switch.c", "enabled": True,
+                          "routes": {"conditions": []}}],
+            "conditions": [
+                {"id": r1y_cd, "type": "countdown", "label": "",
+                 "enabled": True, "seconds": 60,
+                 "start_conditions": [r1y_grp], "reset_conditions": [r1y_x]},
+                {"id": r1y_grp, "type": "and", "label": "", "enabled": True,
+                 "conditions": []},
+                {"id": r1y_x, "type": "state", "label": "", "enabled": True,
+                 "entity_id": "switch.c", "state": "on"},
+            ],
+            "outputs": [{"name": "o", "type": "switch", "entity_id": r1y_out,
+                         "on_conditions": [r1y_cd], "off_conditions": []}],
+        })
+        assert any("没有任何可唤醒源" in m for m in _r1y_cap.records), (
+            f"an empty-group start gate must not credit the countdown "
+            f"(engine judges it False): {_r1y_cap.records}"
+        )
+        # RED-green discriminator: the SAME shape with the empty group
+        # signal-covered (a trigger anchors it pass-through=True) IS viable
+        # — the empty-group face must NOT fire for the anchor (F-327/F-151)
+        r1y_cap_n = len(_r1y_cap.records)
+        validate_controller({
+            "name": "f471-empty-group-anchored",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "switch.c", "enabled": True,
+                          "routes": {"conditions": [r1y_grp]}}],
+            "conditions": [
+                {"id": r1y_cd, "type": "countdown", "label": "",
+                 "enabled": True, "seconds": 60,
+                 "start_conditions": [r1y_grp], "reset_conditions": [r1y_x]},
+                {"id": r1y_grp, "type": "and", "label": "", "enabled": True,
+                 "conditions": []},
+                {"id": r1y_x, "type": "state", "label": "", "enabled": True,
+                 "entity_id": "switch.c", "state": "on"},
+            ],
+            "outputs": [{"name": "o", "type": "switch", "entity_id": r1y_out,
+                         "on_conditions": [r1y_cd], "off_conditions": []}],
+        })
+        assert not any(
+            "没有任何可唤醒源" in m for m in _r1y_cap.records[r1y_cap_n:]
+        ), _r1y_cap.records[r1y_cap_n:]
+    finally:
+        _r1y_logger.removeHandler(_r1y_cap)
+    print("[PASS] R1#4: empty-group start gate loses the credit unless signal-anchored")
+
+    # ------------------------------------------------------------------
+    # R1#5 判别钉: the ①n predicate treats DISABLED members as True
+    # contributors (engine short-circuit) — an all-disabled group is a
+    # CONSTANT-TRUE start (the delayed off-polarity trap without any
+    # cooldown), and the old skip-then-empty→False shape exempted it from
+    # every warning face.
+    # ------------------------------------------------------------------
+    r1z_d1 = "cond_" + "9e" * 16
+    r1z_d2 = "cond_" + "9f" * 16
+    r1z_live = "cond_" + "9a" * 16
+    r1z_grp = "cond_" + "9b" * 16
+    r1z_dur = "cond_" + "9c" * 16
+    r1z_out = "ssc_" + "9c" * 16
+    _r1z_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _r1z_cap = _WarnCap()
+    _r1z_logger.addHandler(_r1z_cap)
+    try:
+        def _r1z_cfg(start_ref):
+            return {
+                "name": "r1#5",
+                "enabled": True,
+                "logging_enabled": False,
+                "triggers": [{"id": trp_trg, "type": "state",
+                              "entity_id": "switch.c", "enabled": True,
+                              "routes": {"conditions": [r1z_live]}}],
+                "conditions": [
+                    {"id": r1z_d1, "type": "state", "label": "",
+                     "enabled": False, "entity_id": "switch.c",
+                     "state": "on"},
+                    {"id": r1z_d2, "type": "state", "label": "",
+                     "enabled": False, "entity_id": "switch.d",
+                     "state": "on"},
+                    {"id": r1z_live, "type": "state", "label": "",
+                     "enabled": True, "entity_id": "switch.c",
+                     "state": "on"},
+                    {"id": r1z_grp, "type": "and", "label": "",
+                     "enabled": True,
+                     "conditions": [r1z_d1, r1z_d2]},
+                    {"id": r1z_dur, "type": "duration", "label": "",
+                     "enabled": True, "seconds": 60,
+                     "start": start_ref, "abort": None},
+                ],
+                "outputs": [{"name": "o", "type": "switch",
+                             "entity_id": r1z_out,
+                             "on_conditions": [r1z_live],
+                             "off_conditions": [r1z_dur]}],
+            }
+
+        def _r1z_n_warn():
+            return sum("start 恒真化" in r for r in _r1z_cap.records)
+        # RED: AND[all disabled] start = constant True (delayed off trap)
+        n0 = _r1z_n_warn()
+        validate_controller(_r1z_cfg(r1z_grp))
+        assert _r1z_n_warn() == n0 + 1, _r1z_cap.records[n0:]
+        # RED: the same via OR (any True member dominates)
+        r1z_grp_or = "cond_" + ("9d" * 16)
+        n1 = _r1z_n_warn()
+        cfg = _r1z_cfg(r1z_grp_or)
+        for c in cfg["conditions"]:
+            if c["id"] == r1z_grp:
+                c["id"] = r1z_grp_or
+                c["type"] = "or"
+        validate_controller(cfg)
+        assert _r1z_n_warn() == n1 + 1, _r1z_cap.records[n1:]
+        # GREEN boundary: mixed AND[live, disabled] keeps the live verdict
+        # in the chain (engine AND(live, True) = live) — no warning
+        r1z_grp_mix = "cond_" + ("1e" * 16)
+        n2 = _r1z_n_warn()
+        cfg2 = _r1z_cfg(r1z_grp_mix)
+        for c in cfg2["conditions"]:
+            if c["id"] == r1z_grp:
+                c["id"] = r1z_grp_mix
+                c["conditions"] = [r1z_live, r1z_d1]
+        validate_controller(cfg2)
+        assert _r1z_n_warn() == n2, _r1z_cap.records[n2:]
+    finally:
+        _r1z_logger.removeHandler(_r1z_cap)
+    print("[PASS] R1#5: all-disabled group start warns (constant-True trap), mixed AND stays silent")
 
 asyncio.run(main())
 print("SMOKE OK")

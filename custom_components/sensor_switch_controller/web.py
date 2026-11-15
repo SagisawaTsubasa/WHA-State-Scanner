@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import voluptuous as vol
 from aiohttp import web
 from homeassistant.components import frontend
 from homeassistant.components.http import (
@@ -48,6 +49,26 @@ _LOGGER = logging.getLogger(__name__)
 WEB_DATA_KEY = f"{DOMAIN}_web_registered"
 
 
+def _service_requires_arguments(hass, domain: str, service: str) -> bool:
+    """R1#2: True when the registered service's schema carries Required
+    keys — the service output calls ``{domain, service}`` with NO
+    service_data, so a schema-required field can never be satisfied and the
+    call fails every cycle. Judge = the Service object's own vol schema
+    (HA 2026.1.3 core.py: ``Service.schema`` is the registered
+    VolSchemaType; ``vol.Required`` markers are the required-field face).
+    A composite (vol.All) or dict-shaped schema that does not expose a
+    plain key mapping is not judgeable here and conservatively returns
+    False — the runtime validation ERROR face still rings every attempt."""
+    svc = hass.services.async_services().get(domain, {}).get(service)
+    schema_obj = getattr(svc, "schema", None) if svc is not None else None
+    if schema_obj is None:
+        return False
+    inner = getattr(schema_obj, "schema", schema_obj)
+    if not isinstance(inner, dict):
+        return False
+    return any(isinstance(key, vol.Required) for key in inner)
+
+
 def _warn_fumiha_services(hass, config: dict) -> None:
     """Save-time reality check for 文羽服务 outputs (0.16.0, 决策 4): a
     domain/service that is not registered RIGHT NOW warns loudly but never
@@ -55,13 +76,24 @@ def _warn_fumiha_services(hass, config: dict) -> None:
     saving (the schema's closed-domain face already rejects anything
     outside the built-in list; this face covers the runtime reality the
     schema cannot see). The runtime mirror is the engine's ERROR log on
-    every call attempt."""
+    every call attempt. R1#2: a REGISTERED service whose schema carries
+    Required keys warns too (the panel dropdown filters those out; this
+    face catches hand-written API payloads)."""
     for out in config.get("outputs") or []:
         if not isinstance(out, dict) or out.get("type") != OUTPUT_FUMIHA_SERVICE:
             continue
         domain = out.get(CONF_DOMAIN) or ""
         service = out.get(CONF_SERVICE) or ""
         if hass.services.has_service(domain, service):
+            if _service_requires_arguments(hass, domain, service):
+                _LOGGER.warning(
+                    "输出「%s」指向的 %s.%s 含必填参数（schema Required），"
+                    "而服务输出无法提供 service_data：调用将每周期失败——"
+                    "节点仅支持零参服务，请改选其他服务",
+                    out.get("name") or out.get("entity_id") or "?",
+                    domain,
+                    service,
+                )
             continue
         _LOGGER.warning(
             "输出「%s」指向的 %s.%s 当前未注册（集成缺装或服务不存在）："

@@ -880,6 +880,13 @@ def _validate_condition(cond) -> dict:
         result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "出差实体")
         if ctype == COND_TRIP_DAY:
             day = cond.get(CONF_DAY)
+            # R1#6: same guard as seconds/times — bools and non-integer
+            # floats are rejected instead of silently truncating
+            # (int(True)=1, int(2.5)=2 were silent rewrites).
+            if isinstance(day, bool) or (
+                isinstance(day, float) and not day.is_integer()
+            ):
+                _fail("出差第N天条件的 day 必须是天数整数")
             try:
                 day = int(day)
             except (OverflowError, TypeError, ValueError):
@@ -1313,15 +1320,23 @@ def _start_armed_by_cooldown(
     keeps diamond-shared members honest per walk). A NOT group or any other
     leaf type makes the subtree impure — the cooldown then shares the start
     verdict with live signals, which is the legitimate on-branch arming
-    shape face ① deliberately stopped warning about. A DISABLED node is
-    skipped (the engine short-circuits it to True, so it contributes no
-    gate), and a subtree empty after skipping is not judged here (the
-    constant-group family, F-327)."""
+    shape face ① deliberately stopped warning about.
+
+    DISABLED nodes count as True contributors (R1#5): the engine
+    short-circuits them to True (condition_engine._evaluate_id), so an
+    all-disabled group is a CONSTANT-TRUE start — the same delayed
+    off-polarity trap as the pure-cooldown composition, and the old
+    skip-then-empty→False shape silently exempted it from every warning
+    face. Merge follows the group's OWN polarity (F-556): an AND holds
+    only when every member arms (all), but an OR already reads True at
+    cold start from ONE True-dominating member (a cooldown or a disabled
+    node), so any() is the honest predicate."""
     cond = by_id.get(start_ref)
     if not cond or start_ref in _path:
         return False
     if cond.get("enabled") is False:
-        return False
+        # engine short-circuit: disabled = constant True contributor
+        return True
     ctype = cond.get("type")
     if ctype == COND_COOLDOWN:
         return True
@@ -1331,10 +1346,9 @@ def _start_armed_by_cooldown(
         m
         for m in cond.get("conditions") or []
         if isinstance(m, str)
-        and (by_id.get(m) or {}).get("enabled") is not False
     ]
     if not members:
-        return False
+        return False  # empty non-signal group = constant False (R6-3): no trap
     path = _path | {start_ref}
     # F-556: the merge follows the group's OWN polarity — an AND holds only
     # when every member arms (all), but an OR already reads True at cold
@@ -1342,13 +1356,15 @@ def _start_armed_by_cooldown(
     # the OR verdict), so the trap exists with a single cooldown member and
     # any() is the honest predicate. The old all() let
     # "OR[cooldown, live leaf]" save silently while the delayed off-polarity
-    # trap stayed live.
+    # trap stayed live. Disabled members join as True (R1#5).
     if ctype == COND_OR:
         return any(_start_armed_by_cooldown(m, by_id, path) for m in members)
     return all(_start_armed_by_cooldown(m, by_id, path) for m in members)
 
 
-def _countdown_can_start(countdown: dict, by_id: dict[str, dict]) -> bool:
+def _countdown_can_start(
+    countdown: dict, by_id: dict[str, dict], signal_covered: set[str] | None = None
+) -> bool:
     """F-471: True when the countdown's start gate can ever fire — at least
     one start-gate member is NOT provably dead in the flag-step judge
     (_flag_branch_verdict: cooldown = no output context = False, an AND with
@@ -1357,13 +1373,29 @@ def _countdown_can_start(countdown: dict, by_id: dict[str, dict]) -> bool:
     never start the timer — the deadline never exists, next_wakeup never
     offers anything, so crediting it as a wakeup source muted faces ②/⑤
     for chains whose only "waker" could never wake anything. Same judge as
-    the stateful dead-gate face in _check_graph, so the two cannot drift."""
+    the stateful dead-gate face in _check_graph, so the two cannot drift.
+    R1#4: an EMPTY GROUP member reads None in that judge (wiring-anchor
+    clemency), but the engine judges a NON-signal-anchor empty group
+    constant False (_evaluate_cond) — so an empty group member is NOT
+    viable unless a trigger's signal coverage anchors it (``signal_covered``
+    from _warn_static_hazards; without the set, conservatively treat every
+    empty group as the False the engine computes)."""
     members = countdown.get(STATEFUL_GATE_KEYS[COND_COUNTDOWN]) or []
     memo: dict[str, bool | None] = {}
     for member in members:
         cond = by_id.get(member)
-        if cond is not None and _flag_branch_verdict(cond, by_id, memo) is not False:
-            return True
+        if cond is None:
+            continue
+        if _flag_branch_verdict(cond, by_id, memo) is False:
+            continue
+        if (
+            cond.get("type") in GROUP_TYPES
+            and not cond.get("conditions")
+            and (signal_covered is None or member not in signal_covered)
+        ):
+            # empty group the engine evaluates False (not a signal anchor)
+            continue
+        return True
     return False
 
 
@@ -1480,20 +1512,27 @@ def _warn_static_hazards(
     # `for` gates and COND_COUNTDOWN are deliberately absent — they are
     # evaluation-born (a countdown's deadline exists only once its start
     # gate was evaluated; see the wakeup arm below and live_reach above).
-    # The trip leaves (0.16.0) join this set: their verdicts flip at pure
-    # clock boundaries (day_n rolls at the day seam; 段时长 crosses at
-    # since+hours) and next_wakeup offers both edges.
+    # Of the trip leaves (0.16.0) only trip_day/trip_duration join this
+    # set (their verdicts flip at pure clock boundaries — day_n rolls at
+    # the day seam, 段时长 crosses at since+hours, and next_wakeup offers
+    # both edges); trip_on is a plain state-shaped leaf (R1#3: its verdict
+    # flips only on trip_count entity events and next_wakeup offers nothing
+    # for it — crediting it muted faces ②/⑤ exactly like the F-471 false
+    # credit).
     wall_clock_types = {
         COND_TIME,
         COND_SUN,
         COND_DEBOUNCE,
         COND_COOLDOWN,
-        *TRIP_TYPES,
+        COND_TRIP_DAY,
+        COND_TRIP_DURATION,
     }
     def _countdown_credit(cid: str) -> bool:
         """F-471: the countdown wakeup credit requires a startable gate."""
         cond = by_id.get(cid)
-        return cond is not None and _countdown_can_start(cond, by_id)
+        return cond is not None and _countdown_can_start(
+            cond, by_id, signal_covered
+        )
     # R4-1 entity-coverage join: compare nodes whose entity end an ENABLED
     # state trigger listens to — the runtime routing index pulls their
     # outputs into that trigger's dispatch targets (controller
@@ -1569,12 +1608,13 @@ def _warn_static_hazards(
             ):
                 continue
             _LOGGER.warning(
-                "输出「%s」的 off 链持续条件「%s」的 start 由冷却支配（直接、经"
-                "纯冷却组，或 OR 组混入任一冷却成员——冷却冷启动无翻转史恒为 "
-                "True 并在 OR 中占优）：持续门 N 秒后自行放行，而输出已处于 off "
-                "时 off 判定不产生新翻转记录，冷却将永远恒 True 并以 off 优先永"
-                "久压制 on 链——与直接挂 off 链同型的延迟版陷阱，请把冷却挂 on "
-                "链或让 start 判据离不开活信号",
+                "输出「%s」的 off 链持续条件「%s」的 start 恒真化（直接、经"
+                "纯冷却组，或组内常量真成员占优——冷却冷启动无翻转史恒为 True、"
+                "停用成员被引擎短路恒为 True，OR 组混入任一即占优、AND 组需全"
+                "部）：持续门 N 秒后自行放行，而输出已处于 off 时 off 判定不产"
+                "生新翻转记录，start 将永远恒 True 并以 off 优先永久压制 on "
+                "链——与直接挂 off 链同型的延迟版陷阱，请把冷却挂 on 链或让 "
+                "start 判据离不开活信号",
                 out_label,
                 dur.get("label") or cid,
             )

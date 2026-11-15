@@ -1337,7 +1337,13 @@ class ConditionEngine:
         a missing/unparseable attribute degrades LOUDLY: rate-limited WARN
         (the F-323 face) + False — 决策 5 显式不可用，禁静默回落. A trip in
         progress with day_n/since absent is the same loud face (a lying or
-        foreign source must stay visible, not silently read False)."""
+        foreign source must stay visible, not silently read False). A NOT-
+        on state (state "off") is a NORMAL verdict, not an unavailable
+        source — trip_count keeps the day_n/since attribute KEYS present
+        with None values while off (cross-repo verified 2026.1.3 wheel:
+        binary_sensor.extra_state_attributes), so the attribute-missing
+        WARN would fire on every ordinary evaluation; the off shape
+        returns False silently (R1#1)."""
         cid = cond.get("id") or path
         eid = cond.get(CONF_ENTITY_ID)
         state = self.hass.states.get(eid)
@@ -1346,6 +1352,11 @@ class ConditionEngine:
             return False
         if ctype == COND_TRIP_ON:
             return state.state == "on"
+        if state.state != "on":
+            # Not on a trip is the normal verdict (trip_count keeps the
+            # day_n/since keys with None values while off — R1#1): False
+            # WITHOUT the unavailable WARN.
+            return False
         attrs = getattr(state, "attributes", None) or {}
         if ctype == COND_TRIP_DAY:
             day_n = attrs.get(TRIP_ATTR_DAY_N)
