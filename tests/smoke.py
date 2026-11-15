@@ -4130,13 +4130,14 @@ async def main():
             f"{sch_records[n_start_edge:]}"
         )
         # ①n (R1#3): the narrow residual face the 0.15.0 narrowing left —
-        # a duration ON the off chain whose start subtree is composed
-        # SOLELY of cooldowns (direct, or via an AND/OR group of only
-        # cooldowns) still traps with a delay: cold start the cooldown
-        # reads True, the duration arms itself N seconds in while the
-        # output is already off, no flip is ever recorded and the off
-        # chain out-ranks on forever. Mixing any live signal into the
-        # start group stays the legitimate arming shape — no warning.
+        # a duration ON the off chain whose start subtree is dominated by
+        # cooldowns (direct, or via a group whose own polarity lets a
+        # cooldown dominate: AND=all-composed, OR=one member suffices,
+        # F-556) still traps with a delay: cold start the cooldown reads
+        # True, the duration arms itself N seconds in while the output is
+        # already off, no flip is ever recorded and the off chain
+        # out-ranks on forever. Mixing a live signal into an AND start
+        # group stays the legitimate arming shape — no warning.
         n_1n = len(sch_records)
         hz_c6 = "cond_" + "6" * 32
         _vc({**json.loads(json.dumps(hz_base)), "conditions": [
@@ -4149,7 +4150,7 @@ async def main():
             {"name": "o", "type": "switch", "entity_id": hz_o1,
              "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
         ]})
-        assert sum("start 仅由冷却构成" in r for r in sch_records[n_1n:]) == 1, (
+        assert sum("start 由冷却支配" in r for r in sch_records[n_1n:]) == 1, (
             "a duration on the off chain armed solely by a cooldown keeps "
             "the delayed off-polarity trap — must warn (R1#3): "
             f"{sch_records[n_1n:]}"
@@ -4167,7 +4168,7 @@ async def main():
             {"name": "o", "type": "switch", "entity_id": hz_o1,
              "on_conditions": [hz_c1], "off_conditions": [hz_c6]},
         ]})
-        assert sum("start 仅由冷却构成" in r for r in sch_records[n_1ng:]) == 1, (
+        assert sum("start 由冷却支配" in r for r in sch_records[n_1ng:]) == 1, (
             "a pure-cooldown GROUP arming the start is the same delayed "
             f"trap shape as the direct one — must warn (R1#3): "
             f"{sch_records[n_1ng:]}"
@@ -5638,6 +5639,269 @@ async def main():
         _ctl_logger.removeHandler(_err_cap)
     mgr_svc.async_unload()
     print("[PASS] service output engine: rising edge, off-wins, loud UNAVAILABLE + retry, no first-eval block")
+
+    # ------------------------------------------------------------------
+    # F-556 判别钉: the ①n predicate follows the group's OWN polarity —
+    # OR(any-member-cooldown) warns, AND(all-composed) stays the narrow
+    # face, pure-live OR stays silent. The old all() let
+    # "OR[cooldown, live leaf]" save silently (the constant-True cooldown
+    # dominates the OR verdict at cold start = the delayed off trap).
+    # ------------------------------------------------------------------
+    f556_c = "cond_" + "5a" * 16
+    f556_b = "cond_" + "5b" * 16
+    f556_dur = "cond_" + "5d" * 16
+    f556_or = "cond_" + "5e" * 16
+    f556_and = "cond_" + "5f" * 16
+    f556_out = "ssc_" + "5a" * 16
+    _f556_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _f556_cap = _WarnCap()
+    _f556_logger.addHandler(_f556_cap)
+    try:
+        def _f556_cfg(groups):
+            conds = [
+                {"id": f556_b, "type": "state", "label": "", "enabled": True,
+                 "entity_id": "switch.c", "state": "on"},
+                {"id": f556_c, "type": "cooldown", "label": "", "enabled": True,
+                 "seconds": 30},
+            ]
+            conds += groups
+            return {
+                "name": "f556",
+                "enabled": True,
+                "logging_enabled": False,
+                "triggers": [{"id": trp_trg, "type": "state",
+                              "entity_id": "switch.c", "enabled": True,
+                              "routes": {"conditions": [f556_b]}}],
+                "conditions": conds,
+                "outputs": [{"name": "o", "type": "switch",
+                             "entity_id": f556_out,
+                             "on_conditions": [f556_b],
+                             "off_conditions": [f556_dur]}],
+            }
+
+        def _f556_n_warn():
+            return sum("start 由冷却支配" in r for r in _f556_cap.records)
+
+        # RED: OR[cooldown, live leaf] arming the off-chain duration —
+        # one cooldown member dominates the OR verdict at cold start
+        n0 = _f556_n_warn()
+        validate_controller(_f556_cfg(
+            [{"id": f556_or, "type": "or", "label": "", "enabled": True,
+              "conditions": [f556_c, f556_b]},
+             {"id": f556_dur, "type": "duration", "label": "", "enabled": True,
+              "seconds": 60, "start": f556_or, "abort": None}]
+        ))
+        assert _f556_n_warn() == n0 + 1, _f556_cap.records[n0:]
+        # GREEN: the same live leaf mixed into an AND group — the cooldown
+        # no longer gates the off verdict alone (legitimate arming shape)
+        n1 = _f556_n_warn()
+        validate_controller(_f556_cfg(
+            [{"id": f556_and, "type": "and", "label": "", "enabled": True,
+              "conditions": [f556_c, f556_b]},
+             {"id": f556_dur, "type": "duration", "label": "", "enabled": True,
+              "seconds": 60, "start": f556_and, "abort": None}]
+        ))
+        assert _f556_n_warn() == n1, _f556_cap.records[n1:]
+        # GREEN: pure-live OR (no cooldown at all) — no flip-history trap
+        n2 = _f556_n_warn()
+        validate_controller(_f556_cfg(
+            [{"id": f556_or, "type": "or", "label": "", "enabled": True,
+              "conditions": [f556_b]},
+             {"id": f556_dur, "type": "duration", "label": "", "enabled": True,
+              "seconds": 60, "start": f556_or, "abort": None}]
+        ))
+        assert _f556_n_warn() == n2, _f556_cap.records[n2:]
+        # RED: all-cooldown OR — any() keeps it covered
+        n3 = _f556_n_warn()
+        validate_controller(_f556_cfg(
+            [{"id": f556_or, "type": "or", "label": "", "enabled": True,
+              "conditions": [f556_c]},
+             {"id": f556_dur, "type": "duration", "label": "", "enabled": True,
+              "seconds": 60, "start": f556_or, "abort": None}]
+        ))
+        assert _f556_n_warn() == n3 + 1, _f556_cap.records[n3:]
+    finally:
+        _f556_logger.removeHandler(_f556_cap)
+    print("[PASS] F-556: ①n OR arm = any(cooldown members), AND arm = all, pure-live OR silent")
+
+    # ------------------------------------------------------------------
+    # F-471 判别钉: the countdown wakeup credit requires a startable gate —
+    # an EMPTY start gate (legal reset-only countdown) or a gate whose
+    # members are provably dead in the flag-step judge no longer mutes
+    # faces ②/⑤ for chains whose only "waker" can never wake anything.
+    # ------------------------------------------------------------------
+    f471_cd = "cond_" + "6a" * 16
+    f471_x = "cond_" + "6b" * 16
+    f471_cool = "cond_" + "6c" * 16
+    f471_out = "ssc_" + "6a" * 16
+
+    def _f471_cfg(gate_members, extra_conds=()):
+        conds = [
+            {"id": f471_cd, "type": "countdown", "label": "", "enabled": True,
+             "seconds": 60, "start_conditions": list(gate_members),
+             "reset_conditions": [f471_x]},
+            {"id": f471_x, "type": "state", "label": "", "enabled": True,
+             "entity_id": "switch.c", "state": "on"},
+            *extra_conds,
+        ]
+        return {
+            "name": "f471",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "switch.c", "enabled": True,
+                          "routes": {"conditions": []}}],
+            "conditions": conds,
+            "outputs": [{"name": "o", "type": "switch",
+                         "entity_id": f471_out,
+                         "on_conditions": [f471_cd], "off_conditions": []}],
+        }
+
+    _f471_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _f471_cap = _WarnCap()
+    _f471_logger.addHandler(_f471_cap)
+    try:
+        def _f471_freeze_warns():
+            return sum("没有任何可唤醒源" in r for r in _f471_cap.records)
+        # RED: empty start gate (reset-only countdown) — the timer can
+        # never start, so crediting it muted the freeze warning forever
+        n0 = _f471_freeze_warns()
+        validate_controller(_f471_cfg([]))
+        assert _f471_freeze_warns() == n0 + 1, _f471_cap.records[n0:]
+        # GREEN: a live start gate member credits the countdown
+        n1 = _f471_freeze_warns()
+        validate_controller(_f471_cfg([f471_x]))
+        assert _f471_freeze_warns() == n1, _f471_cap.records[n1:]
+        # a gate whose members are ALL provably dead (AND[cooldown]) is
+        # already REJECTED by the stateful dead-gate face — the only
+        # saveable non-credit shape is the empty gate, covered above
+        # GREEN: mixed OR gate keeps a viable member (cooldown + live leaf)
+        f471_or = "cond_" + "6e" * 16
+        n3 = _f471_freeze_warns()
+        validate_controller(_f471_cfg(
+            [f471_or],
+            extra_conds=[
+                {"id": f471_cool, "type": "cooldown", "label": "",
+                 "enabled": True, "seconds": 30},
+                {"id": f471_or, "type": "or", "label": "", "enabled": True,
+                 "conditions": [f471_cool, f471_x]},
+            ],
+        ))
+        assert _f471_freeze_warns() == n3, _f471_cap.records[n3:]
+    finally:
+        _f471_logger.removeHandler(_f471_cap)
+    print("[PASS] F-471: countdown wakeup credit follows the start gate's viability (empty gate warns, live/mixed-OR credits)")
+
+    # ------------------------------------------------------------------
+    # F-472 判别钉: a same-cycle capture(main pass)+clear(convergence
+    # re-step) on the SAME snapshot id must land BOTH decision-log rows —
+    # the old {**a, **b} dict merge kept only the re-step's clear.
+    # ------------------------------------------------------------------
+    f472_w = "cond_" + "7a" * 16
+    f472_x = "cond_" + "7b" * 16
+    f472_s = "cond_" + "7c" * 16
+    f472_f = "cond_" + "7d" * 16
+    f472_c = "cond_" + "7e" * 16
+    f472_out = "ssc_" + "7a" * 16
+    f472_cfg = {
+        "name": "f472",
+        "enabled": True,
+        "logging_enabled": True,
+        "triggers": [{"id": trp_trg, "type": "state",
+                      "entity_id": "switch.c", "enabled": True,
+                      "routes": {"conditions": [f472_x]}}],
+        "conditions": [
+            {"id": f472_w, "type": "state", "label": "", "enabled": True,
+             "entity_id": "switch.d", "state": "off"},
+            {"id": f472_x, "type": "state", "label": "", "enabled": True,
+             "entity_id": "switch.c", "state": "on"},
+            {"id": f472_s, "type": "snapshot", "label": "", "enabled": True,
+             "entity_id": "sensor.a", "capture": [f472_x], "clear": [f472_f]},
+            {"id": f472_f, "type": "flag", "label": "", "enabled": True,
+             "set_conditions": [f472_c], "reset_conditions": [],
+             "initial": False},
+            {"id": f472_c, "type": "countdown", "label": "", "enabled": True,
+             "seconds": 60, "start_conditions": [f472_w],
+             "reset_conditions": []},
+        ],
+        "outputs": [{"name": "o", "type": "switch", "entity_id": f472_out,
+                     "on_conditions": [f472_s], "off_conditions": []}],
+    }
+    validate_controller(json.loads(json.dumps(f472_cfg)))
+    f472_h = _Hass()
+    f472_h.states._d["switch.c"] = "off"  # capture gate low at cycle 1
+    mgr_472 = ControllerManager(f472_h, "ctrl_f47201", json.loads(json.dumps(f472_cfg)))
+    recs_472 = _log_cycles("ctrl_f47201")
+    await mgr_472._async_evaluate(None, ["init"], None)  # countdown starts
+    f472_h.states._d["switch.c"] = "on"
+    _advance_utc(120)  # the deadline passes while the capture gate rises
+    await mgr_472._async_evaluate(None, ["zero"], None)
+    dec_472 = [r.get("decision") for r in _log_tail(recs_472, "ctrl_f47201")]
+    assert "capture" in dec_472 and "clear" in dec_472, dec_472
+    # order: the main-pass capture precedes the re-step clear
+    assert dec_472.index("capture") < dec_472.index("clear"), dec_472
+    mgr_472.async_unload()
+    print("[PASS] F-472: same-cycle capture+clear both reach the decision log in pass order")
+
+    # ------------------------------------------------------------------
+    # F-473 判别钉: an unparseable deadline is nulled AT the seeding exit
+    # AND the cleaned entry self-heals back into the hub table (in-memory
+    # immediately + debounced disk write) — no repeat warning next restart.
+    # ------------------------------------------------------------------
+    class _HealStore:
+        def __init__(self):
+            self.saved = []
+            self.delayed = []
+            self.load_result = {"controllers": {}}
+
+        async def async_load(self):
+            return self.load_result
+
+        async def async_save(self, data):
+            self.saved.append(data)
+
+        def async_delay_save(self, data_func, delay=0):
+            self.delayed.append(data_func)
+
+    f473_nid = "cond_" + "8a" * 16
+    f473_cfg = {
+        "name": "f473",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [{"id": trp_trg, "type": "state",
+                      "entity_id": "switch.c", "enabled": True,
+                      "routes": {"conditions": []}}],
+        "conditions": [
+            {"id": f473_nid, "type": "countdown", "label": "",
+             "enabled": True, "seconds": 60,
+             "start_conditions": [], "reset_conditions": []},
+        ],
+        "outputs": [{"name": "o", "type": "switch", "entity_id": f472_out,
+                     "on_conditions": [f473_nid], "off_conditions": []}],
+    }
+    hub_473 = ScannerHub(_Hass())
+    hub_473._flag_store = _HealStore()
+    hub_473.stateful_states["ctrl_f47301"] = {
+        f473_nid: {"deadline": "not-a-date", "verdict": True, "count": 2},
+    }
+    hub_473.hass.data[_DOM] = hub_473  # the manager's seeding exit reads hass.data
+    mgr_473 = ControllerManager(hub_473.hass, "ctrl_f47301", f473_cfg)
+    healed = (hub_473.stateful_states.get("ctrl_f47301") or {}).get(f473_nid) or {}
+    assert healed.get("deadline") is None, healed
+    assert healed.get("verdict") is True and healed.get("count") == 2, healed
+    assert len(hub_473._flag_store.delayed) == 1, hub_473._flag_store.delayed
+    payload = hub_473._flag_store.delayed[0]()
+    assert payload["stateful"]["ctrl_f47301"][f473_nid]["deadline"] is None, payload
+    assert payload["stateful"]["ctrl_f47301"][f473_nid]["verdict"] is True, payload
+    # the engine seed carries the cleaned value too (a rebuild reads None,
+    # not the bad string — the warning fires exactly once per bad value)
+    assert mgr_473.engine.stateful_values()[f473_nid]["deadline"] is None
+    mgr_473.async_unload()
+    print("[PASS] F-473: bad deadline self-heals into the hub table + debounced disk write")
 
 asyncio.run(main())
 print("SMOKE OK")

@@ -1547,13 +1547,15 @@ def _warn_static_hazards(
                 cond.get("label") or cid,
             )
         # ①n (R1#3, 0.15.0 residual): the start-only-cooldown shape —
-        # off=[D], D=duration(start=C), C=cooldown directly or via an
-        # AND/OR group composed solely of cooldowns. follow_gate_inputs=
-        # False above no longer drags C onto the off chain, but this
-        # degenerate shape keeps the polarity trap with a delay: cold start
-        # C reads True (no flip history), so D arms itself N seconds in
-        # while the output is already off — the off verdict applies
-        # nothing, records no flip, C stays constant-True and off
+        # off=[D], D=duration(start=C), C=cooldown directly or via a group
+        # whose own polarity lets a cooldown dominate: AND needs ALL
+        # members composed of cooldowns, OR needs just ONE (the constant-
+        # True cooldown dominates the OR verdict, F-556). follow_gate_
+        # inputs=False above no longer drags C onto the off chain, but
+        # this degenerate shape keeps the polarity trap with a delay:
+        # cold start C reads True (no flip history), so D arms itself N
+        # seconds in while the output is already off — the off verdict
+        # applies nothing, records no flip, C stays constant-True and off
         # out-ranks on forever. Warn-only, same trap defense as ①.
         for cid in off_reach.get(out["entity_id"], set()):
             dur = by_id.get(cid)
@@ -1567,11 +1569,12 @@ def _warn_static_hazards(
             ):
                 continue
             _LOGGER.warning(
-                "输出「%s」的 off 链持续条件「%s」的 start 仅由冷却构成（直接或经"
-                "纯冷却组）：冷启动时冷却无翻转史恒为 True，持续门 N 秒后自行放"
-                "行，而输出已处于 off 时 off 判定不产生新翻转记录，冷却将永远恒 "
-                "True 并以 off 优先永久压制 on 链——与直接挂 off 链同型的延迟版陷"
-                "阱，请把冷却挂 on 链或给 start 混入活信号",
+                "输出「%s」的 off 链持续条件「%s」的 start 由冷却支配（直接、经"
+                "纯冷却组，或 OR 组混入任一冷却成员——冷却冷启动无翻转史恒为 "
+                "True 并在 OR 中占优）：持续门 N 秒后自行放行，而输出已处于 off "
+                "时 off 判定不产生新翻转记录，冷却将永远恒 True 并以 off 优先永"
+                "久压制 on 链——与直接挂 off 链同型的延迟版陷阱，请把冷却挂 on "
+                "链或让 start 判据离不开活信号",
                 out_label,
                 dur.get("label") or cid,
             )
