@@ -229,6 +229,21 @@ const LANG = {
     summaryGatePrefix: "门×",
     summaryResetPrefix: "复×",
     statefulIdle: "未配置门",
+    condTripOn: "出差中",
+    condTripDay: "出差第 N 天",
+    condTripDuration: "段时长",
+    tripEntity: "出差实体（trip_count 出差中传感器）",
+    tripDayLabel: "第几天（N）",
+    tripHoursLabel: "时长阈值（小时）",
+    tripHint: "读 trip_count 出差实体：实体缺失/不可用时显式不可用（判定 False + 告警日志），trip_count 缺装期属预期；段时长阈值与第 N 天由 trip_count 的 day_n/since 属性裁定。",
+    summaryTripDayLead: "第",
+    summaryTripDayTail: "天",
+    outService: "文羽服务",
+    svcDomainLabel: "集成",
+    svcServiceLabel: "服务",
+    svcUninstalled: "⚠ 所选集成未安装或服务不存在——节点显式不可用，运行时将记 ERROR 且不执行",
+    svcPickHint: "选集成→选服务；连上条件线即生效（升沿调用一次）",
+    svcInspectorNote: "集成与服务在画布节点体内选择（非本表单）",
   },
   en: {
     appTitle: "Whole-House State Scanner",
@@ -437,6 +452,21 @@ const LANG = {
     summaryGatePrefix: "gate×",
     summaryResetPrefix: "rst×",
     statefulIdle: "no gates wired",
+    condTripOn: "On trip",
+    condTripDay: "Trip day N",
+    condTripDuration: "Trip duration",
+    tripEntity: "Trip entity (trip_count trip sensor)",
+    tripDayLabel: "Day number (N)",
+    tripHoursLabel: "Duration threshold (hours)",
+    tripHint: "Reads the trip_count trip entity: a missing/unavailable source is a loud unavailable face (verdict False + warning log) — expected while trip_count is not deployed; the day number and duration threshold ride trip_count's day_n/since attributes.",
+    summaryTripDayLead: "day ",
+    summaryTripDayTail: "",
+    outService: "Fumiha service",
+    svcDomainLabel: "Integration",
+    svcServiceLabel: "Service",
+    svcUninstalled: "⚠ The chosen integration is not installed or the service does not exist — the node is explicitly unavailable; runtime logs an ERROR and does nothing",
+    svcPickHint: "Pick integration → service; wire conditions to activate (one call per rising edge)",
+    svcInspectorNote: "Integration and service are picked on the canvas node body (not this form)",
   },
 };
 
@@ -472,6 +502,9 @@ const TYPE_LABEL_KEY = {
   countdown: "condCountdown",
   quota: "condQuota",
   tally: "condTally",
+  trip_on: "condTripOn",
+  trip_day: "condTripDay",
+  trip_duration: "condTripDuration",
   and: "condAnd",
   or: "condOr",
   not: "condNot",
@@ -494,6 +527,9 @@ const TYPE_ICON = {
   countdown: "⏲",
   quota: "🎫",
   tally: "🧮",
+  trip_on: "🧳",
+  trip_day: "🗓",
+  trip_duration: "⌛",
   and: "⊕",
   or: "⊗",
   not: "¬",
@@ -614,6 +650,15 @@ function conditionSummary(cond, tr) {
       text = `${TYPE_ICON[cond.type] || ""}${param}｜${parts.join(" / ") || trk("statefulIdle")}`;
       break;
     }
+    case "trip_on":
+      text = `${cond.entity_id || "?"}`;
+      break;
+    case "trip_day":
+      text = `${cond.entity_id || "?"}｜${trk("summaryTripDayLead")}${cond.day ?? "?"}${trk("summaryTripDayTail")}`;
+      break;
+    case "trip_duration":
+      text = `${cond.entity_id || "?"}｜≥ ${cond.hours ?? "?"}h`;
+      break;
     default:
       text = `${(cond.conditions || []).length}${trk("summaryMembers")}`;
   }
@@ -1145,7 +1190,7 @@ class ScannerPanel extends HTMLElement {
               .map((tp) => `<button class="wha-btn" data-add-trg="${tp}">${TRIGGER_ICON[tp]} ${esc(this.tr(TRIGGER_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("addCondition"))}</h3>
-            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag", "snapshot", "literal", "compare", "countdown", "quota", "tally"]
+            ${["numeric_state", "state", "time", "sun", "template", "cooldown", "calendar", "duration", "debounce", "flag", "snapshot", "literal", "compare", "countdown", "quota", "tally", "trip_on", "trip_day", "trip_duration"]
               .map((tp) => `<button class="wha-btn" data-add-cond="${tp}">${TYPE_ICON[tp]} ${esc(this.tr(TYPE_LABEL_KEY[tp]))}</button>`)
               .join("")}
             <h3>${esc(this.tr("logicGroups"))}</h3>
@@ -1156,6 +1201,7 @@ class ScannerPanel extends HTMLElement {
             <h3>${esc(this.tr("addOutput"))}</h3>
             <button class="wha-btn" data-add-out="switch">⏻ ${esc(this.tr("outSwitch"))}</button>
             <button class="wha-btn" data-add-out="binary_sensor">◉ ${esc(this.tr("outBinary"))}</button>
+            <button class="wha-btn" data-add-out="fumiha_service">📞 ${esc(this.tr("outService"))}</button>
             <p class="wha-sub" style="margin-top:10px">${esc(this.tr("paletteHint"))}</p>
             <p class="wha-sub">${esc(this.tr("conditionSink1"))}<br>${esc(this.tr("conditionSink2"))}<br>${esc(this.tr("conditionSink3"))}</p>
           </div>
@@ -1929,6 +1975,12 @@ class ScannerPanel extends HTMLElement {
   _initCanvas(container) {
     const ed = this._editor;
     const df = new window.Drawflow(container);
+    // 0.16.0: the 文羽服务 node body hosts interactive <select> pickers —
+    // vendor default (draggable_inputs=true) starts a node DRAG from a
+    // select mousedown, making the dropdowns unusable. False = inputs/
+    // selects/textareas never start a drag (verified against the vendored
+    // drawflow.min.js click handler).
+    df.draggable_inputs = false;
     df.start();
     ed.df = df;
     ed.importing = true;
@@ -2425,17 +2477,23 @@ class ScannerPanel extends HTMLElement {
       </div>`;
   }
 
+  _outIcon(type) {
+    return type === "switch" ? "⏻" : type === "fumiha_service" ? "📞" : "◉";
+  }
+
   _outNodeHtml(out) {
     return `
       <div class="wha-node-body-wrap">
         <div class="wha-node-head">
-          <span data-nicon>${out.type === "switch" ? "⏻" : "◉"}</span>
+          <span data-nicon>${this._outIcon(out.type)}</span>
           <span data-nhead>${esc(out.name)}</span>
           <span class="wha-node-tag" data-ntag>${esc(out.type)}</span>
         </div>
-        <div class="wha-node-body" data-nbody>
-          ${out.type === "switch" && out.manual_override ? "✋ " : ""}${esc(out.entity_id)}
-        </div>
+        <div class="wha-node-body" data-nbody>${
+          out.type === "fumiha_service"
+            ? ""
+            : `${out.type === "switch" && out.manual_override ? "✋ " : ""}${esc(out.entity_id)}`
+        }</div>
         <span class="decision-badge" data-badge style="display:none"></span>
       </div>`;
   }
@@ -2492,7 +2550,98 @@ class ScannerPanel extends HTMLElement {
     ed.nodeToOut.set(nodeId, out.entity_id);
     ed.outToNode.set(out.entity_id, nodeId);
     this._labelNodePorts(nodeId, "output");
+    if (out.type === "fumiha_service") this._renderServiceBody(nodeId);
     return nodeId;
+  }
+
+  _serviceOptions() {
+    // runtime snapshot face (决策 1 两级下拉): level 1 = the closed built-in
+    // list ∩ integrations actually loaded in hass.services ("没装自然就
+    // 没有"); level 2 = the services the chosen domain currently registers.
+    const svcMap = (this._hass && this._hass.services) || {};
+    const domains = FUMIHA_DOMAINS.filter((d) => svcMap[d]);
+    return {
+      domains,
+      servicesOf: (domain) =>
+        domain && svcMap[domain] ? Object.keys(svcMap[domain]).sort() : [],
+    };
+  }
+
+  _renderServiceBody(nodeId) {
+    // 文羽服务 node body: the two-level pickers live IN the node (决策 1 —
+    // not the inspector form), plus the explicit unavailable face when the
+    // picked target is missing (决策 4). Rebuilds on import, body refresh
+    // and picker changes; rebinds the change listeners each pass.
+    const ed = this._editor;
+    const el = ed.df?.container?.querySelector(`#node-${nodeId}`);
+    const outId = ed.nodeToOut?.get(nodeId);
+    const out = (ed.controller.outputs || []).find(
+      (o) => o.entity_id === outId
+    );
+    if (!el || !out) return;
+    const body = el.querySelector("[data-nbody]");
+    if (!body) return;
+    const { domains, servicesOf } = this._serviceOptions();
+    const picked = out.domain || "";
+    const pickedMissing = !!picked && !domains.includes(picked);
+    const svcList = servicesOf(picked);
+    const svcMissing = !!picked && !svcList.includes(out.service || "") && !pickedMissing;
+    // a saved-but-now-uninstalled domain/service stays selectable so the
+    // user can see and fix it; the status line carries the warning (决策 4 —
+    // the dropdown must never silently swallow the saved value)
+    const domainList = picked && !domains.includes(picked) ? [picked, ...domains] : domains;
+    const svcAll = svcMissing ? [out.service, ...svcList] : svcList;
+    const domainOpts = [
+      `<option value="">—</option>`,
+      ...domainList.map(
+        (d) =>
+          `<option value="${esc(d)}" ${picked === d ? "selected" : ""}>${esc(d)}</option>`
+      ),
+    ];
+    const svcOpts = [
+      `<option value="">—</option>`,
+      ...svcAll.map(
+        (s) =>
+          `<option value="${esc(s)}" ${out.service === s ? "selected" : ""}>${esc(s)}</option>`
+      ),
+    ];
+    let status = "";
+    if (!picked || !out.service) {
+      status = `<div class="wha-svc-status muted">${esc(this.tr("svcPickHint"))}</div>`;
+    } else if (pickedMissing || svcMissing) {
+      status = `<div class="wha-svc-status bad">${esc(this.tr("svcUninstalled"))}</div>`;
+    } else {
+      status = `<div class="wha-svc-status ok">✓ ${esc(picked)}.${esc(out.service)}</div>`;
+    }
+    body.innerHTML = `
+      <div class="wha-svc-pick">
+        <label class="wha-svc-row"><span>${esc(this.tr("svcDomainLabel"))}</span>
+          <select class="wha-input wha-svc-domain" data-svcpick="domain">${domainOpts.join("")}</select></label>
+        <label class="wha-svc-row"><span>${esc(this.tr("svcServiceLabel"))}</span>
+          <select class="wha-input wha-svc-service" data-svcpick="service">${svcOpts.join("")}</select></label>
+        ${status}
+      </div>`;
+    this._bindServicePickers(nodeId);
+  }
+
+  _bindServicePickers(nodeId) {
+    const ed = this._editor;
+    const el = ed.df?.container?.querySelector(`#node-${nodeId}`);
+    const outId = ed.nodeToOut?.get(nodeId);
+    const out = (ed.controller.outputs || []).find(
+      (o) => o.entity_id === outId
+    );
+    if (!el || !out) return;
+    el.querySelectorAll("[data-svcpick]").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const k = sel.dataset.svcpick;
+        out[k] = sel.value;
+        ed.dirty = true;
+        // a domain swap invalidates the service pick — rebuild the body so
+        // the level-2 list and the status face follow the new value
+        this._renderServiceBody(nodeId);
+      });
+    });
   }
 
   _addConditionNode(type) {
@@ -2548,6 +2697,14 @@ class ScannerPanel extends HTMLElement {
     } else if (type === "tally") {
       cond.count_conditions = [];
       cond.reset_conditions = [];
+    } else if (type === "trip_on") {
+      cond.entity_id = "";
+    } else if (type === "trip_day") {
+      cond.entity_id = "";
+      cond.day = 2;
+    } else if (type === "trip_duration") {
+      cond.entity_id = "";
+      cond.hours = 24;
     } else {
       cond.conditions = [];
     }
@@ -2562,16 +2719,21 @@ class ScannerPanel extends HTMLElement {
   _addOutputNode(type) {
     const ed = this._editor;
     const out = {
-      name: type === "switch" ? this.tr("outSwitch") : this.tr("outBinary"),
+      name: type === "switch" ? this.tr("outSwitch") : type === "fumiha_service" ? this.tr("outService") : this.tr("outBinary"),
       type,
       entity_id: newOutId(),
       on_conditions: [],
       off_conditions: [],
       manual_override: false,
     };
+    if (type === "fumiha_service") {
+      out.domain = "";
+      out.service = "";
+    }
     ed.controller.outputs.push(out);
     const count = ed.controller.outputs.length;
     const nodeId = this._dfAddOutNode(out, this._outX(), 30 + (count - 1) * 140);
+    this._renderServiceBody(nodeId); // service nodes: mount the pickers
     this._selectNode(nodeId);
     ed.dirty = true;
   }
@@ -2614,11 +2776,15 @@ class ScannerPanel extends HTMLElement {
       if (head) head.textContent = out.name;
       // head icon/type tag must follow a type switch too (WHA-F-265)
       const nicon = el.querySelector("[data-nicon]");
-      if (nicon) nicon.textContent = out.type === "switch" ? "⏻" : "◉";
+      if (nicon) nicon.textContent = this._outIcon(out.type);
       const ntag = el.querySelector("[data-ntag]");
       if (ntag) ntag.textContent = out.type;
-      if (body)
+      if (out.type === "fumiha_service") {
+        // pickers + status face rebuild (kept alive across body redraws)
+        if (body) this._renderServiceBody(nodeId);
+      } else if (body) {
         body.innerHTML = `${out.type === "switch" && out.manual_override ? "✋ " : ""}${esc(out.entity_id)}`;
+      }
     } else {
       const trgId = ed.nodeToTrg.get(nodeId);
       if (trgId === undefined) return;
@@ -2711,9 +2877,13 @@ class ScannerPanel extends HTMLElement {
           <select class="wha-input" data-insk="type">
             <option value="switch" ${out.type === "switch" ? "selected" : ""}>${esc(this.tr("outSwitch"))}</option>
             <option value="binary_sensor" ${out.type === "binary_sensor" ? "selected" : ""}>${esc(this.tr("outBinary"))}</option>
+            <option value="fumiha_service" ${out.type === "fumiha_service" ? "selected" : ""}>${esc(this.tr("outService"))}</option>
           </select>
         </label>
         <p class="wha-sub">${esc(out.entity_id)}</p>
+        ${out.type === "fumiha_service"
+          ? `<p class="wha-sub">${esc(this.tr("svcInspectorNote"))}</p>`
+          : ""}
         ${out.type === "switch"
           ? `<label class="field field-inline"><input type="checkbox" data-insk="manual_override" ${out.manual_override ? "checked" : ""}> ${esc(this.tr("manualOverride"))}</label>`
           : ""}
@@ -2782,7 +2952,7 @@ class ScannerPanel extends HTMLElement {
       input.addEventListener("change", () => {
         const k = input.dataset.insk;
         let v = input.type === "checkbox" ? input.checked : input.value;
-        if (k === "above" || k === "below" || k.endsWith("_offset") || k === "hours") {
+        if (k === "above" || k === "below" || k.endsWith("_offset") || k === "hours" || k === "day") {
           v = v === "" ? null : Number(v);
         } else if (k === "seconds") {
           v = Number(v) || 60;
@@ -2922,6 +3092,20 @@ class ScannerPanel extends HTMLElement {
           <p class="wha-sub">${esc(trk("quotaHint"))}</p>`;
       case "tally":
         return `<p class="wha-sub">${esc(trk("tallyHint"))}</p>`;
+      case "trip_on":
+        return `
+          <div class="field"><span>${esc(trk("tripEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick="binary_sensor" value="${esc(cond.entity_id || "")}"></div>
+          <p class="wha-sub">${esc(trk("tripHint"))}</p>`;
+      case "trip_day":
+        return `
+          <div class="field"><span>${esc(trk("tripEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick="binary_sensor" value="${esc(cond.entity_id || "")}"></div>
+          <label class="field"><span>${esc(trk("tripDayLabel"))}</span><input class="wha-input" type="number" min="1" max="365" data-insk="day" value="${esc(cond.day ?? 2)}"></label>
+          <p class="wha-sub">${esc(trk("tripHint"))}</p>`;
+      case "trip_duration":
+        return `
+          <div class="field"><span>${esc(trk("tripEntity"))}</span><input class="wha-input" list="wha-entities-insp" data-insk="entity_id" data-epick="binary_sensor" value="${esc(cond.entity_id || "")}"></div>
+          <label class="field"><span>${esc(trk("tripHoursLabel"))}</span><input class="wha-input" type="number" min="1" max="8760" step="0.5" data-insk="hours" value="${esc(cond.hours ?? 24)}"></label>
+          <p class="wha-sub">${esc(trk("tripHint"))}</p>`;
       case "compare": {
         const sideHtml = (which, labelKey) => {
           const side = cond[which] || {};
@@ -3244,6 +3428,7 @@ class ScannerPanel extends HTMLElement {
             <option value="hold">hold</option>
             <option value="capture">capture</option>
             <option value="clear">clear</option>
+            <option value="call">call</option>
           </select>
           <input class="wha-input" type="number" min="10" max="5000" value="500" data-lf="limit" style="width:90px">
           <button class="wha-btn primary" data-lact="query">${esc(this.tr("query"))}</button>
@@ -3316,6 +3501,7 @@ class ScannerPanel extends HTMLElement {
           : r.decision === "off" ? "off"
           : r.decision === "capture" ? "capture"
           : r.decision === "clear" ? "clear"
+          : r.decision === "call" ? "call"
           : "hold";
         // snapshot event lines carry no triggered_by copy (R1-6): the
         // source column localizes from the structured decision/value keys

@@ -28,11 +28,17 @@ Thumbs.db
 # 须可读——R7 报告第三节门禁证据不合规项，WHA-F-303）；
 # dev/test_ports.py 已于 0.13.0 R1 修复轮解禁入仓（数据节点端口可见性
 # DOM 冒烟钉——准入 JS 与 CSS 反向的复发防线，WHA-SNAPSHOT-121 R1-1）；
+# dev/test_fumiha.py 已于 0.16.0 步2 解禁入仓（trip 叶信号口+文羽服务节点体
+# 两级下拉+显式不可用面的 DOM 冒烟钉——R6 双端同向核对防线）；
 # dev/ 其余本地工具仍不入库
 dev/*
 !dev/test_routing.py
 !dev/mutation_check.py
 !dev/test_ports.py
+!dev/test_fumiha.py
 /*.png
 
 .zcode/
+
+# batch-ops 本地任务运行时（不入库）
+.batch-ops/

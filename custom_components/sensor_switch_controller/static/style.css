@@ -94,6 +94,7 @@
 .badge.hold { color: var(--wha-warn); }
 .badge.capture { background: rgba(3, 169, 244, 0.12); color: var(--wha-accent, #03a9f4); border-color: transparent; }
 .badge.clear { background: rgba(127,127,127,.12); color: var(--wha-sub); border-color: transparent; }
+.badge.call { background: rgba(3, 169, 244, 0.12); color: var(--wha-accent, #03a9f4); border-color: transparent; }
 .badge.meta { background: rgba(127,127,127,.12); }
 
 table.wha-table {
@@ -294,6 +295,10 @@ details.wha-json pre {
 .parent-drawflow .drawflow .wha-node.cond-template .wha-node-head { color: #2e7d32; }
 .parent-drawflow .drawflow .wha-node.cond-and .wha-node-head,
 .parent-drawflow .drawflow .wha-node.cond-or .wha-node-head { color: #ad1457; }
+/* trip leaves (0.16.0): a shared travel-teal head */
+.parent-drawflow .drawflow .wha-node.cond-trip_on .wha-node-head,
+.parent-drawflow .drawflow .wha-node.cond-trip_day .wha-node-head,
+.parent-drawflow .drawflow .wha-node.cond-trip_duration .wha-node-head { color: #00695c; }
 .parent-drawflow .drawflow .wha-node.wha-out .wha-node-head { color: var(--wha-accent); }
 
 .parent-drawflow .drawflow .wha-node.met { border-color: var(--wha-ok); box-shadow: 0 0 0 2px rgba(67,160,71,.3); }
@@ -310,6 +315,8 @@ details.wha-json pre {
 }
 .parent-drawflow .drawflow .wha-node .decision-badge.on { background: var(--wha-ok); color: #fff; border-color: transparent; }
 .parent-drawflow .drawflow .wha-node .decision-badge.off { background: var(--wha-bad); color: #fff; border-color: transparent; }
+/* 文羽服务 rising-edge call (0.16.0) */
+.parent-drawflow .drawflow .wha-node .decision-badge.call { background: var(--wha-accent); color: #fff; border-color: transparent; }
 
 /* drawflow default theme tweaks */
 .parent-drawflow { width: 100%; height: 100%; }
@@ -400,11 +407,40 @@ details.wha-json pre {
    snapshot/compare are exempt too: their input_1/2 are the live capture/clear
    and A/B ports — WHA-SNAPSHOT-121 R1-1, admission JS and CSS must agree;
    the 0.14.0 stateful nodes are exempt likewise: input_1/2 are the live
-   gate/reset ports — WHA-STATEFUL-123, admission JS and CSS must agree) */
+   gate/reset ports — WHA-STATEFUL-123, admission JS and CSS must agree;
+   the 0.16.0 trip leaves need NO exemption — they are plain leaves whose
+   only live ports are input_3 (signal origin) + output_1, so the default
+   hide already covers them) */
 .parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare):not(.cond-countdown):not(.cond-quota):not(.cond-tally) .input_1,
 .parent-drawflow .drawflow .wha-node.cond-node:not(.cond-duration):not(.cond-and):not(.cond-or):not(.cond-not):not(.cond-flag):not(.cond-snapshot):not(.cond-compare):not(.cond-countdown):not(.cond-quota):not(.cond-tally) .input_2 {
   display: none;
 }
+
+/* 文羽服务 node body (0.16.0): the two-level pickers live in the node body
+   (决策 1); the status line is the explicit unavailable face (决策 4) */
+.parent-drawflow .drawflow .wha-node .wha-svc-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 150px;
+}
+.parent-drawflow .drawflow .wha-node .wha-svc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--wha-sub);
+}
+.parent-drawflow .drawflow .wha-node .wha-svc-row select.wha-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+.parent-drawflow .drawflow .wha-node .wha-svc-status { font-size: 10px; line-height: 1.3; }
+.parent-drawflow .drawflow .wha-node .wha-svc-status.muted { color: var(--wha-sub); }
+.parent-drawflow .drawflow .wha-node .wha-svc-status.ok { color: var(--wha-ok); }
+.parent-drawflow .drawflow .wha-node .wha-svc-status.bad { color: var(--wha-bad); font-weight: 600; }
 
 /* snapshot capture/clear ports: blue = capture (memory write), red = clear;
    the stateful gate/reset ports share the semantics (blue = action gate,
