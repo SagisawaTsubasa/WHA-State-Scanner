@@ -515,6 +515,24 @@ const STATEFUL_GATE_KEY = {
 };
 const isStatefulType = (t) => t in STATEFUL_GATE_KEY;
 
+// "文羽服务" output (0.16.0): the CLOSED built-in domain list (决策 2) —
+// must stay byte-equal to FUMIHA_SERVICE_DOMAINS in const.py; the pairing
+// test (tests/test_web.py::test_fumiha_domain_list_matches_panel) fails
+// otherwise. Extension point: append the domain on BOTH faces.
+const FUMIHA_DOMAINS = [
+  "fumiha_hub",
+  "fumiha_lighting",
+  "sensor_switch_controller",
+  "stockroom",
+  "trip_count",
+  "auto_night_light",
+  "glm_quota",
+  "lux_balance",
+  "filter_life_tracker",
+  "deepseek_usage",
+  "water_heater_optimizer",
+];
+
 function conditionSummary(cond, tr) {
   // `tr` is the panel's translation fn — node summaries follow hass.language
   const trk = tr || ((k) => k);

@@ -114,6 +114,46 @@ COMPARE_OPS = (
     "below_equal",
 )
 
+# Trip condition leaves (0.16.0): read the trip_count trip binary sensor's
+# state + attributes (day_n / since) — ordinary leaves (`for` applies, they
+# are signal origins). trip_count missing/unreadable = loud unavailable face
+# (rate-limited WARN + False), never a silent degrade (决策 5).
+COND_TRIP_ON = "trip_on"
+COND_TRIP_DAY = "trip_day"
+COND_TRIP_DURATION = "trip_duration"
+TRIP_TYPES = (COND_TRIP_ON, COND_TRIP_DAY, COND_TRIP_DURATION)
+TRIP_DAY_MAX = 365
+# 段时长 threshold cap: one year in hours (a trip longer than that is a
+# config error, same spirit as the other timing caps).
+TRIP_DURATION_HOURS_MAX = 8760
+CONF_DAY = "day"
+# Attribute keys the trip_count trip binary sensor carries (contract frozen
+# by trip_count logic.py/binary_sensor.py; WHA only READS them).
+TRIP_ATTR_DAY_N = "day_n"
+TRIP_ATTR_SINCE = "since"
+
+# "文羽服务" action output (0.16.0): an output type that calls a service on
+# the service bus instead of flipping an entity. The domain is a CLOSED
+# built-in list (决策 2: 内置名单，非 manifest 自声明) — the panel dropdown
+# mirrors the same list and a pairing test pins the two faces equal.
+# Extension point: append the domain here AND to FUMIHA_DOMAINS in
+# static/panel.js (the pairing test fails otherwise).
+FUMIHA_SERVICE_DOMAINS = (
+    "fumiha_hub",
+    "fumiha_lighting",
+    "sensor_switch_controller",
+    "stockroom",
+    "trip_count",
+    "auto_night_light",
+    "glm_quota",
+    "lux_balance",
+    "filter_life_tracker",
+    "deepseek_usage",
+    "water_heater_optimizer",
+)
+CONF_DOMAIN = "domain"
+CONF_SERVICE = "service"
+
 # Trigger types
 TRG_STATE = "state"
 TRG_TIME = "time"
@@ -137,6 +177,10 @@ TRG_ID_PREFIX = "trg_"
 # Output types
 OUTPUT_SWITCH = "switch"
 OUTPUT_BINARY_SENSOR = "binary_sensor"
+# "文羽服务" action output (0.16.0): no entity is registered for it; the
+# evaluation calls {domain, service} on the service bus on the on-chain's
+# rising edge (off chain wins / resets the edge, same precedence as flips).
+OUTPUT_FUMIHA_SERVICE = "fumiha_service"
 
 DEFAULT_SCAN_INTERVAL = 180
 SUN_OFFSET_LIMIT = 86400

@@ -28,7 +28,15 @@ explicitly — ``entity_id`` as one id or a list of ids (the old "listen
 to the whole sensor pool" default is rejected for ENABLED triggers;
 pool-empty migrated stores land invalid with a visible error instead of
 a never-firing trigger, while a DISABLED pool listener stays legal and
-inert — it never registers, WHA-F-309).
+inert — it never registers, WHA-F-309). Since 0.16.0 there are three trip
+leaves (``trip_on`` / ``trip_day`` / ``trip_duration`` — ordinary leaves
+that read the trip_count trip binary sensor's state and ``day_n``/``since``
+attributes) and the "文羽服务" action output (``fumiha_service``): an
+output that calls ``{domain, service}`` on the service bus instead of
+flipping an entity — the domain is a closed built-in list
+(FUMIHA_SERVICE_DOMAINS) and the save-time installed/registered checks are
+WARN-only (an integration uninstalled after saving must not brick the
+controller load); the runtime missing-service face is an ERROR log.
 """
 
 from __future__ import annotations
@@ -59,6 +67,8 @@ from .const import (
     COND_OR,
     COND_QUOTA,
     COND_SNAPSHOT,
+    COND_TRIP_DAY,
+    COND_TRIP_DURATION,
     COND_STATE,
     COND_SUN,
     COND_TALLY,
@@ -68,6 +78,9 @@ from .const import (
     CONF_AT,
     CONF_CAPTURE,
     CONF_CLEAR,
+    CONF_DAY,
+    CONF_DOMAIN,
+    CONF_SERVICE,
     CONF_EVERY_SECONDS,
     CONF_HOURS,
     CONF_INITIAL,
@@ -89,12 +102,17 @@ from .const import (
     DEBOUNCE_MAX,
     DEFAULT_SCAN_INTERVAL,
     DURATION_MAX,
+    FUMIHA_SERVICE_DOMAINS,
     OUTPUT_BINARY_SENSOR,
+    OUTPUT_FUMIHA_SERVICE,
     OUTPUT_SWITCH,
     QUOTA_MAX,
     SUN_OFFSET_LIMIT,
     STATEFUL_GATE_KEYS,
     STATEFUL_TYPES,
+    TRIP_DAY_MAX,
+    TRIP_DURATION_HOURS_MAX,
+    TRIP_TYPES,
     TRG_HOMEASSISTANT,
     TRG_ID_PREFIX,
     TRG_STATE,
@@ -126,6 +144,9 @@ LEAF_TYPES = (
     COND_SNAPSHOT,
     COND_LITERAL,
     COND_COMPARE,
+    # trip leaves (0.16.0): ordinary leaves — `for` applies, they are signal
+    # origins (deliberately NOT in NON_SIGNAL_TYPES)
+    *TRIP_TYPES,
 )
 GROUP_TYPES = (COND_AND, COND_OR, COND_NOT)
 # NOT signal origins (R2-7): timing gates latch/hold internal state and
@@ -144,7 +165,7 @@ NON_SIGNAL_TYPES = (
     # same rejection face as the 0.13.0 data nodes
     *STATEFUL_TYPES,
 )
-OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR)
+OUTPUT_TYPES = (OUTPUT_SWITCH, OUTPUT_BINARY_SENSOR, OUTPUT_FUMIHA_SERVICE)
 TRIGGER_TYPES = (TRG_STATE, TRG_TIME, TRG_SUN, TRG_HOMEASSISTANT)
 EVERY_SECONDS_MIN, EVERY_SECONDS_MAX = 10, 86400
 
@@ -847,6 +868,37 @@ def _validate_condition(cond) -> dict:
             _fail(f"求值条件的 op 必须是 {'/'.join(COMPARE_OPS)}")
         result[CONF_OP] = op
 
+    elif ctype in TRIP_TYPES:
+        # Trip leaves (0.16.0): read the trip_count trip binary sensor —
+        # state (on/off) for trip_on, the day_n attribute (== the configured
+        # day) for trip_day, the since attribute (+ the configured hours
+        # threshold) for trip_duration. Ordinary leaves: `for` applies via
+        # the generic branch below and the nodes are signal origins (not in
+        # NON_SIGNAL_TYPES). No existence check here — schema has no runtime
+        # view; an unreadable source degrades LOUDLY at evaluation (rate-
+        # limited WARN + False, the F-323 face — 决策 5 显式不可用).
+        result["entity_id"] = _validate_entity_id(cond.get("entity_id"), "出差实体")
+        if ctype == COND_TRIP_DAY:
+            day = cond.get(CONF_DAY)
+            try:
+                day = int(day)
+            except (OverflowError, TypeError, ValueError):
+                _fail("出差第N天条件的 day 必须是天数整数")
+            if not 1 <= day <= TRIP_DAY_MAX:
+                _fail(f"出差第N天条件的 day 必须在 1-{TRIP_DAY_MAX} 天之间")
+            result[CONF_DAY] = day
+        elif ctype == COND_TRIP_DURATION:
+            hours = cond.get(CONF_HOURS)
+            try:
+                hours = float(hours)
+            except (OverflowError, TypeError, ValueError):
+                _fail("段时长条件的 hours 必须是小时数")
+            if not math.isfinite(hours) or not 0 < hours <= TRIP_DURATION_HOURS_MAX:
+                _fail(
+                    f"段时长条件的 hours 必须在 0-{TRIP_DURATION_HOURS_MAX} 之间"
+                )
+            result[CONF_HOURS] = hours
+
     elif ctype in STATEFUL_TYPES:
         # Stateful step nodes (0.14.0): one mechanism, three parameterizations
         # — countdown (start/reset), quota (consume/reset), tally
@@ -973,14 +1025,34 @@ def _validate_output(out) -> dict:
         "type": otype,
         "entity_id": out_id,
     }
-    if otype == OUTPUT_SWITCH:
+    if otype == OUTPUT_FUMIHA_SERVICE:
+        # "文羽服务" action output (0.16.0): calls {domain, service} on the
+        # service bus — no entity, no manual override. The domain is the
+        # CLOSED built-in list (决策 2); installed/registered reality is a
+        # WARN at save time (web layer) and an ERROR at runtime — a service
+        # uninstalled AFTER saving must keep loading, never brick (决策 4).
+        domain = out.get(CONF_DOMAIN)
+        if not isinstance(domain, str) or domain not in FUMIHA_SERVICE_DOMAINS:
+            _fail(
+                f"服务输出的 domain 必须是内置文羽域之一：{domain!r}"
+                f"（允许 {', '.join(FUMIHA_SERVICE_DOMAINS)}）"
+            )
+        service = out.get(CONF_SERVICE)
+        if not isinstance(service, str) or not service.strip():
+            _fail("服务输出的 service 必须是非空服务名")
+        if len(service) > _MAX_LABEL_LEN:
+            _fail(f"服务输出的 service 长度不能超过 {_MAX_LABEL_LEN}")
+        result[CONF_DOMAIN] = domain
+        result[CONF_SERVICE] = service.strip()
+    elif otype == OUTPUT_SWITCH:
         result["manual_override"] = _to_bool(
             out.get("manual_override", False), "输出的 manual_override"
         )
     # else (F-329): binary_sensor has no control surface to lock — the flag
     # was accepted and persisted with no effect (and resurrected itself on a
     # switch→binary→switch round-trip), so it is dropped for non-switch
-    # outputs instead of being stored dead.
+    # outputs instead of being stored dead. The service output likewise
+    # carries no manual override (no entity to lock).
     for key in ("on_conditions", "off_conditions"):
         members = out.get(key) or []
         if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
@@ -1264,7 +1336,35 @@ def _start_armed_by_cooldown(
     if not members:
         return False
     path = _path | {start_ref}
+    # F-556: the merge follows the group's OWN polarity — an AND holds only
+    # when every member arms (all), but an OR already reads True at cold
+    # start from ONE cooldown member (the constant-True cooldown dominates
+    # the OR verdict), so the trap exists with a single cooldown member and
+    # any() is the honest predicate. The old all() let
+    # "OR[cooldown, live leaf]" save silently while the delayed off-polarity
+    # trap stayed live.
+    if ctype == COND_OR:
+        return any(_start_armed_by_cooldown(m, by_id, path) for m in members)
     return all(_start_armed_by_cooldown(m, by_id, path) for m in members)
+
+
+def _countdown_can_start(countdown: dict, by_id: dict[str, dict]) -> bool:
+    """F-471: True when the countdown's start gate can ever fire — at least
+    one start-gate member is NOT provably dead in the flag-step judge
+    (_flag_branch_verdict: cooldown = no output context = False, an AND with
+    a dead member stays dead, a NOT with a satisfied member stays false).
+    An EMPTY start gate is legal at save (reset-only countdown) but can
+    never start the timer — the deadline never exists, next_wakeup never
+    offers anything, so crediting it as a wakeup source muted faces ②/⑤
+    for chains whose only "waker" could never wake anything. Same judge as
+    the stateful dead-gate face in _check_graph, so the two cannot drift."""
+    members = countdown.get(STATEFUL_GATE_KEYS[COND_COUNTDOWN]) or []
+    memo: dict[str, bool | None] = {}
+    for member in members:
+        cond = by_id.get(member)
+        if cond is not None and _flag_branch_verdict(cond, by_id, memo) is not False:
+            return True
+    return False
 
 
 def _warn_static_hazards(
@@ -1380,7 +1480,20 @@ def _warn_static_hazards(
     # `for` gates and COND_COUNTDOWN are deliberately absent — they are
     # evaluation-born (a countdown's deadline exists only once its start
     # gate was evaluated; see the wakeup arm below and live_reach above).
-    wall_clock_types = {COND_TIME, COND_SUN, COND_DEBOUNCE, COND_COOLDOWN}
+    # The trip leaves (0.16.0) join this set: their verdicts flip at pure
+    # clock boundaries (day_n rolls at the day seam; 段时长 crosses at
+    # since+hours) and next_wakeup offers both edges.
+    wall_clock_types = {
+        COND_TIME,
+        COND_SUN,
+        COND_DEBOUNCE,
+        COND_COOLDOWN,
+        *TRIP_TYPES,
+    }
+    def _countdown_credit(cid: str) -> bool:
+        """F-471: the countdown wakeup credit requires a startable gate."""
+        cond = by_id.get(cid)
+        return cond is not None and _countdown_can_start(cond, by_id)
     # R4-1 entity-coverage join: compare nodes whose entity end an ENABLED
     # state trigger listens to — the runtime routing index pulls their
     # outputs into that trigger's dispatch targets (controller
@@ -1526,7 +1639,8 @@ def _warn_static_hazards(
                 and (by_id.get(cid, {}).get("type") in wall_clock_types
                      or (cid in live_ids
                          and (by_id.get(cid, {}).get("type") == COND_DURATION
-                              or by_id.get(cid, {}).get("type") == COND_COUNTDOWN
+                              or (by_id.get(cid, {}).get("type") == COND_COUNTDOWN
+                                  and _countdown_credit(cid))
                               or by_id.get(cid, {}).get("for"))))
                 or cid in wakeup_covered
                 or cid in entity_end_covered
@@ -1603,7 +1717,8 @@ def _warn_static_hazards(
                 or (cid in live_ids
                     and by_id.get(cid, {}).get("enabled") is not False
                     and (by_id.get(cid, {}).get("type") == COND_DURATION
-                         or by_id.get(cid, {}).get("type") == COND_COUNTDOWN
+                         or (by_id.get(cid, {}).get("type") == COND_COUNTDOWN
+                             and _countdown_credit(cid))
                          or by_id.get(cid, {}).get("for")))
                 or cid in wakeup_covered
                 or cid in entity_end_covered

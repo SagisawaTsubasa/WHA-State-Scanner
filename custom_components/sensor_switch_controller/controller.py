@@ -56,6 +56,8 @@ from .const import (
     COND_SNAPSHOT,
     DOMAIN,
     EVAL_DEBOUNCE_SECONDS,
+    OUTPUT_FUMIHA_SERVICE,
+    OUTPUT_SWITCH,
     TRG_STATE,
 )
 from .decision_log import DecisionLogger
@@ -177,6 +179,7 @@ class ControllerManager:
         # the single tz gate for this field, R2#1 / 教训 R7: naive is
         # salvageable data, not a bad value).
         saved_stateful: dict[str, dict] = {}
+        deadline_healed = False
         if hub is not None:
             for nid, entry in (
                 hub.stateful_states.get(controller_id) or {}
@@ -199,6 +202,11 @@ class ControllerManager:
                             clean["deadline"],
                         )
                         clean["deadline"] = None
+                        # F-473: the null used to live in the seeded copy
+                        # only — the hub table and disk kept the bad string,
+                        # so every restart repeated the warning. Track the
+                        # heal; async_setup writes the cleaned table back.
+                        deadline_healed = True
                     elif parsed.tzinfo is None:
                         # R2#1: normalize the naive form right here — the
                         # engine compares against aware utcnow and a naive
@@ -226,6 +234,16 @@ class ControllerManager:
             # (_persist_stateful_if_changed).
             stateful_values=saved_stateful,
         )
+        # F-473 self-heal write-back: the engine now holds the cleaned seed
+        # (deadline=None where the store carried an unparseable string).
+        # async_save_stateful_moved is sync (in-memory table + debounced
+        # disk write through Store.async_delay_save, F-339) — safe inside
+        # __init__; the debounced window merges the burst and Store's
+        # final-write listener flushes on shutdown.
+        if deadline_healed and hub is not None:
+            hub.async_save_stateful_moved(
+                controller_id, self._stateful_payload()
+            )
         # trigger-logic groups: groups named by any trigger's signal coverage.
         # Coverage is topological (0.7.3 F-151 resolution, superseding the
         # F-120 enabled filter): a disabled trigger never fires, so keeping
@@ -258,13 +276,26 @@ class ControllerManager:
         # (out_cfg["entity_id"], e.g. "ssc_<hex>") — the same key used for
         # lookups during evaluation.
         self._entities: dict[str, Any] = {}
+        # The first-eval gate waits for ENTITY outputs only (0.16.0): a
+        # 文羽服务 output registers no entity, so counting it would block
+        # the first evaluation until the 30s fallback. Entity outputs still
+        # gate it exactly as before.
         self._expected_out_ids = {
             out["entity_id"]
             for out in self.outputs
-            if isinstance(out, dict) and out.get("entity_id")
+            if isinstance(out, dict)
+            and out.get("entity_id")
+            and out.get("type", OUTPUT_SWITCH) != OUTPUT_FUMIHA_SERVICE
         }
         self._added_out_ids: set[str] = set()
         self._first_eval_pending = True
+        # Rising-edge ledger of the 文羽服务 outputs (0.16.0):
+        # {out_id: bool} — True = last cycle's on-gate held AND the call
+        # went through. Runtime-only (reset on rebuild): a service demand
+        # that survives a restart re-fires once, visible in the decision
+        # log (shortcut: persisting edge state would need a runtime-store
+        # format change for marginal benefit).
+        self._service_prev: dict[str, bool] = {}
 
         # Debounced trigger firings (trigger ids + log descriptions).
         self._debounce_unsub = None
@@ -326,12 +357,24 @@ class ControllerManager:
         # pool is no longer a listening fallback), so nothing is passed in.
         self.trigger_manager.async_setup()
         self.hass.async_create_task(self.logger.async_cleanup())
-        # Fallback for the init gate: async_entity_added fires per output,
-        # but HA swallows per-entity add failures — one broken output would
-        # otherwise hold the first evaluation forever. Force it after 30s.
-        self._init_fallback_unsub = async_call_later(
-            self.hass, 30, self._async_init_fallback
-        )
+        if self.outputs and not self._expected_out_ids:
+            # 0.16.0: entity-less controllers (文羽服务 outputs only) have
+            # no registration events to wait for — run the first evaluation
+            # now instead of idling to the 30s fallback. Zero-output
+            # controllers keep idling (nothing to evaluate).
+            self._first_eval_pending = False
+            self.hass.async_create_background_task(
+                self._async_evaluate(None, ["init"]),
+                f"{self.controller_id}-init",
+            )
+        else:
+            # Fallback for the init gate: async_entity_added fires per
+            # output, but HA swallows per-entity add failures — one broken
+            # output would otherwise hold the first evaluation forever.
+            # Force it after 30s.
+            self._init_fallback_unsub = async_call_later(
+                self.hass, 30, self._async_init_fallback
+            )
 
     @callback
     def _async_init_fallback(self, _now) -> None:
@@ -756,9 +799,14 @@ class ControllerManager:
             # R2#3: merge the convergence re-step's snapshot events into
             # the same cycle's log rows — a capture fired by a stateful
             # flip in the re-step used to be persisted but never logged
+            # F-472: concatenate the two passes instead of dict-merging —
+            # a same-id capture+clear inside one cycle (main pass capture,
+            # convergence re-step clear) lost one record under {**a, **b}
+            # and the decision log showed only the pass that merged last.
+            # Pass order is preserved (main pass first, re-step second).
             snap_records = self._snapshot_log_records(
-                {**snap_events, **restep_snaps}
-            )
+                snap_events
+            ) + self._snapshot_log_records(restep_snaps)
             if records or snap_records:
                 await self.logger.log_cycle(records + snap_records)
 
@@ -1028,6 +1076,9 @@ class ControllerManager:
             )
             return {}, None
 
+        if out_cfg.get("type", OUTPUT_SWITCH) == OUTPUT_FUMIHA_SERVICE:
+            return await self._async_evaluate_service_output(out_cfg, detailed)
+
         entity = self._entities.get(out_id)
         if entity is None:
             return {}, None
@@ -1105,6 +1156,96 @@ class ControllerManager:
             "override": overridden,
         }
 
+    async def _async_evaluate_service_output(
+        self, out_cfg: dict, detailed: bool = False
+    ) -> tuple[dict, dict | None]:
+        """Evaluate one 文羽服务 output (0.16.0) and apply its action.
+
+        RISING-EDGE service bus call: the on chain (off wins, the same
+        precedence as flips) must go False→True before ``{domain, service}``
+        is called once — a level-held gate must not re-fire every cycle.
+        The edge ledger (``_service_prev``) is runtime-only: after a reload/
+        restart a still-true gate re-fires once, visible in the decision
+        log. A missing service (integration uninstalled — 决策 4) or a
+        failed call raises the UNAVAILABLE face LOUDLY: an ERROR log line
+        every attempt, the edge stays alive so the next cycle retries, and
+        the record carries applied=False — never a silent drop."""
+        out_id = out_cfg["entity_id"]
+        on_ids = out_cfg.get("on_conditions", [])
+        off_ids = out_cfg.get("off_conditions", [])
+        on_met, on_details = await self.engine.evaluate_detailed(on_ids, out_id)
+        off_met, off_details = await self.engine.evaluate_detailed(off_ids, out_id)
+
+        gate = on_met and not off_met
+        applied = False
+        decision = "hold"
+        if gate and not self._service_prev.get(out_id, False):
+            decision = "call"
+            domain = out_cfg.get("domain") or ""
+            service = out_cfg.get("service") or ""
+            if self.hass.services.has_service(domain, service):
+                try:
+                    await self.hass.services.async_call(
+                        domain, service, blocking=True
+                    )
+                except Exception:  # noqa: BLE001 — 服务实现可抛任意异常
+                    _LOGGER.exception(
+                        "服务输出「%s」调用 %s.%s 失败：本拍不生效，门保持"
+                        "期间下一评估周期重试",
+                        out_cfg.get("name") or out_id,
+                        domain,
+                        service,
+                    )
+                else:
+                    applied = True
+                    self._last_flip[out_id] = dt_util.utcnow()
+                    await self._persist_last_flip(out_id)
+            else:
+                _LOGGER.error(
+                    "服务输出「%s」的 %s.%s 未注册（集成缺装或服务不存在）："
+                    "节点显式不可用，本拍不执行，门保持期间每周期重试",
+                    out_cfg.get("name") or out_id,
+                    domain,
+                    service,
+                )
+        # Edge bookkeeping: consume on a successful call; a failed/missing
+        # call keeps the edge alive (retry next cycle); a dropped gate
+        # re-arms naturally.
+        self._service_prev[out_id] = bool(gate and applied)
+
+        record = {
+            "output": out_cfg.get("name"),
+            "decision": decision,
+            "on_met": on_met,
+            "off_met": off_met,
+            "applied": applied,
+            "override": False,
+            "conditions": {**on_details, **off_details},
+        }
+        self.last_results[out_id] = {
+            "entity_id": None,
+            "state": "call" if applied else "hold",
+            "decision": decision,
+            "on_met": on_met,
+            "off_met": off_met,
+            "applied": applied,
+            "override": False,
+            "evaluated_at": dt_util.now().isoformat(),
+        }
+        self.last_cycle = dt_util.now().isoformat()
+
+        if not detailed:
+            return record, None
+        return record, {
+            "decision": decision,
+            "on_met": on_met,
+            "off_met": off_met,
+            "on_conditions": on_details or {},
+            "off_conditions": off_details or {},
+            "applied": applied,
+            "override": False,
+        }
+
     def runtime_snapshot(self) -> dict:
         """Live view of this controller for the web panel."""
         return {
@@ -1172,9 +1313,14 @@ class ControllerManager:
 
         if self.logging_enabled:
             # R2#3: same merge as _async_evaluate_locked
+            # F-472: concatenate the two passes instead of dict-merging —
+            # a same-id capture+clear inside one cycle (main pass capture,
+            # convergence re-step clear) lost one record under {**a, **b}
+            # and the decision log showed only the pass that merged last.
+            # Pass order is preserved (main pass first, re-step second).
             snap_records = self._snapshot_log_records(
-                {**snap_events, **restep_snaps}
-            )
+                snap_events
+            ) + self._snapshot_log_records(restep_snaps)
             if records or snap_records:
                 await self.logger.log_cycle(records + snap_records)
 
@@ -1304,9 +1450,10 @@ class ControllerManager:
                 return
             if self.logging_enabled:
                 # R2#3: same merge as _async_evaluate_locked
+                # F-472: same two-pass concat as the full-cycle entrances
                 snap_records = self._snapshot_log_records(
-                    {**snap_events, **restep_snaps}
-                )
+                    snap_events
+                ) + self._snapshot_log_records(restep_snaps)
                 if record or snap_records:
                     await self.logger.log_cycle(
                         ([record] if record else []) + snap_records

@@ -5294,5 +5294,350 @@ async def main():
     validate_controller(_cfg_cds)  # primary-gate one-shot self-reset legal
     print("[PASS] stateful schema: self-ref/dead-gate/route/params rejected, F-459+R2#8 abort pairs split")
 
+    # ------------------------------------------------------------------
+    # 0.16.0 trip leaves: schema face — ordinary leaves (`for` applies,
+    # routes naming them are LEGAL signal origins), parameter ranges,
+    # entity validation.
+    # ------------------------------------------------------------------
+    trp_leaf = "cond_" + "e" * 32
+    trp_trg = "trg_" + "e" * 32
+    trp_out = "ssc_" + "e" * 32
+
+    def _trip_base(conds):
+        return {
+            "name": "trip",
+            "enabled": True,
+            "logging_enabled": False,
+            "triggers": [{"id": trp_trg, "type": "state",
+                          "entity_id": "binary_sensor.trip",
+                          "enabled": True,
+                          "routes": {"conditions": [trp_leaf]}}],
+            "conditions": conds,
+            "outputs": [{"name": "o", "type": "switch", "entity_id": trp_out,
+                         "on_conditions": [trp_leaf], "off_conditions": []}],
+        }
+
+    trip_valid = validate_controller(json.loads(json.dumps(_trip_base([
+        {"id": trp_leaf, "type": "trip_on", "label": "", "enabled": True,
+         "entity_id": "binary_sensor.trip"},
+    ]))))
+    assert trip_valid["conditions"][0]["type"] == "trip_on"
+    # `for` applies (ordinary leaf — NOT a timing gate)
+    trip_for = validate_controller(json.loads(json.dumps(_trip_base([
+        {"id": trp_leaf, "type": "trip_day", "label": "", "enabled": True,
+         "entity_id": "binary_sensor.trip", "day": 2,
+         "for": {"hours": 0, "minutes": 1, "seconds": 0}},
+    ]))))
+    assert trip_for["conditions"][0]["for"]["minutes"] == 1, trip_for["conditions"][0]
+    # routes naming a trip leaf are legal above — the trigger survived with
+    # its coverage intact (signal origin; NON_SIGNAL_TYPES excludes the
+    # trip family)
+    assert trip_valid["triggers"][0]["routes"]["conditions"] == [trp_leaf]
+
+    def _trip_fail(ctype, frag, **extra):
+        cond = {"id": trp_leaf, "type": ctype, "label": "", "enabled": True,
+                "entity_id": "binary_sensor.trip"}
+        cond.update(extra)
+        try:
+            validate_controller(json.loads(json.dumps(_trip_base([cond]))))
+        except ControllerValidationError as err:
+            assert frag in str(err), (frag, str(err))
+            return
+        raise AssertionError(f"expected failure containing {frag!r}")
+
+    _trip_fail("trip_day", "必须是天数整数", day="two")
+    _trip_fail("trip_day", "必须在 1-365 天之间", day=0)
+    _trip_fail("trip_day", "必须在 1-365 天之间", day=366)
+    _trip_fail("trip_duration", "必须是小时数", hours="x")
+    _trip_fail("trip_duration", "必须在 0-8760 之间", hours=0)
+    _trip_fail("trip_duration", "必须在 0-8760 之间", hours=-1)
+    _trip_fail("trip_duration", "必须在 0-8760 之间", hours=float("inf"))
+    _trip_fail("trip_duration", "必须在 0-8760 之间", hours=8761)
+    _trip_fail("trip_day", "必须是实体 ID 字符串", entity_id=None, day=2)
+    print("[PASS] trip schema: ordinary leaf semantics (for + signal origin), param ranges rejected")
+
+    # ------------------------------------------------------------------
+    # 0.16.0 trip leaves: engine face — state/day_n/since reads, the loud
+    # unavailable degrade (rate-limited WARN + False), and the wall-clock
+    # wakeup edges (since+hours for trip_duration, next local midnight for
+    # trip_day, none for trip_on / unreadable sources).
+    # ------------------------------------------------------------------
+    from custom_components.sensor_switch_controller.condition_engine import (  # noqa: E402
+        ConditionEngine,
+    )
+
+    trp_on = "cond_" + "1a" * 16
+    trp_day = "cond_" + "2b" * 16
+    trp_dur = "cond_" + "3c" * 16
+    eng_h = _Hass()
+    eng_h.states._d["binary_sensor.trip"] = "on"
+    # since = 40h before the stub utc clock (10-06 02:00) — the 20h
+    # threshold is crossed, 50h is not
+    eng_h.states._attrs["binary_sensor.trip"] = {
+        "day_n": 2, "since": "2026-10-04T10:00:00",
+    }
+    eng_trp = ConditionEngine(eng_h, [
+        {"id": trp_on, "type": "trip_on", "entity_id": "binary_sensor.trip"},
+        {"id": trp_day, "type": "trip_day", "entity_id": "binary_sensor.trip",
+         "day": 2},
+        {"id": trp_dur, "type": "trip_duration",
+         "entity_id": "binary_sensor.trip", "hours": 20},
+    ])
+    assert await eng_trp._evaluate_id(trp_on, set()) is True
+    assert await eng_trp._evaluate_id(trp_day, set()) is True
+    assert await eng_trp._evaluate_id(trp_dur, set()) is True
+    eng_h.states._attrs["binary_sensor.trip"]["day_n"] = 3
+    assert await eng_trp._evaluate_id(trp_day, set()) is False
+    # loud degrade: source unavailable → False + rate-limited WARN
+    class _WarnCap(_put_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list = []
+
+        def emit(self, record):
+            self.records.append(record.getMessage())
+
+    _eng_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.condition_engine"
+    )
+    _warn_cap = _WarnCap()
+    _eng_logger.addHandler(_warn_cap)
+    try:
+        eng_h.states._d["binary_sensor.trip"] = "unavailable"
+        assert await eng_trp._evaluate_id(trp_on, set()) is False
+        assert any(
+            "trip source unreadable" in m for m in _warn_cap.records
+        ), _warn_cap.records
+        # missing attribute → same loud face
+        eng_h.states._d["binary_sensor.trip"] = "on"
+        eng_h.states._attrs["binary_sensor.trip"] = {"since": None}
+        assert await eng_trp._evaluate_id(trp_day, set()) is False
+        assert any(
+            "trip day_n missing" in m for m in _warn_cap.records
+        ), _warn_cap.records
+        assert await eng_trp._evaluate_id(trp_dur, set()) is False
+        assert any(
+            "trip since missing" in m for m in _warn_cap.records
+        ), _warn_cap.records
+        # wakeup edges: duration offers since+hours (future), day offers the
+        # next local midnight, trip_on offers nothing. Expectations derive
+        # from the LIVE stub clock — earlier segments advance it (the 续走
+        # pin jumps a full day), so a hard-coded instant would land in the
+        # past and be dropped by offer(). local is re-synced to the stub's
+        # implied +8h relationship for the same reason.
+        base_utc = _clock["utc"]
+        if base_utc.tzinfo is not None:
+            base_utc = base_utc.replace(tzinfo=None)
+        _saved_local = _clock["local"]
+        _clock["local"] = base_utc + timedelta(hours=8)
+        try:
+            eng_h.states._attrs["binary_sensor.trip"] = {
+                "day_n": 2,
+                "since": (base_utc - timedelta(hours=1)).isoformat(),
+            }
+            pend_d = eng_trp.next_wakeup({trp_dur: {"o1"}})
+            assert pend_d is not None and pend_d[0] == base_utc + timedelta(
+                hours=19
+            ) and pend_d[1] == {"o1"}, pend_d
+            pend_n = eng_trp.next_wakeup({trp_day: {"o2"}})
+            assert pend_n is not None and pend_n[0] == (
+                _clock["local"] + timedelta(days=1)
+            ).replace(hour=0, minute=0, second=0, microsecond=0), pend_n
+            assert eng_trp.next_wakeup({trp_on: {"o3"}}) is None
+            # an unreadable source offers nothing either
+            eng_h.states._d["binary_sensor.trip"] = "unknown"
+            assert eng_trp.next_wakeup({trp_dur: {"o1"}}) is None
+        finally:
+            _clock["local"] = _saved_local
+    finally:
+        _eng_logger.removeHandler(_warn_cap)
+    print("[PASS] trip engine: state/day_n/since reads, loud unavailable WARN, wall-clock wakeup edges")
+
+    # ------------------------------------------------------------------
+    # 0.16.0 hazard face wiring: the trip leaves join the wall-clock tier —
+    # a chain whose only waker is a trip leaf must NOT trip faces ②/⑤.
+    # ------------------------------------------------------------------
+    trp_out2 = "ssc_" + "e5" * 16
+    haz_cfg = json.loads(json.dumps({
+        "name": "trip-haz",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [{"id": trp_trg, "type": "state",
+                      "entity_id": "binary_sensor.trip",
+                      "enabled": True,
+                      "routes": {"conditions": []}}],
+        "conditions": [{"id": trp_leaf, "type": "trip_day", "label": "",
+                        "enabled": True, "entity_id": "binary_sensor.trip",
+                        "day": 1}],
+        "outputs": [{"name": "o", "type": "switch", "entity_id": trp_out2,
+                     "on_conditions": [trp_leaf], "off_conditions": []}],
+    }))
+    _haz_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.schema"
+    )
+    _haz_cap = _WarnCap()
+    _haz_logger.addHandler(_haz_cap)
+    try:
+        validate_controller(haz_cfg)
+        assert not any(
+            "没有任何可唤醒源" in m or "依赖日历条件" in m
+            for m in _haz_cap.records
+        ), _haz_cap.records
+    finally:
+        _haz_logger.removeHandler(_haz_cap)
+    print("[PASS] trip hazard faces: trip leaves join the wall-clock wakeup tier")
+
+    # ------------------------------------------------------------------
+    # 0.16.0 文羽服务 output: schema face — closed built-in domain list,
+    # service required, manual_override dropped, chains validated.
+    # ------------------------------------------------------------------
+    svc_out = "ssc_" + "f" * 32
+    svc_cfg = {
+        "name": "svc",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [{"id": trp_trg, "type": "state",
+                      "entity_id": "binary_sensor.trip",
+                      "enabled": True,
+                      "routes": {"conditions": [trp_leaf]}}],
+        "conditions": [{"id": trp_leaf, "type": "trip_on", "label": "",
+                        "enabled": True, "entity_id": "binary_sensor.trip"}],
+        "outputs": [{"name": "call-out", "type": "fumiha_service",
+                     "entity_id": svc_out, "domain": "trip_count",
+                     "service": "depart", "manual_override": False,
+                     "on_conditions": [trp_leaf], "off_conditions": []}],
+    }
+    svc_valid = validate_controller(json.loads(json.dumps(svc_cfg)))
+    assert svc_valid["outputs"][0]["domain"] == "trip_count"
+    assert svc_valid["outputs"][0]["service"] == "depart"
+    assert "manual_override" not in svc_valid["outputs"][0]
+
+    def _svc_fail(mut, frag):
+        cfg = json.loads(json.dumps(svc_cfg))
+        mut(cfg["outputs"][0])
+        try:
+            validate_controller(cfg)
+        except ControllerValidationError as err:
+            assert frag in str(err), (frag, str(err))
+            return
+        raise AssertionError(f"expected failure containing {frag!r}")
+
+    _svc_fail(lambda o: o.update(domain="not_a_fumiha"), "必须是内置文羽域之一")
+    _svc_fail(lambda o: o.update(domain=""), "必须是内置文羽域之一")
+    _svc_fail(lambda o: o.update(service="  "), "service 必须是非空服务名")
+    _svc_fail(lambda o: o.update(service=None), "service 必须是非空服务名")
+    print("[PASS] service output schema: built-in domain list closed, service required, override dropped")
+
+    # ------------------------------------------------------------------
+    # 0.16.0 文羽服务 output: engine face — rising-edge call, held gate
+    # acts once, off wins / re-arms, loud UNAVAILABLE (missing service →
+    # ERROR + retry next cycle), decision-log call row, and the first-eval
+    # gate does not wait for the entity-less output.
+    # ------------------------------------------------------------------
+    svc_h = _Hass()
+    svc_h.states._d["switch.c"] = "on"
+    svc_calls: list[tuple[str, str]] = []
+    svc_missing = [False]
+
+    async def _svc_call(domain, service, blocking=False):
+        svc_calls.append((domain, service))
+
+    svc_h.services = types.SimpleNamespace(
+        has_service=lambda d, s: not svc_missing[0],
+        async_call=_svc_call,
+    )
+    svc_leaf = "cond_" + "4d" * 16
+    svc_mgr_cfg = {
+        "name": "svc-run",
+        "enabled": True,
+        "logging_enabled": False,
+        "triggers": [{"id": "trg_" + "d" * 32, "type": "state",
+                      "entity_id": "switch.c", "enabled": True,
+                      "routes": {"conditions": [svc_leaf]}}],
+        "conditions": [{"id": svc_leaf, "type": "state", "label": "",
+                        "enabled": True, "entity_id": "switch.c",
+                        "state": "on"}],
+        "outputs": [{"name": "call-out", "type": "fumiha_service",
+                     "entity_id": svc_out, "domain": "trip_count",
+                     "service": "depart",
+                     "on_conditions": [svc_leaf], "off_conditions": []}],
+    }
+    mgr_svc = ControllerManager(svc_h, "ctrl_svc01", svc_mgr_cfg)
+    # first-eval gate: the entity-less output must not block the cycle (it
+    # used to wait for the 30s fallback with _expected_out_ids non-empty)
+    assert mgr_svc._expected_out_ids == set(), mgr_svc._expected_out_ids
+    await mgr_svc._async_evaluate(None, ["init"], None)
+    assert svc_calls == [("trip_count", "depart")], svc_calls
+    assert mgr_svc.last_results[svc_out]["decision"] == "call"
+    assert mgr_svc.last_results[svc_out]["applied"] is True
+    # held gate: the next cycle must NOT re-fire (rising edge)
+    await mgr_svc._async_evaluate(None, ["again"], None)
+    assert svc_calls == [("trip_count", "depart")], svc_calls
+    # gate drops and rises → fires again
+    svc_h.states._d["switch.c"] = "off"
+    await mgr_svc._async_evaluate(None, ["drop"], None)
+    svc_h.states._d["switch.c"] = "on"
+    await mgr_svc._async_evaluate(None, ["rise"], None)
+    assert svc_calls == [
+        ("trip_count", "depart"), ("trip_count", "depart"),
+    ], svc_calls
+    # off chain wins: off met suppresses the call (edge consumed → no call)
+    mgr_svc.outputs[0]["off_conditions"] = [svc_leaf]
+    await mgr_svc._async_evaluate(None, ["offwin"], None)
+    assert len(svc_calls) == 2, svc_calls
+    mgr_svc.outputs[0]["off_conditions"] = []
+    # UNAVAILABLE face: service missing → ERROR log, no call, edge stays
+    # alive (retry next cycle), record applied=False
+    class _ErrCap(_put_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list = []
+
+        def emit(self, record):
+            self.records.append(
+                f"{record.levelname}: {record.getMessage()}"
+            )
+
+    _ctl_logger = _put_logging.getLogger(
+        "custom_components.sensor_switch_controller.controller"
+    )
+    _err_cap = _ErrCap()
+    _ctl_logger.addHandler(_err_cap)
+    try:
+        svc_h.states._d["switch.c"] = "off"
+        await mgr_svc._async_evaluate(None, ["rearm"], None)
+        svc_h.states._d["switch.c"] = "on"
+        svc_missing[0] = True
+        await mgr_svc._async_evaluate(None, ["missing"], None)
+        assert svc_calls == [
+            ("trip_count", "depart"), ("trip_count", "depart"),
+        ], svc_calls
+        assert mgr_svc.last_results[svc_out]["applied"] is False
+        assert any("未注册" in m and "ERROR" in m for m in _err_cap.records), (
+            _err_cap.records
+        )
+        # edge alive: the retry next cycle attempts again
+        await mgr_svc._async_evaluate(None, ["retry"], None)
+        assert svc_calls == [
+            ("trip_count", "depart"), ("trip_count", "depart"),
+        ], svc_calls
+        assert any("未注册" in m and "ERROR" in m for m in _err_cap.records)
+        # a THROWING service keeps the edge alive too (failed call retries)
+        svc_missing[0] = False
+
+        async def _boom(domain, service, blocking=False):
+            raise RuntimeError("boom")
+
+        svc_h.services.async_call = _boom
+        await mgr_svc._async_evaluate(None, ["boom"], None)
+        assert any("调用" in m and "失败" in m for m in _err_cap.records), (
+            _err_cap.records
+        )
+        assert mgr_svc.last_results[svc_out]["applied"] is False
+    finally:
+        _ctl_logger.removeHandler(_err_cap)
+    mgr_svc.async_unload()
+    print("[PASS] service output engine: rising edge, off-wins, loud UNAVAILABLE + retry, no first-eval block")
+
 asyncio.run(main())
 print("SMOKE OK")

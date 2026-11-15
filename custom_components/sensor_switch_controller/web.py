@@ -25,11 +25,14 @@ from homeassistant.loader import async_get_loaded_integration
 
 from .const import (
     API_BASE,
+    CONF_DOMAIN,
+    CONF_SERVICE,
     DOMAIN,
     HUB_BUS_EVENT_PAGE_CHANGED,
     HUB_PAGE_ID,
     HUB_PAGE_ORDER,
     HUB_REGISTRY_KEY,
+    OUTPUT_FUMIHA_SERVICE,
     PANEL_ELEMENT,
     PANEL_SIDEBAR_ICON,
     PANEL_SIDEBAR_TITLE,
@@ -43,6 +46,30 @@ from .schema import ControllerValidationError, validate_controller
 _LOGGER = logging.getLogger(__name__)
 
 WEB_DATA_KEY = f"{DOMAIN}_web_registered"
+
+
+def _warn_fumiha_services(hass, config: dict) -> None:
+    """Save-time reality check for 文羽服务 outputs (0.16.0, 决策 4): a
+    domain/service that is not registered RIGHT NOW warns loudly but never
+    rejects — an integration uninstalled after saving must keep loading and
+    saving (the schema's closed-domain face already rejects anything
+    outside the built-in list; this face covers the runtime reality the
+    schema cannot see). The runtime mirror is the engine's ERROR log on
+    every call attempt."""
+    for out in config.get("outputs") or []:
+        if not isinstance(out, dict) or out.get("type") != OUTPUT_FUMIHA_SERVICE:
+            continue
+        domain = out.get(CONF_DOMAIN) or ""
+        service = out.get(CONF_SERVICE) or ""
+        if hass.services.has_service(domain, service):
+            continue
+        _LOGGER.warning(
+            "输出「%s」指向的 %s.%s 当前未注册（集成缺装或服务不存在）："
+            "保存继续，节点运行时将显式报错且不执行",
+            out.get("name") or out.get("entity_id") or "?",
+            domain,
+            service,
+        )
 
 
 def get_hub(hass: HomeAssistant) -> ScannerHub | None:
@@ -107,6 +134,7 @@ class ControllersView(HomeAssistantView):
             return self.json({"ok": False, "error": str(err)}, status_code=400)
         except _WebError as err:
             return _error_response(self, err)
+        _warn_fumiha_services(hass, config)
 
         # The lock spans snapshot → mutate → save (+ rollback) so the
         # whole-table store write can never capture another request's
@@ -146,6 +174,7 @@ class ControllerDetailView(HomeAssistantView):
             return self.json({"ok": False, "error": str(err)}, status_code=400)
         except _WebError as err:
             return _error_response(self, err)
+        _warn_fumiha_services(hass, config)
 
         # The lock spans snapshot → mutate → save (+ rollback) so the
         # whole-table store write can never capture another request's
@@ -319,7 +348,7 @@ class LogsView(HomeAssistantView):
         # capture/clear: the 0.13.0 snapshot event lines join the filter
         # face (R2-5, closing the ledger item — the panel dropdown follows)
         if decision is not None and decision not in (
-            "on", "off", "hold", "capture", "clear",
+            "on", "off", "hold", "capture", "clear", "call",
         ):
             return self.json({"ok": False, "error": "decision 参数非法"}, status_code=400)
         try:

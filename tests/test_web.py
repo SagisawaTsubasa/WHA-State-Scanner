@@ -9,6 +9,7 @@ Stockroom reference implementations.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import types
 
 import pytest
@@ -814,3 +815,95 @@ def test_put_view_skips_sweep_when_save_fails():
         web_mod.validate_controller = real_validate
         hub.store.async_save = real_save
     assert calls == [], "the sweep must not run before the save wins"
+
+
+# ----------------------------------------------------------------------
+# 文羽服务 outputs (0.16.0): the save-time reality warning (决策 4) and
+# the panel/Python built-in domain list pairing pin.
+# ----------------------------------------------------------------------
+
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _svc_hass(registered: set[str]):
+    hass = types.SimpleNamespace()
+    hass.services = types.SimpleNamespace(
+        has_service=lambda domain, service: f"{domain}.{service}" in registered
+    )
+    return hass
+
+
+def test_fumiha_service_save_warning_warns_only(caplog):
+    config = {
+        "outputs": [
+            {
+                "name": "ok",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "1" * 32,
+                "domain": "trip_count",
+                "service": "depart",
+            },
+            {
+                "name": "ghost",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "2" * 32,
+                "domain": "glm_quota",
+                "service": "reset",
+            },
+            {
+                "name": "plain",
+                "type": "switch",
+                "entity_id": "ssc_" + "3" * 32,
+            },
+        ]
+    }
+    hass = _svc_hass({"trip_count.depart"})
+    with caplog.at_level("WARNING", logger="custom_components.sensor_switch_controller.web"):
+        web_mod._warn_fumiha_services(hass, config)
+    warned = [r.getMessage() for r in caplog.records]
+    assert len(warned) == 1, warned
+    assert "ghost" in warned[0] and "glm_quota.reset" in warned[0]
+    assert "保存继续" in warned[0]
+
+
+def test_fumiha_service_save_warning_silent_when_registered(caplog):
+    config = {
+        "outputs": [
+            {
+                "name": "ok",
+                "type": "fumiha_service",
+                "entity_id": "ssc_" + "1" * 32,
+                "domain": "trip_count",
+                "service": "depart",
+            }
+        ]
+    }
+    hass = _svc_hass({"trip_count.depart"})
+    with caplog.at_level("WARNING", logger="custom_components.sensor_switch_controller.web"):
+        web_mod._warn_fumiha_services(hass, config)
+    assert caplog.records == []
+
+
+def test_fumiha_domain_list_matches_panel():
+    # 决策 2 pairing pin: the closed built-in list exists on BOTH faces
+    # (Python schema enforcement + the panel's level-1 dropdown filter);
+    # the two must never drift. Panel-side parse: the FUMIHA_DOMAINS array
+    # literal in static/panel.js.
+    from custom_components.sensor_switch_controller.const import (
+        FUMIHA_SERVICE_DOMAINS,
+    )
+
+    panel = (
+        _REPO_ROOT / "custom_components" / "sensor_switch_controller"
+        / "static" / "panel.js"
+    ).read_text(encoding="utf-8")
+    start = panel.index("const FUMIHA_DOMAINS = [")
+    end = panel.index("];", start)
+    body = panel[start + len("const FUMIHA_DOMAINS = ["):end]
+    js_domains = [
+        m
+        for m in (s.strip().strip('",') for s in body.split("\n"))
+        if m and not m.startswith("//")
+    ]
+    assert tuple(js_domains) == tuple(FUMIHA_SERVICE_DOMAINS), js_domains

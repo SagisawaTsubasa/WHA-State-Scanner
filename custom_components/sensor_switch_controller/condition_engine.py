@@ -34,6 +34,7 @@ from .const import (
     CONF_ABORT,
     CONF_CAPTURE,
     CONF_CLEAR,
+    CONF_DAY,
     CONF_HOURS,
     CONF_INITIAL,
     CONF_INPUT_A,
@@ -53,8 +54,14 @@ from .const import (
     COND_LITERAL,
     COND_QUOTA,
     COND_SNAPSHOT,
+    COND_TRIP_DAY,
+    COND_TRIP_DURATION,
+    COND_TRIP_ON,
     STATEFUL_GATE_KEYS,
     STATEFUL_TYPES,
+    TRIP_ATTR_DAY_N,
+    TRIP_ATTR_SINCE,
+    TRIP_TYPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -814,6 +821,43 @@ class ConditionEngine:
                 deadline = entry.get("deadline") if entry else None
                 if deadline is not None and not entry.get("verdict"):
                     offer(deadline, outs)
+            elif ctype in TRIP_TYPES:
+                # 0.16.0 wall-clock edges of the trip leaves (their verdicts
+                # flip without HA events): trip_duration crosses at
+                # since+hours; trip_day flips when day_n rolls — per the
+                # current trip_count semantics that is local midnight.
+                # shortcut: a trip_count crossover time other than midnight
+                # (v0.3.0 跨点判定 configurable) makes this anchor fire
+                # early — a state trigger listening to the trip entity (its
+                # attribute change IS a state event) covers the real flip;
+                # upgrade when trip_count exposes the crossover moment.
+                if not outs:
+                    continue
+                state = self.hass.states.get(cond.get(CONF_ENTITY_ID))
+                if not state or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                    continue
+                attrs = getattr(state, "attributes", None) or {}
+                if ctype == COND_TRIP_DURATION:
+                    since_raw = attrs.get(TRIP_ATTR_SINCE)
+                    start = None
+                    if isinstance(since_raw, str):
+                        try:
+                            start = dt_util.parse_datetime(since_raw)
+                        except (TypeError, ValueError):
+                            start = None
+                    if start is not None:
+                        hours = float(cond.get(CONF_HOURS, 0) or 0)
+                        offer(
+                            dt_util.as_utc(start)
+                            + timedelta(hours=hours),
+                            outs,
+                        )
+                else:  # trip_on: no clock edge; trip_day: the day seam
+                    if ctype == COND_TRIP_DAY:
+                        next_day = dt_util.start_of_local_day(
+                            now_local + timedelta(days=1)
+                        )
+                        offer(next_day, outs)
             elif ctype == "calendar":
                 # F-320: calendar verdicts flip at event boundaries
                 # (start - hours / event.end) that raise no HA event. Two
@@ -1280,10 +1324,65 @@ class ConditionEngine:
             return value, True
         return raw, False
 
+    def _evaluate_trip(self, cond: dict, ctype: str, path: str) -> bool:
+        """Trip leaves (0.16.0): read the trip_count trip binary sensor.
+
+        trip_on: the sensor's state == "on" (a trip segment is open).
+        trip_day: on AND the ``day_n`` attribute == the configured day (the
+        Nth day of the trip — trip_count owns the 跨点 semantics behind
+        day_n; WHA only mirrors the value).
+        trip_duration: on AND (now − ``since``) >= the configured hours.
+
+        An unreadable source (missing entity, unknown/unavailable state) or
+        a missing/unparseable attribute degrades LOUDLY: rate-limited WARN
+        (the F-323 face) + False — 决策 5 显式不可用，禁静默回落. A trip in
+        progress with day_n/since absent is the same loud face (a lying or
+        foreign source must stay visible, not silently read False)."""
+        cid = cond.get("id") or path
+        eid = cond.get(CONF_ENTITY_ID)
+        state = self.hass.states.get(eid)
+        if not state or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            self._warn_eval_failure(cid, "trip source unreadable", eid)
+            return False
+        if ctype == COND_TRIP_ON:
+            return state.state == "on"
+        attrs = getattr(state, "attributes", None) or {}
+        if ctype == COND_TRIP_DAY:
+            day_n = attrs.get(TRIP_ATTR_DAY_N)
+            if isinstance(day_n, bool) or not isinstance(day_n, int):
+                self._warn_eval_failure(
+                    cid, "trip day_n missing", f"{eid} day_n={day_n!r}"
+                )
+                return False
+            return day_n == int(cond.get(CONF_DAY, 1))
+        # COND_TRIP_DURATION
+        since_raw = attrs.get(TRIP_ATTR_SINCE)
+        start = None
+        if isinstance(since_raw, str):
+            try:
+                start = dt_util.parse_datetime(since_raw)
+            except (TypeError, ValueError):
+                start = None
+        if start is None:
+            self._warn_eval_failure(
+                cid, "trip since missing", f"{eid} since={since_raw!r}"
+            )
+            return False
+        if start.tzinfo is None:
+            # R2#1 shape: an offset-less ISO is salvageable data — normalize
+            # to UTC instead of TypeError-ing on the subtraction below.
+            start = dt_util.as_utc(start)
+        hours = float(cond.get(CONF_HOURS, 0) or 0)
+        elapsed = (dt_util.utcnow() - dt_util.as_utc(start)).total_seconds()
+        return elapsed >= hours * 3600
+
     async def _evaluate_leaf(
         self, cond: dict, ctype: str, path: str, out_id: str | None = None
     ) -> bool:
         """Evaluate a leaf condition without FOR handling."""
+        if ctype in TRIP_TYPES:
+            return self._evaluate_trip(cond, ctype, path)
+
         if ctype == COND_SNAPSHOT:
             # Verdict = the snapshot EXISTS (no snapshot → always False).
             # The value itself is read by compare inputs, never here; the
